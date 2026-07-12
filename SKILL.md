@@ -5,7 +5,7 @@ description: "Remote code execution + folder sync over SSH. Use when the user wa
 
 # rexec — Remote Code Execution + Folder Sync
 
-A CLI tool to sync local folders and execute commands on remote hosts over SSH. Commands survive SSH disconnections via `nohup` wrapping, with auto-reconnect and log streaming.
+A CLI tool to sync local folders and execute commands on remote hosts over SSH. Commands survive SSH disconnections via a peer-architecture worker binary, with auto-reconnect and frame-based log streaming.
 
 ## Binary
 
@@ -13,12 +13,12 @@ A CLI tool to sync local folders and execute commands on remote hosts over SSH. 
 rexec  (installed at ~/.local/bin/rexec)
 ```
 
-Source: `~/Code/remote-exec`
+Source: `/root/code/rexec`
 
 ## Quick Start
 
 ```bash
-# 1. First time on a new host: check remote dependencies (rsync, sh, nohup)
+# 1. First time on a new host: check remote dependencies (rsync, sh)
 rexec <host> init
 
 # 2. Sync folder + run command (one-liner)
@@ -31,6 +31,31 @@ rexec <host> run -- "bash deploy.sh"
 rexec my-server run --sync ./src:/opt/app/src -- "cd /opt/app && make build"
 ```
 
+## Architecture
+
+rexec uses a **peer-architecture** design: the same `rexec` binary runs on both local and remote hosts.
+
+```
+Local rexec ──SSH Channel──→ ~/.rexec/rexec worker -- "cmd"
+                   ↑                    │
+                   │  binary frames      ├── spawn child process (sh -c "cmd")
+                   │  (stdout/stderr)   ├── write ~/.rexec/logs/<pid>.log (always)
+                   │                    └── stream frames via SSH channel (when connected)
+                   │
+            on disconnect:
+                   ↓
+Local rexec ──SSH Channel──→ ~/.rexec/rexec attach --pid <pid> --offset <n>
+                                │
+                                ├── replay log from offset (missed data)
+                                └── tail log for live output
+```
+
+Key design decisions:
+- **No `nohup`**: the rexec worker ignores SIGHUP and manages the child process directly
+- **No `dd`/`stat` polling**: output is streamed via binary frames over the SSH channel
+- **Log file as source of truth**: the worker always writes to `~/.rexec/logs/<pid>.log` first, then tries to send via SSH channel. If the channel is disconnected, the log file still has all data.
+- **Binary frame protocol**: `[1 byte type][4 bytes BE length][payload]` — efficient, no parsing overhead
+
 ## Commands
 
 ### `init` — Check and install remote dependencies
@@ -40,22 +65,6 @@ rexec <host> init
 ```
 
 Checks if `rsync`, `sh`, `nohup` exist on the remote. If missing, auto-detects the package manager (`apt-get`/`yum`/`dnf`/`apk`/`pacman`) and installs them. Run this once before first use on a new host.
-
-Example output (all deps present):
-```
-Checking remote dependencies...
-
-=== Checking dependencies ===
-✓ rsync: /usr/bin/rsync
-✓ sh: /usr/bin/sh
-✓ nohup: /usr/bin/nohup
-=== Detecting package manager ===
-pm:apt-get
-
-✓ All dependencies satisfied.
-```
-
-If deps are missing, it will auto-install via the detected package manager and verify after installation.
 
 ### `run` — Execute a command on the remote host
 
@@ -69,13 +78,19 @@ Options:
   - Both local and remote paths are normalized to end with `/` so rsync syncs directory contents (not the directory itself).
 - Trailing arguments after `--` are joined and passed to `sh -c` on the remote
 
-Example output:
-```
-✓ Synced /tmp/rexec_test_dir -> ali:/tmp/rexec_test_dir/
-Remote PID: 84450 | Log: /tmp/rexec_815090_1905907165.log
-hello from ali
-✓ Remote process exited
-```
+What happens on `run`:
+1. If `--sync` given: runs `rsync -az --delete -e ssh LOCAL/ HOST:REMOTE/`
+2. SSH connect (russh, pure Rust)
+3. Auto-deploys rexec binary to `~/.rexec/rexec` on remote (version-checked, only uploads if missing/outdated)
+4. SSH exec: `~/.rexec/rexec worker -- "command"`
+5. Reads binary frames from the SSH channel, writes to local stdout/stderr
+6. On disconnect: reconnects and runs `~/.rexec/rexec attach --pid <pid> --offset <n>` to resume
+
+### `worker` / `attach` — Internal subcommands (not user-facing)
+
+These run on the remote host via SSH exec:
+- `rexec worker -- "cmd"` — spawns child process, writes log + streams output via frames
+- `rexec attach --pid <pid> --offset <n>` — replays log from offset, then tails live
 
 ## Best Practices — Local Edit → Sync → Remote Execute
 
@@ -107,22 +122,23 @@ rexec dev run --sync ./src:/workspace/src -- "cd /workspace && cargo test"
 - **`--sync` only accepts directories**, not individual files. Put a single script in a directory and sync that directory.
 - **`--sync` uses `rsync --delete`** — files on the remote that don't exist locally will be removed. Make sure the remote path is dedicated to your project.
 - **One-liner workflow**: `rexec run --sync` combines sync and execution, so you can iterate quickly without separate scp/rsync commands.
-- **Long-running jobs**: even if SSH drops, the remote process continues (nohup). CLI auto-reconnects and resumes log streaming.
+- **Long-running jobs**: even if SSH drops, the remote worker continues running. CLI auto-reconnects and resumes output streaming.
 
 ## How It Works
 
 1. **Sync** (if `--sync` given): runs `rsync -az --delete -e ssh LOCAL/ HOST:REMOTE/`
-2. **Connect**: establishes SSH via russh (pure Rust, no libssh2), authenticates via agent → identity file → default keys
-3. **Execute**: wraps command in `nohup sh -c '...' > /tmp/rexec_<local_pid>_<rand>.log 2>&1 &`
-4. **Follow**: polls the remote log file, streaming new content to local stdout
-5. **Reconnect**: on SSH disconnect, exponential backoff (1s→30s, max 10 retries), resumes from last byte offset
-6. **Complete**: detects process exit via `kill -0 <pid>`, prints final output
+2. **Connect**: establishes SSH via russh (pure Rust), authenticates via agent → identity file → default keys
+3. **Deploy**: checks `~/.rexec/rexec --version` on remote; if missing or outdated, uploads the local binary via SSH channel (`cat > ~/.rexec/rexec`)
+4. **Execute**: SSH exec `~/.rexec/rexec worker -- "command"` — the worker spawns `sh -c "cmd"`, writes output to log file + streams frames via SSH channel
+5. **Stream**: local rexec reads binary frames from the SSH channel, writes to local stdout/stderr
+6. **Reconnect**: on SSH disconnect, exponential backoff (1s→30s, max 10 retries), then runs `~/.rexec/rexec attach --pid <pid> --offset <n>` to replay missed log data and resume live streaming
+7. **Complete**: receives `EXITED` frame with exit code, prints result
 
 ## Interruption & Disconnection Behavior
 
 ### Local rexec killed (SIGINT / SIGTERM / Ctrl+C)
 
-When rexec receives SIGINT or SIGTERM, it prints the remote PID and log file path before exiting:
+When rexec receives SIGINT or SIGTERM, it prints the remote PID before exiting:
 
 ```
 line 1 at 17:11:41
@@ -130,29 +146,41 @@ line 2 at 17:11:42
 line 3 at 17:11:43
 
 ⚠ Interrupted by signal. Remote process still running.
-  PID: 84450  Log: /tmp/rexec_815090_1905907165.log
+  PID: 84450
 ```
 
-The remote process **continues running** — it is not affected by the local rexec being killed. To check on it later:
+The remote worker **continues running** — it ignores SIGHUP and manages the child process independently. To check on it later:
 
 ```bash
-ssh <host> "ps -p 84450 && tail -f /tmp/rexec_815090_1905907165.log"
+ssh <host> "ps -p 84450"
+# Or re-attach manually:
+ssh <host> "~/.rexec/rexec attach --pid 84450 --offset 0"
 ```
 
 ### SSH connection drops
 
-- Remote process **continues running** via `nohup` (not killed when SSH drops)
+- Remote worker **continues running** — it ignores SIGHUP, keeps writing to `~/.rexec/logs/<pid>.log`
 - Local CLI **auto-reconnects** with exponential backoff (1s→2s→...→30s, max 10 retries)
-- Log output **resumes from last byte offset** — no data lost
-- If reconnection fails after 10 retries, prints remote log file path and exits
-- The log file persists at `/tmp/rexec_<local_pid>_<rand>.log` on the remote
+- Output **resumes from last byte offset** — no data lost
+- If reconnection fails after 10 retries, prints remote PID and exits
 
 ```
-⚠ Connection lost: <error>. Remote process still running.
-  PID: 84450  Log: /tmp/rexec_815090_1905907165.log
+⚠ Connection lost. Remote process still running.
+  PID: 84450
   Retry 1/10 in 1s...
-✓ Reconnected. Resuming log follow...
+✓ Reconnected. Resuming...
 ```
+
+## Remote File Layout
+
+```
+~/.rexec/
+├── rexec              # rexec binary (auto-deployed, version-checked)
+└── logs/
+    └── <pid>.log      # frame-encoded output log (binary, not plain text)
+```
+
+The log file uses the same binary frame format as the SSH channel — `attach` reads it and forwards raw frames, no re-encoding needed.
 
 ## Host Specification
 
@@ -171,24 +199,16 @@ rexec root@192.168.1.100:2222 run -- "df -h"
 ### Local development → remote execution
 
 ```bash
-# Edit code locally, sync and run on remote
 rexec dev-server run --sync ./project:/home/dev/project -- "cd /home/dev/project && python -m pytest"
-```
-
-### Deploy script
-
-```bash
-# Put deploy.sh in a directory (sync only accepts dirs)
-rexec prod run --sync ./scripts:/opt/deploy -- "bash /opt/deploy/deploy.sh --env production"
 ```
 
 ### Long-running training job
 
 ```bash
 rexec gpu-01 run --sync ./training:/workspace/training -- "cd /workspace/training && python train.py --epochs 100"
-# If SSH drops, process continues. CLI retries and shows output when reconnected.
-# If CLI is killed, it prints the remote PID and log path. Resume with:
-#   ssh gpu-01 "tail -f /tmp/rexec_<pid>_<rand>.log"
+# If SSH drops, the worker continues. CLI retries and resumes output.
+# If CLI is killed, it prints the remote PID. Resume with:
+#   ssh gpu-01 "~/.rexec/rexec attach --pid <pid> --offset 0"
 ```
 
 ### Verify a host is ready
@@ -201,5 +221,5 @@ rexec my-server init
 ## Prerequisites
 
 - **Local**: `rsync` installed, `ssh` agent or keys configured
-- **Remote**: `rsync`, `sh`, `nohup` (run `rexec <host> init` to verify/install)
+- **Remote**: `rsync`, `sh` (run `rexec <host> init` to verify/install)
 - **SSH config**: host alias in `~/.ssh/config` or direct `user@host:port`

@@ -32,8 +32,8 @@ async fn authenticate(
     }
 
     // 2. Try identity file from ssh config
-    if let Some(id_file) = &remote.identity_file {
-        if let Ok(key) = load_private_key(id_file) {
+    if let Some(id_file) = &remote.identity_file
+        && let Ok(key) = load_private_key(id_file) {
             let key_with_hash = PrivateKeyWithHashAlg::new(Arc::new(key), None);
             let result = session
                 .authenticate_publickey(&user, key_with_hash)
@@ -42,14 +42,13 @@ async fn authenticate(
                 return Ok(());
             }
         }
-    }
 
     // 3. Try default ~/.ssh/id_rsa, id_ed25519, id_ecdsa
     let home = dirs::home_dir().context("cannot determine home directory")?;
     for name in &["id_rsa", "id_ed25519", "id_ecdsa"] {
         let path = home.join(".ssh").join(name);
-        if path.exists() {
-            if let Ok(key) = load_private_key(&path) {
+        if path.exists()
+            && let Ok(key) = load_private_key(&path) {
                 let key_with_hash = PrivateKeyWithHashAlg::new(Arc::new(key), None);
                 let result = session
                     .authenticate_publickey(&user, key_with_hash)
@@ -58,7 +57,6 @@ async fn authenticate(
                     return Ok(());
                 }
             }
-        }
     }
 
     Err(anyhow!(
@@ -143,266 +141,61 @@ pub async fn connect(remote: &RemoteHost) -> Result<client::Handle<ClientHandler
     Ok(session)
 }
 
-/// Execute a command on the remote host using nohup, then follow the output file.
-///
-/// The command is wrapped in `nohup sh -c '...' > logfile 2>&1 &` so it survives
-/// SSH disconnection. We then read the logfile incrementally to stream output.
-pub async fn run_and_follow(
-    session: &mut client::Handle<ClientHandler>,
-    remote: &RemoteHost,
-    command: &str,
-) -> Result<()> {
-    // Generate a unique log file path on the remote
-    let log_file = format!(
-        "/tmp/rexec_{}_{}.log",
-        std::process::id(),
-        rand::random::<u32>()
-    );
+/// Upload the local rexec binary to ~/.rexec/rexec on the remote host.
+pub async fn upload_binary(session: &mut client::Handle<ClientHandler>) -> Result<()> {
+    // Read local binary
+    let self_path = std::fs::read_link("/proc/self/exe").context("reading /proc/self/exe")?;
+    let binary = std::fs::read(&self_path)
+        .with_context(|| format!("reading binary {}", self_path.display()))?;
 
-    // Build the remote wrapper: nohup sh -c 'CMD' > LOG 2>&1 & echo $!
-    let wrapper = format!(
-        "nohup sh -c {} > {} 2>&1 & echo $! > {}.pid; disown 2>/dev/null; cat {}.pid",
-        shell_quote(command),
-        log_file,
-        log_file,
-        log_file
-    );
-
-    // Start the command in background
+    // Create remote directory and receive binary via cat
     let mut channel = session.channel_open_session().await?;
-    channel.exec(true, wrapper.as_str()).await?;
+    channel
+        .exec(
+            true,
+            "mkdir -p ~/.rexec/logs && cat > ~/.rexec/rexec && chmod +x ~/.rexec/rexec",
+        )
+        .await?;
 
-    // Read the PID from the wrapper output
-    let mut pid = String::new();
+    // Send binary data in chunks (SSH max packet ~32768)
+    for chunk in binary.chunks(32768) {
+        channel.data(chunk).await?;
+    }
+    channel.eof().await?;
+
+    // Wait for completion
     while let Some(msg) = channel.wait().await {
         match msg {
-            ChannelMsg::Data { ref data } => {
-                pid.push_str(std::str::from_utf8(data).unwrap_or(""));
-            }
-            ChannelMsg::ExitStatus { .. } => {}
-            ChannelMsg::Eof => break,
-            _ => {}
-        }
-    }
-    let pid = pid.trim().to_string();
-
-    if pid.is_empty() {
-        eprintln!("⚠ Warning: could not determine remote PID");
-    } else {
-        eprintln!("Remote PID: {} | Log: {}", pid, log_file);
-    }
-
-    // Small delay for the nohup process to start writing
-    tokio::time::sleep(Duration::from_millis(200)).await;
-
-    // Follow the log file, with reconnection on SSH disconnect
-    follow_log(session, remote, &log_file, &pid).await
-}
-
-/// Follow the remote log file, streaming new content to stdout.
-/// On SSH disconnect, retry with exponential backoff.
-/// On local SIGINT/SIGTERM, print remote info and exit.
-async fn follow_log(
-    session: &mut client::Handle<ClientHandler>,
-    remote: &RemoteHost,
-    log_file: &str,
-    pid: &str,
-) -> Result<()> {
-    let mut offset: u64 = 0;
-    let mut backoff = Duration::from_secs(1);
-    let max_backoff = Duration::from_secs(30);
-    let max_retries = 10;
-    let mut retries = 0;
-
-    // Install signal handler: prints remote info on Ctrl+C / kill
-    let (sig_tx, mut sig_rx) = tokio::sync::mpsc::channel::<()>(1);
-    tokio::spawn(async move {
-        use tokio::signal::unix::{SignalKind, signal};
-        let mut sigint = signal(SignalKind::interrupt()).unwrap();
-        let mut sigterm = signal(SignalKind::terminate()).unwrap();
-        loop {
-            tokio::select! {
-                _ = sigint.recv() => break,
-                _ = sigterm.recv() => break,
-            }
-        }
-        let _ = sig_tx.send(()).await;
-    });
-
-    loop {
-        tokio::select! {
-            // Signal received — print remote info and exit
-            _ = sig_rx.recv() => {
-                eprintln!(
-                    "\n⚠ Interrupted by signal. Remote process still running.\n  PID: {}  Log: {}",
-                    pid, log_file
-                );
-                return Ok(());
-            }
-            // Normal log polling
-            result = read_log_tail(session, log_file, offset) => {
-                match result {
-                    Ok((data, new_offset, eof)) => {
-                        if !data.is_empty() {
-                            use std::io::Write;
-                            let stdout = std::io::stdout();
-                            let mut lock = stdout.lock();
-                            lock.write_all(&data)?;
-                            lock.flush()?;
-                        }
-                        offset = new_offset;
-                        backoff = Duration::from_secs(1);
-                        retries = 0;
-
-                        if eof {
-                            let alive = check_process_alive(session, pid).await.unwrap_or(false);
-                            if !alive {
-                                if let Ok((data, new_offset, _)) =
-                                    read_log_tail(session, log_file, offset).await
-                                {
-                                    if !data.is_empty() {
-                                        use std::io::Write;
-                                        let stdout = std::io::stdout();
-                                        let mut lock = stdout.lock();
-                                        lock.write_all(&data)?;
-                                        lock.flush()?;
-                                    }
-                                    let _ = new_offset;
-                                }
-                                println!("\n✓ Remote process exited");
-                                break;
-                            }
-                            tokio::time::sleep(Duration::from_millis(500)).await;
-                        }
-                    }
-                    Err(e) => {
-                        retries += 1;
-                        eprintln!(
-                            "\n⚠ Connection lost: {}. Remote process still running.\n  PID: {}  Log: {}\n  Retry {}/{} in {:?}...",
-                            e, pid, log_file, retries, max_retries, backoff
-                        );
-
-                        if retries >= max_retries {
-                            eprintln!(
-                                "✗ Max retries reached. Remote process is still running.\n  PID: {}  Log: {}",
-                                pid, log_file
-                            );
-                            return Err(anyhow!(
-                                "connection lost after {} retries. Remote log: {}",
-                                max_retries,
-                                log_file
-                            ));
-                        }
-
-                        tokio::time::sleep(backoff).await;
-                        backoff = (backoff * 2).min(max_backoff);
-
-                        match connect(remote).await {
-                            Ok(new_session) => {
-                                *session = new_session;
-                                eprintln!("✓ Reconnected. Resuming log follow...");
-                            }
-                            Err(_) => {
-                                continue;
-                            }
-                        }
-                    }
+            ChannelMsg::ExitStatus { exit_status } => {
+                if exit_status != 0 {
+                    return Err(anyhow!("upload failed (exit {})", exit_status));
                 }
             }
+            ChannelMsg::Eof => break,
+            _ => {}
         }
     }
 
     Ok(())
 }
 
-/// Read log file content from the given offset.
-/// Returns (data, new_offset, reached_eof_on_file).
-async fn read_log_tail(
-    session: &client::Handle<ClientHandler>,
-    log_file: &str,
-    offset: u64,
-) -> Result<(Vec<u8>, u64, bool)> {
-    // Check file size
-    let stat_cmd = format!("stat -c %s {} 2>/dev/null || echo 0", shell_quote(log_file));
+/// Ensure the remote host has a matching rexec binary. Upload if missing or outdated.
+pub async fn ensure_remote_binary(session: &mut client::Handle<ClientHandler>) -> Result<()> {
+    let local_version = env!("CARGO_PKG_VERSION");
+    let expected = format!("rexec {}", local_version);
 
-    let mut channel = session.channel_open_session().await?;
-    channel.exec(true, stat_cmd.as_str()).await?;
+    // Check remote version
+    let remote_output = exec_remote(session, "~/.rexec/rexec --version 2>/dev/null").await?;
+    let remote_version = remote_output.trim();
 
-    let mut output = String::new();
-    while let Some(msg) = channel.wait().await {
-        match msg {
-            ChannelMsg::Data { ref data } => {
-                output.push_str(std::str::from_utf8(data).unwrap_or(""));
-            }
-            ChannelMsg::ExitStatus { .. } => {}
-            ChannelMsg::Eof => break,
-            _ => {}
-        }
+    if remote_version == expected {
+        return Ok(()); // Already up to date
     }
 
-    let file_size: u64 = output.trim().parse().unwrap_or(0);
-
-    if file_size <= offset {
-        return Ok((vec![], offset, true));
-    }
-
-    // Read new content using dd
-    let read_cmd = format!(
-        "dd if={} bs=1 skip={} count={} 2>/dev/null",
-        shell_quote(log_file),
-        offset,
-        file_size - offset
-    );
-
-    let mut channel = session.channel_open_session().await?;
-    channel.exec(true, read_cmd.as_str()).await?;
-
-    let mut data = Vec::new();
-    while let Some(msg) = channel.wait().await {
-        match msg {
-            ChannelMsg::Data { data: ref chunk } => {
-                data.extend_from_slice(chunk);
-            }
-            ChannelMsg::ExitStatus { .. } => {}
-            ChannelMsg::Eof => break,
-            _ => {}
-        }
-    }
-
-    Ok((data, file_size, false))
-}
-
-/// Check if a process with the given PID is still running on the remote.
-async fn check_process_alive(
-    session: &client::Handle<ClientHandler>,
-    pid: &str,
-) -> Result<bool> {
-    if pid.is_empty() {
-        return Ok(false);
-    }
-
-    let cmd = format!("kill -0 {} 2>/dev/null && echo alive || echo dead", pid);
-    let mut channel = session.channel_open_session().await?;
-    channel.exec(true, cmd.as_str()).await?;
-
-    let mut output = String::new();
-    while let Some(msg) = channel.wait().await {
-        match msg {
-            ChannelMsg::Data { ref data } => {
-                output.push_str(std::str::from_utf8(data).unwrap_or(""));
-            }
-            ChannelMsg::ExitStatus { .. } => {}
-            ChannelMsg::Eof => break,
-            _ => {}
-        }
-    }
-
-    Ok(output.contains("alive"))
-}
-
-/// Simple shell quoting for a single argument.
-fn shell_quote(s: &str) -> String {
-    format!("'{}'", s.replace('\'', "'\"'\"'"))
+    // Upload binary
+    upload_binary(session).await?;
+    eprintln!("✓ Deployed rexec v{} to remote", local_version);
+    Ok(())
 }
 
 /// Run a command on the remote and collect stdout as a string.
@@ -434,7 +227,6 @@ pub async fn check_and_install_deps(session: &mut client::Handle<ClientHandler>)
     println!("Checking remote dependencies...\n");
 
     // Check all three deps in one round-trip
-    // Output format: rsync:/usr/bin/rsync\nsh:/bin/sh\nnohup:/usr/bin/nohup\npm:apt-get
     let check_cmd = r#"echo "=== Checking dependencies ===";
 for tool in rsync sh nohup; do
   if command -v "$tool" >/dev/null 2>&1; then
@@ -462,16 +254,15 @@ fi"#;
     print!("{}", output);
 
     // Parse which deps are missing
-    let missing_rsunc = output.contains("✗ rsync");
+    let missing_rsync = output.contains("✗ rsync");
     let missing_nohup = output.contains("✗ nohup");
-    // sh is always present, but check anyway
     let missing_sh = output.contains("✗ sh");
 
     if missing_sh {
         return Err(anyhow!("'sh' not found on remote — this is a critical dependency. Please install a POSIX shell manually."));
     }
 
-    let any_missing = missing_rsunc || missing_nohup;
+    let any_missing = missing_rsync || missing_nohup;
     if !any_missing {
         println!("\n✓ All dependencies satisfied.");
         return Ok(());
@@ -494,7 +285,7 @@ fi"#;
 
     if pm == "none" {
         eprintln!("\n⚠ Could not detect a package manager on the remote host.");
-        eprintln!("  Missing: rsync={}, nohup={}", missing_rsunc, missing_nohup);
+        eprintln!("  Missing: rsync={}, nohup={}", missing_rsync, missing_nohup);
         eprintln!("  Please install them manually.");
         return Err(anyhow!("no package manager detected, cannot auto-install"));
     }
@@ -503,7 +294,7 @@ fi"#;
 
     // Build install command based on package manager
     let mut packages: Vec<&str> = Vec::new();
-    if missing_rsunc {
+    if missing_rsync {
         packages.push("rsync");
     }
     // nohup is part of coreutils on most systems, or part of 'busybox' on Alpine
