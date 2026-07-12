@@ -19,22 +19,27 @@ use crate::protocol::{Frame, FrameReader, FrameType};
 /// Log file is written first (source of truth), then stdout.
 /// If stdout write fails (SSH disconnected), the flag is cleared
 /// and subsequent writes skip stdout — the log file still has all data.
+///
+/// Returns Ok(true) on success, Ok(false) if the log file write failed
+/// (non-fatal — child process should still be waited on).
 async fn write_frame(
     frame: &Frame,
     log: &mut tokio::fs::File,
     stdout: &mut tokio::io::Stdout,
     stdout_ok: &mut bool,
-) -> Result<()> {
+) -> Result<bool> {
     let encoded = frame.encode();
     // Log file first — source of truth
-    log.write_all(&encoded).await?;
-    log.flush().await?; // fdatasync — ensure data on disk
+    if log.write_all(&encoded).await.is_err() || log.flush().await.is_err() {
+        // Log file write failed (disk full, etc.) — non-fatal
+        // Continue streaming to stdout if possible, just can't reconnect later
+        return Ok(false);
+    }
     // Then try stdout (SSH channel)
-    if *stdout_ok
-        && stdout.write_all(&encoded).await.is_err() {
-            *stdout_ok = false;
-        }
-    Ok(())
+    if *stdout_ok && stdout.write_all(&encoded).await.is_err() {
+        *stdout_ok = false;
+    }
+    Ok(true)
 }
 
 /// Worker mode: spawn a child process, stream its output via the frame protocol.
@@ -42,6 +47,9 @@ async fn write_frame(
 /// Runs on the remote host. stdin/stdout are connected to the SSH channel.
 /// Output is written to both the log file (always) and stdout (when connected).
 /// SIGHUP is ignored so the worker survives SSH disconnection.
+///
+/// The child process is always waited on, even if the worker encounters errors.
+/// The log file is cleaned up on successful exit (exit code 0).
 pub async fn worker(command: &str) -> Result<()> {
     // Ignore SIGHUP — survive SSH disconnect
     unsafe {
@@ -67,7 +75,7 @@ pub async fn worker(command: &str) -> Result<()> {
     let mut child = tokio::process::Command::new("sh")
         .arg("-c")
         .arg(command)
-        .stdin(Stdio::null()) // no stdin for now
+        .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -76,7 +84,7 @@ pub async fn worker(command: &str) -> Result<()> {
     let mut child_stdout = child.stdout.take().unwrap();
     let mut child_stderr = child.stderr.take().unwrap();
 
-    // Send Started frame
+    // Send Started frame (non-fatal if log write fails)
     write_frame(&Frame::started(pid), &mut log_file, &mut stdout, &mut stdout_ok).await?;
 
     // Channel for collecting output frames from stdout/stderr readers
@@ -91,7 +99,7 @@ pub async fn worker(command: &str) -> Result<()> {
                 Ok(0) | Err(_) => break,
                 Ok(n) => {
                     if tx_out.send(Frame::stdout(buf[..n].to_vec())).await.is_err() {
-                        break; // channel closed
+                        break;
                     }
                 }
             }
@@ -118,26 +126,32 @@ pub async fn worker(command: &str) -> Result<()> {
     drop(frame_tx);
 
     // Main writer loop: write frames to log + stdout
+    // Errors are non-fatal — we still need to wait for the child process
     while let Some(frame) = frame_rx.recv().await {
-        write_frame(&frame, &mut log_file, &mut stdout, &mut stdout_ok).await?;
+        let _ = write_frame(&frame, &mut log_file, &mut stdout, &mut stdout_ok).await;
     }
 
-    // All output drained — wait for child to exit
+    // Always wait for child to exit, regardless of write errors
     let status = child.wait().await?;
+    let exit_code = status.code().unwrap_or(-1);
 
     // Send Exited frame
-    let exit_code = status.code().unwrap_or(-1);
-    write_frame(
+    let _ = write_frame(
         &Frame::exited(exit_code),
         &mut log_file,
         &mut stdout,
         &mut stdout_ok,
     )
-    .await?;
+    .await;
 
     // Final flush
     let _ = log_file.flush().await;
     let _ = stdout.flush().await;
+
+    // Clean up log file on successful exit (exit code 0)
+    if exit_code == 0 {
+        let _ = tokio::fs::remove_file(&log_path).await;
+    }
 
     Ok(())
 }
@@ -147,6 +161,9 @@ pub async fn worker(command: &str) -> Result<()> {
 /// Runs on the remote host. Reads the log file written by a worker process
 /// and streams it to stdout (SSH channel). Used for reconnection after
 /// SSH disconnect.
+///
+/// Uses a single file handle for the duration of the session.
+/// Uses `read()` (not `read_exact()`) to handle partial writes gracefully.
 pub async fn attach(pid: u32, offset: u64) -> Result<()> {
     let home = dirs::home_dir().context("cannot determine home directory")?;
     let log_path = home
@@ -162,12 +179,16 @@ pub async fn attach(pid: u32, offset: u64) -> Result<()> {
     let mut offset = offset;
     let mut reader = FrameReader::new();
 
+    // Open file once and reuse
+    let mut file = tokio::fs::File::open(&log_path).await?;
+    file.seek(SeekFrom::Start(offset)).await?;
+
     loop {
         // Check current file size
-        let file_size = match tokio::fs::metadata(&log_path).await {
+        let file_size = match file.metadata().await {
             Ok(m) => m.len(),
             Err(_) => {
-                // Log file deleted — synthesize exit
+                // Can't stat — synthesize exit
                 let frame = Frame::exited(-1);
                 stdout.write_all(&frame.encode()).await?;
                 stdout.flush().await?;
@@ -176,24 +197,34 @@ pub async fn attach(pid: u32, offset: u64) -> Result<()> {
         };
 
         if file_size > offset {
-            // Read new data from offset
-            let mut file = tokio::fs::File::open(&log_path).await?;
+            // Seek to the new data position and read what's available
             file.seek(SeekFrom::Start(offset)).await?;
 
             let to_read = (file_size - offset) as usize;
-            let mut buf = vec![0u8; to_read];
-            file.read_exact(&mut buf).await?;
-            offset = file_size;
+            // Cap read size to avoid huge allocations
+            let read_size = to_read.min(65536);
+            let mut buf = vec![0u8; read_size];
 
-            // Write raw bytes to stdout (frames are already encoded in the log)
-            stdout.write_all(&buf).await?;
-            stdout.flush().await?;
+            // Use read() not read_exact() — may return fewer bytes
+            let n = match file.read(&mut buf).await {
+                Ok(0) => 0,
+                Ok(n) => n,
+                Err(_) => 0, // Read error — try again next iteration
+            };
 
-            // Parse to check for EXITED frame
-            reader.push(&buf);
-            while let Some(frame) = reader.next_frame() {
-                if frame.frame_type == FrameType::Exited {
-                    return Ok(()); // Process exited — done
+            if n > 0 {
+                offset += n as u64;
+
+                // Write raw bytes to stdout (frames are already encoded in the log)
+                stdout.write_all(&buf[..n]).await?;
+                stdout.flush().await?;
+
+                // Parse to check for EXITED frame
+                reader.push(&buf[..n]);
+                while let Some(frame) = reader.next_frame() {
+                    if frame.frame_type == FrameType::Exited {
+                        return Ok(()); // Process exited — done
+                    }
                 }
             }
         }
@@ -204,7 +235,7 @@ pub async fn attach(pid: u32, offset: u64) -> Result<()> {
             // Worker is dead and no more data to read.
             // Give one more chance for the filesystem to sync.
             tokio::time::sleep(Duration::from_millis(200)).await;
-            let new_size = tokio::fs::metadata(&log_path).await.map(|m| m.len()).unwrap_or(0);
+            let new_size = file.metadata().await.map(|m| m.len()).unwrap_or(0);
             if new_size <= offset {
                 // Still no new data — synthesize exit
                 let frame = Frame::exited(-1);

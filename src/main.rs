@@ -195,7 +195,7 @@ mod tests {
     /// Verify that `sh -c shell_quote(input)` reproduces the original input.
     /// This tests the full quoting round-trip through a real shell.
     fn assert_shell_roundtrip(input: &str) {
-        let quoted = shell_quote(input);
+        let quoted = shell_quote(input).unwrap();
         let output = std::process::Command::new("sh")
             .arg("-c")
             .arg(format!("printf %s {}", quoted))
@@ -207,18 +207,18 @@ mod tests {
 
     #[test]
     fn test_shell_quote_simple() {
-        assert_eq!(shell_quote("hello"), "'hello'");
+        assert_eq!(shell_quote("hello").unwrap(), "'hello'");
     }
 
     #[test]
     fn test_shell_quote_empty() {
-        assert_eq!(shell_quote(""), "''");
+        assert_eq!(shell_quote("").unwrap(), "''");
     }
 
     #[test]
     fn test_shell_quote_with_double_quotes() {
         // Double quotes inside single quotes are literal
-        let quoted = shell_quote(r#"echo "hello world""#);
+        let quoted = shell_quote(r#"echo "hello world""#).unwrap();
         assert_eq!(quoted, r#"'echo "hello world"'"#);
         assert_shell_roundtrip(r#"echo "hello world""#);
     }
@@ -226,7 +226,7 @@ mod tests {
     #[test]
     fn test_shell_quote_with_single_quotes() {
         // Single quotes must be escaped with the '"'"' trick
-        let quoted = shell_quote("echo 'hello'");
+        let quoted = shell_quote("echo 'hello'").unwrap();
         assert_eq!(quoted, "'echo '\"'\"'hello'\"'\"''");
         assert_shell_roundtrip("echo 'hello'");
     }
@@ -254,6 +254,12 @@ mod tests {
         assert_shell_roundtrip("echo hello\necho world");
     }
 
+    #[test]
+    fn test_shell_quote_rejects_null_byte() {
+        let result = shell_quote("echo hello\0; rm -rf /");
+        assert!(result.is_err());
+    }
+
     /// Test the full quoting chain: command → shell_quote → sh -c → result.
     /// This simulates what happens when rexec passes a command to the remote worker.
     #[test]
@@ -271,7 +277,7 @@ mod tests {
 
         for cmd in commands {
             // Step 1: shell_quote the command (as done in run_command)
-            let quoted = shell_quote(cmd);
+            let quoted = shell_quote(cmd).unwrap();
 
             // Step 2: simulate remote shell parsing the worker_cmd
             // The remote shell sees: <binary> worker -- <quoted_command>
@@ -294,18 +300,25 @@ mod tests {
 }
 
 /// Simple shell quoting for a single argument.
-fn shell_quote(s: &str) -> String {
-    format!("'{}'", s.replace('\'', "'\"'\"'"))
+/// Rejects null bytes to prevent command injection via C-string truncation.
+fn shell_quote(s: &str) -> Result<String> {
+    if s.contains('\0') {
+        return Err(anyhow!("command contains null byte — rejected for safety"));
+    }
+    Ok(format!("'{}'", s.replace('\'', "'\"'\"'")))
 }
 
 /// Core run logic: deploy worker, stream output, reconnect on disconnect.
+///
+/// `unused_assignments`: `session = new_session` on reconnect keeps the SSH
+/// handle alive (channel holds an implicit ref), but the compiler can't see it.
 #[allow(unused_assignments)]
 async fn run_command(remote: &RemoteHost, command: &str) -> Result<()> {
     let mut session = ssh::connect(remote).await?;
     ssh::ensure_remote_binary(&mut session).await?;
 
     // Start worker on remote
-    let worker_cmd = format!("~/.rexec/rexec worker -- {}", shell_quote(command));
+    let worker_cmd = format!("~/.rexec/rexec worker -- {}", shell_quote(command)?);
     let mut channel = session.channel_open_session().await?;
     channel.exec(true, worker_cmd.as_str()).await?;
 
@@ -342,9 +355,10 @@ async fn run_command(remote: &RemoteHost, command: &str) -> Result<()> {
             msg = channel.wait() => {
                 match msg {
                     Some(ChannelMsg::Data { ref data }) => {
-                        offset += data.len() as u64;
                         frame_reader.push(data);
                         while let Some(frame) = frame_reader.next_frame() {
+                            // Track offset at frame boundaries, not raw SSH bytes
+                            offset = frame_reader.consumed_bytes();
                             match frame.frame_type {
                                 FrameType::Stdout => {
                                     use std::io::Write;

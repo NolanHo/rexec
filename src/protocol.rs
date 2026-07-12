@@ -126,8 +126,11 @@ impl Frame {
 /// Incremental frame parser for streaming data (e.g. from SSH channel messages).
 ///
 /// Push data as it arrives, then pull complete frames.
+/// Tracks total bytes consumed by complete frames for log-file offset tracking.
 pub struct FrameReader {
     buf: Vec<u8>,
+    /// Total bytes consumed by all frames returned so far.
+    consumed: u64,
 }
 
 impl Default for FrameReader {
@@ -138,7 +141,10 @@ impl Default for FrameReader {
 
 impl FrameReader {
     pub fn new() -> Self {
-        Self { buf: Vec::new() }
+        Self {
+            buf: Vec::new(),
+            consumed: 0,
+        }
     }
 
     /// Append incoming bytes.
@@ -146,44 +152,65 @@ impl FrameReader {
         self.buf.extend_from_slice(data);
     }
 
-    /// Total bytes consumed by all frames returned so far.
+    /// Total bytes consumed by all complete frames returned so far.
+    /// This is the log-file offset to resume from on reconnect.
+    pub fn consumed_bytes(&self) -> u64 {
+        self.consumed
+    }
+
+    /// Remaining un-parsed bytes in the buffer.
     #[allow(dead_code)]
-    pub fn consumed(&self) -> u64 {
+    pub fn remaining(&self) -> u64 {
         self.buf.len() as u64
     }
 
     /// Try to parse the next complete frame from the buffer.
-    /// Returns None if not enough data yet.
+    /// Returns None if not enough data yet for a complete frame.
+    ///
+    /// Unknown frame types are drained and skipped (not returned as None),
+    /// to prevent stream desynchronization.
     pub fn next_frame(&mut self) -> Option<Frame> {
-        if self.buf.len() < HEADER_LEN {
-            return None;
-        }
-        let len = u32::from_be_bytes([
-            self.buf[1],
-            self.buf[2],
-            self.buf[3],
-            self.buf[4],
-        ]) as usize;
+        loop {
+            if self.buf.len() < HEADER_LEN {
+                return None;
+            }
+            let len = u32::from_be_bytes([
+                self.buf[1],
+                self.buf[2],
+                self.buf[3],
+                self.buf[4],
+            ]) as usize;
 
-        // Sanity check: reject absurdly large frames (max 16 MiB)
-        if len > 16 * 1024 * 1024 {
-            // Corrupted stream — drain buffer to force reconnection
-            self.buf.clear();
-            return None;
-        }
+            // Sanity check: reject absurdly large frames (max 16 MiB)
+            if len > 16 * 1024 * 1024 {
+                // Corrupted stream — drain buffer to force reconnection
+                self.buf.clear();
+                return None;
+            }
 
-        let total = HEADER_LEN + len;
-        if self.buf.len() < total {
-            return None;
-        }
+            let total = HEADER_LEN + len;
+            if self.buf.len() < total {
+                return None;
+            }
 
-        let frame_type = FrameType::from_byte(self.buf[0])?;
-        let data = self.buf[HEADER_LEN..total].to_vec();
-        self.buf.drain(0..total);
-        Some(Frame {
-            frame_type,
-            data,
-        })
+            let frame_type_byte = self.buf[0];
+            let data = self.buf[HEADER_LEN..total].to_vec();
+            self.buf.drain(0..total);
+            self.consumed += total as u64;
+
+            match FrameType::from_byte(frame_type_byte) {
+                Some(ft) => {
+                    return Some(Frame {
+                        frame_type: ft,
+                        data,
+                    });
+                }
+                None => {
+                    // Unknown frame type — already drained, continue to next frame
+                    continue;
+                }
+            }
+        }
     }
 }
 
@@ -197,7 +224,7 @@ pub fn parse_frames(data: &[u8]) -> (Vec<Frame>, usize) {
     while let Some(frame) = reader.next_frame() {
         frames.push(frame);
     }
-    let consumed = data.len() - reader.consumed() as usize;
+    let consumed = reader.consumed_bytes() as usize;
     (frames, consumed)
 }
 
@@ -300,5 +327,54 @@ mod tests {
         for ft in &all_types {
             assert!(seen.insert(*ft as u8), "duplicate byte value: {:#04x}", *ft as u8);
         }
+    }
+
+    #[test]
+    fn test_unknown_frame_type_skipped() {
+        // Build a frame with unknown type 0x07, followed by a known frame
+        let mut unknown_encoded = vec![0x07];
+        unknown_encoded.extend_from_slice(&(7u32).to_be_bytes());
+        unknown_encoded.extend_from_slice(b"unknown");
+
+        let known_frame = Frame::stdout(b"after".to_vec());
+        let mut combined = Vec::new();
+        combined.extend_from_slice(&unknown_encoded);
+        combined.extend_from_slice(&known_frame.encode());
+
+        let mut reader = FrameReader::new();
+        reader.push(&combined);
+
+        // First frame should be the known one (unknown skipped)
+        let decoded = reader.next_frame().unwrap();
+        assert_eq!(decoded.frame_type, FrameType::Stdout);
+        assert_eq!(decoded.data, b"after");
+
+        // No more frames
+        assert!(reader.next_frame().is_none());
+
+        // Consumed should include the skipped frame
+        assert_eq!(reader.consumed_bytes(), combined.len() as u64);
+    }
+
+    #[test]
+    fn test_consumed_bytes_tracking() {
+        let f1 = Frame::stdout(b"aaa".to_vec()); // 5 + 3 = 8 bytes
+        let f2 = Frame::stderr(b"bb".to_vec());   // 5 + 2 = 7 bytes
+
+        let mut combined = Vec::new();
+        combined.extend_from_slice(&f1.encode());
+        combined.extend_from_slice(&f2.encode());
+
+        let mut reader = FrameReader::new();
+        reader.push(&combined);
+
+        reader.next_frame().unwrap();
+        assert_eq!(reader.consumed_bytes(), 8);
+
+        reader.next_frame().unwrap();
+        assert_eq!(reader.consumed_bytes(), 15);
+
+        assert!(reader.next_frame().is_none());
+        assert_eq!(reader.consumed_bytes(), 15); // unchanged
     }
 }

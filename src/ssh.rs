@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -11,7 +11,7 @@ use russh::{ChannelMsg, client::AuthResult};
 use crate::RemoteHost;
 
 /// Attempt to load a private key from a path.
-fn load_private_key(path: &PathBuf) -> Result<PrivateKey> {
+fn load_private_key(path: &Path) -> Result<PrivateKey> {
     PrivateKey::from_openssh(&std::fs::read_to_string(path)?)
         .with_context(|| format!("loading private key from {}", path.display()))
 }
@@ -87,17 +87,47 @@ async fn try_agent_auth(
     Err(anyhow!("no agent identity was accepted"))
 }
 
+/// SSH client handler with known_hosts verification (accept-new semantics).
 #[derive(Clone)]
-pub struct ClientHandler;
+pub struct ClientHandler {
+    host: String,
+    port: u16,
+}
 
 impl russh::client::Handler for ClientHandler {
     type Error = russh::Error;
 
     async fn check_server_key(
         &mut self,
-        _server_public_key: &russh::keys::PublicKey,
+        server_public_key: &russh::keys::PublicKey,
     ) -> Result<bool, Self::Error> {
-        Ok(true)
+        let home = match dirs::home_dir() {
+            Some(h) => h,
+            None => return Ok(true), // can't verify without home dir
+        };
+        let known_hosts_path = home.join(".ssh/known_hosts");
+
+        // Check against known_hosts: accept-new semantics
+        // - Key matches → accept
+        // - Key doesn't match → reject (potential MITM)
+        // - Host not in known_hosts → accept (first connect, like StrictHostKeyChecking=accept-new)
+        match russh::keys::check_known_hosts_path(
+            &self.host,
+            self.port,
+            server_public_key,
+            &known_hosts_path,
+        ) {
+            Ok(true) => Ok(true),   // Key matches
+            Ok(false) => Ok(false), // Key mismatch — reject
+            Err(_) => {
+                // Host not in known_hosts or file doesn't exist — accept on first connect
+                eprintln!(
+                    "⚠ Accepting new host key for {}:{} (not in known_hosts)",
+                    self.host, self.port
+                );
+                Ok(true)
+            }
+        }
     }
 }
 
@@ -121,9 +151,13 @@ pub async fn connect(remote: &RemoteHost) -> Result<client::Handle<ClientHandler
 
     // 2. SSH handshake with 15s timeout
     let config = Arc::new(client::Config::default());
+    let handler = ClientHandler {
+        host: tcp_host.to_string(),
+        port,
+    };
     let mut session = tokio::time::timeout(
         Duration::from_secs(15),
-        russh::client::connect_stream(config, tcp_stream, ClientHandler),
+        russh::client::connect_stream(config, tcp_stream, handler),
     )
     .await
     .with_context(|| format!("SSH handshake timed out (15s) with {}", addr))?
@@ -199,6 +233,7 @@ pub async fn ensure_remote_binary(session: &mut client::Handle<ClientHandler>) -
 }
 
 /// Run a command on the remote and collect stdout as a string.
+/// Uses lossy UTF-8 conversion to handle non-UTF-8 output gracefully.
 pub async fn exec_remote(
     session: &client::Handle<ClientHandler>,
     command: &str,
@@ -206,29 +241,30 @@ pub async fn exec_remote(
     let mut channel = session.channel_open_session().await?;
     channel.exec(true, command).await?;
 
-    let mut output = String::new();
+    let mut output = Vec::new();
     while let Some(msg) = channel.wait().await {
         match msg {
             ChannelMsg::Data { ref data } => {
-                output.push_str(std::str::from_utf8(data).unwrap_or(""));
+                output.extend_from_slice(data);
             }
             ChannelMsg::ExitStatus { .. } => {}
             ChannelMsg::Eof => break,
             _ => {}
         }
     }
-    Ok(output)
+    Ok(String::from_utf8_lossy(&output).into_owned())
 }
 
 /// Check remote dependencies and install if missing.
 ///
-/// Required: rsync, sh, nohup. We detect the package manager and install.
+/// Required: rsync, sh. The worker uses SIGHUP ignoring via libc,
+/// not the `nohup` command, so nohup is no longer a dependency.
 pub async fn check_and_install_deps(session: &mut client::Handle<ClientHandler>) -> Result<()> {
     println!("Checking remote dependencies...\n");
 
-    // Check all three deps in one round-trip
+    // Check deps in one round-trip
     let check_cmd = r#"echo "=== Checking dependencies ===";
-for tool in rsync sh nohup; do
+for tool in rsync sh; do
   if command -v "$tool" >/dev/null 2>&1; then
     echo "✓ $tool: $(command -v $tool)";
   else
@@ -255,15 +291,13 @@ fi"#;
 
     // Parse which deps are missing
     let missing_rsync = output.contains("✗ rsync");
-    let missing_nohup = output.contains("✗ nohup");
     let missing_sh = output.contains("✗ sh");
 
     if missing_sh {
         return Err(anyhow!("'sh' not found on remote — this is a critical dependency. Please install a POSIX shell manually."));
     }
 
-    let any_missing = missing_rsync || missing_nohup;
-    if !any_missing {
+    if !missing_rsync {
         println!("\n✓ All dependencies satisfied.");
         return Ok(());
     }
@@ -285,32 +319,19 @@ fi"#;
 
     if pm == "none" {
         eprintln!("\n⚠ Could not detect a package manager on the remote host.");
-        eprintln!("  Missing: rsync={}, nohup={}", missing_rsync, missing_nohup);
-        eprintln!("  Please install them manually.");
+        eprintln!("  Missing: rsync");
+        eprintln!("  Please install it manually.");
         return Err(anyhow!("no package manager detected, cannot auto-install"));
     }
 
     println!("\nInstalling missing dependencies via {}...", pm);
 
-    // Build install command based on package manager
-    let mut packages: Vec<&str> = Vec::new();
-    if missing_rsync {
-        packages.push("rsync");
-    }
-    // nohup is part of coreutils on most systems, or part of 'busybox' on Alpine
-    if missing_nohup {
-        match pm {
-            "apk" => packages.push("busybox"),
-            _ => packages.push("coreutils"),
-        }
-    }
-
     let install_cmd = match pm {
-        "apt-get" => format!("sudo apt-get update -qq && sudo apt-get install -y -qq {}", packages.join(" ")),
-        "yum" => format!("sudo yum install -y -q {}", packages.join(" ")),
-        "dnf" => format!("sudo dnf install -y -q {}", packages.join(" ")),
-        "apk" => format!("sudo apk add --quiet {}", packages.join(" ")),
-        "pacman" => format!("sudo pacman -S --noconfirm --quiet {}", packages.join(" ")),
+        "apt-get" => "sudo apt-get update -qq && sudo apt-get install -y -qq rsync".to_string(),
+        "yum" => "sudo yum install -y -q rsync".to_string(),
+        "dnf" => "sudo dnf install -y -q rsync".to_string(),
+        "apk" => "sudo apk add --quiet rsync".to_string(),
+        "pacman" => "sudo pacman -S --noconfirm --quiet rsync".to_string(),
         _ => return Err(anyhow!("unsupported package manager")),
     };
 
@@ -320,7 +341,7 @@ fi"#;
 
     // Verify installation
     println!("\n=== Verifying installation ===");
-    let verify_cmd = r#"for tool in rsync sh nohup; do
+    let verify_cmd = r#"for tool in rsync sh; do
   if command -v "$tool" >/dev/null 2>&1; then
     echo "✓ $tool: $(command -v $tool)";
   else
