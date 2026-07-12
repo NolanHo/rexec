@@ -108,25 +108,32 @@ impl russh::client::Handler for ClientHandler {
         let known_hosts_path = home.join(".ssh/known_hosts");
 
         // Check against known_hosts: accept-new semantics
-        // - Key matches → accept
-        // - Key doesn't match → reject (potential MITM)
-        // - Host not in known_hosts → accept (first connect, like StrictHostKeyChecking=accept-new)
+        // - Ok(true)  → Key matches known_hosts → accept
+        // - Ok(false) → Host not in known_hosts → accept and persist (first connect)
+        // - Err(_)    → Key changed for known host → reject (potential MITM)
         match russh::keys::check_known_hosts_path(
             &self.host,
             self.port,
             server_public_key,
             &known_hosts_path,
         ) {
-            Ok(true) => Ok(true),   // Key matches
-            Ok(false) => Ok(false), // Key mismatch — reject
-            Err(_) => {
-                // Host not in known_hosts or file doesn't exist — accept on first connect
+            Ok(true) => Ok(true),
+            Ok(false) => {
+                // Host not in known_hosts — accept and persist
                 eprintln!(
                     "⚠ Accepting new host key for {}:{} (not in known_hosts)",
                     self.host, self.port
                 );
+                // Best-effort: write key to known_hosts for future verification
+                let _ = russh::keys::known_hosts::learn_known_hosts_path(
+                    &self.host,
+                    self.port,
+                    server_public_key,
+                    &known_hosts_path,
+                );
                 Ok(true)
             }
+            Err(_) => Ok(false), // Key changed — reject (potential MITM)
         }
     }
 }

@@ -25,7 +25,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Action {
-    /// Check remote dependencies (rsync, sh, nohup) and install if missing
+    /// Check remote dependencies (rsync, sh) and install if missing
     Init,
 
     /// Execute a command on the remote host
@@ -437,6 +437,10 @@ async fn run_command(remote: &RemoteHost, command: &str) -> Result<()> {
                                             new_channel.exec(true, attach_cmd.as_str()).await?;
                                             session = new_session;
                                             channel = new_channel;
+                                            // Reset FrameReader — old buffer has partial bytes
+                                            // from the previous connection that would corrupt
+                                            // the re-sent data from attach
+                                            frame_reader = FrameReader::new();
                                             eprintln!("✓ Reconnected. Resuming...");
                                             reconnected = true;
                                             break;
