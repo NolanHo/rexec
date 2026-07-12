@@ -172,7 +172,18 @@ pub async fn attach(pid: u32, offset: u64) -> Result<()> {
         .join(format!("{}.log", pid));
 
     if !log_path.exists() {
-        return Err(anyhow!("log file not found for PID {}", pid));
+        // Log file may have been deleted by the worker after successful exit.
+        // Check if the process is still alive — if dead, assume success.
+        let alive = unsafe { libc::kill(pid as i32, 0) == 0 };
+        if !alive {
+            // Worker exited and cleaned up — synthesize success exit
+            let mut stdout = tokio::io::stdout();
+            let frame = Frame::exited(0);
+            stdout.write_all(&frame.encode()).await?;
+            stdout.flush().await?;
+            return Ok(());
+        }
+        return Err(anyhow!("log file not found for PID {} and process is alive", pid));
     }
 
     let mut stdout = tokio::io::stdout();

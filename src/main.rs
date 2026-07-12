@@ -352,7 +352,12 @@ async fn run_command(remote: &RemoteHost, command: &str) -> Result<()> {
     loop {
         tokio::select! {
             // Signal received — print remote info and exit
-            _ = sig_rx.recv() => {
+            sig = sig_rx.recv() => {
+                if sig.is_none() {
+                    // Signal handler task failed to init — continue without signal handling
+                    eprintln!("⚠ Signal handler unavailable; Ctrl+C will not work");
+                    continue;
+                }
                 if let Some(p) = pid {
                     eprintln!(
                         "\n⚠ Interrupted by signal. Remote process still running.\n  PID: {}",
@@ -436,7 +441,11 @@ async fn run_command(remote: &RemoteHost, command: &str) -> Result<()> {
                             // Allow Ctrl+C during backoff
                             tokio::select! {
                                 _ = tokio::time::sleep(backoff) => {}
-                                _ = sig_rx.recv() => {
+                                sig = sig_rx.recv() => {
+                                    if sig.is_none() {
+                                        eprintln!("⚠ Signal handler unavailable");
+                                        continue;
+                                    }
                                     if let Some(p) = pid {
                                         eprintln!(
                                             "\n⚠ Interrupted by signal. Remote process still running.\n  PID: {}",
