@@ -329,6 +329,9 @@ async fn run_command(remote: &RemoteHost, command: &str) -> Result<()> {
     //   offset = base_offset + frame_reader.consumed_bytes()
     let mut base_offset: u64 = 0;
     let mut pid: Option<u32> = None;
+    // Track whether signal handler is available — if it fails to init,
+    // stop polling sig_rx to avoid busy-loop on None.
+    let mut signal_available = true;
 
     // Signal handler: print remote info and exit on Ctrl+C / SIGTERM
     let (sig_tx, mut sig_rx) = tokio::sync::mpsc::channel::<()>(1);
@@ -352,9 +355,13 @@ async fn run_command(remote: &RemoteHost, command: &str) -> Result<()> {
     loop {
         tokio::select! {
             // Signal received — print remote info and exit
-            sig = sig_rx.recv() => {
+            sig = async {
+                if signal_available { sig_rx.recv().await }
+                else { std::future::pending::<Option<()>>().await }
+            } => {
                 if sig.is_none() {
-                    // Signal handler task failed to init — continue without signal handling
+                    // Signal handler task failed to init — disable polling to avoid busy-loop
+                    signal_available = false;
                     eprintln!("⚠ Signal handler unavailable; Ctrl+C will not work");
                     continue;
                 }
@@ -441,8 +448,12 @@ async fn run_command(remote: &RemoteHost, command: &str) -> Result<()> {
                             // Allow Ctrl+C during backoff
                             tokio::select! {
                                 _ = tokio::time::sleep(backoff) => {}
-                                sig = sig_rx.recv() => {
+                                sig = async {
+                                    if signal_available { sig_rx.recv().await }
+                                    else { std::future::pending::<Option<()>>().await }
+                                } => {
                                     if sig.is_none() {
+                                        signal_available = false;
                                         eprintln!("⚠ Signal handler unavailable");
                                         continue;
                                     }
