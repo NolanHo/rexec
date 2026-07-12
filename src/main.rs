@@ -324,14 +324,24 @@ async fn run_command(remote: &RemoteHost, command: &str) -> Result<()> {
 
     let mut frame_reader = FrameReader::new();
     let mut offset: u64 = 0;
+    // base_offset preserves the total log-file offset across FrameReader resets.
+    // After reconnection, frame_reader is reset to 0, so:
+    //   offset = base_offset + frame_reader.consumed_bytes()
+    let mut base_offset: u64 = 0;
     let mut pid: Option<u32> = None;
 
     // Signal handler: print remote info and exit on Ctrl+C / SIGTERM
     let (sig_tx, mut sig_rx) = tokio::sync::mpsc::channel::<()>(1);
     tokio::spawn(async move {
         use tokio::signal::unix::{SignalKind, signal};
-        let mut sigint = signal(SignalKind::interrupt()).unwrap();
-        let mut sigterm = signal(SignalKind::terminate()).unwrap();
+        let mut sigint = match signal(SignalKind::interrupt()) {
+            Ok(s) => s,
+            Err(_) => return,
+        };
+        let mut sigterm = match signal(SignalKind::terminate()) {
+            Ok(s) => s,
+            Err(_) => return,
+        };
         tokio::select! {
             _ = sigint.recv() => {}
             _ = sigterm.recv() => {}
@@ -358,7 +368,7 @@ async fn run_command(remote: &RemoteHost, command: &str) -> Result<()> {
                         frame_reader.push(data);
                         while let Some(frame) = frame_reader.next_frame() {
                             // Track offset at frame boundaries, not raw SSH bytes
-                            offset = frame_reader.consumed_bytes();
+                            offset = base_offset + frame_reader.consumed_bytes();
                             match frame.frame_type {
                                 FrameType::Stdout => {
                                     use std::io::Write;
@@ -423,7 +433,19 @@ async fn run_command(remote: &RemoteHost, command: &str) -> Result<()> {
                                 "  Retry {}/{} in {:?}...",
                                 retry, max_retries, backoff
                             );
-                            tokio::time::sleep(backoff).await;
+                            // Allow Ctrl+C during backoff
+                            tokio::select! {
+                                _ = tokio::time::sleep(backoff) => {}
+                                _ = sig_rx.recv() => {
+                                    if let Some(p) = pid {
+                                        eprintln!(
+                                            "\n⚠ Interrupted by signal. Remote process still running.\n  PID: {}",
+                                            p
+                                        );
+                                    }
+                                    return Ok(());
+                                }
+                            }
                             backoff = (backoff * 2).min(max_backoff);
 
                             match ssh::connect(remote).await {
@@ -434,16 +456,22 @@ async fn run_command(remote: &RemoteHost, command: &str) -> Result<()> {
                                     );
                                     match new_session.channel_open_session().await {
                                         Ok(new_channel) => {
-                                            new_channel.exec(true, attach_cmd.as_str()).await?;
-                                            session = new_session;
-                                            channel = new_channel;
-                                            // Reset FrameReader — old buffer has partial bytes
-                                            // from the previous connection that would corrupt
-                                            // the re-sent data from attach
-                                            frame_reader = FrameReader::new();
-                                            eprintln!("✓ Reconnected. Resuming...");
-                                            reconnected = true;
-                                            break;
+                                            match new_channel.exec(true, attach_cmd.as_str()).await {
+                                                Ok(()) => {
+                                                    session = new_session;
+                                                    channel = new_channel;
+                                                    // Preserve total offset across FrameReader reset
+                                                    base_offset = offset;
+                                                    frame_reader = FrameReader::new();
+                                                    eprintln!("✓ Reconnected. Resuming...");
+                                                    reconnected = true;
+                                                    break;
+                                                }
+                                                Err(e) => {
+                                                    eprintln!("  Failed to exec attach: {}", e);
+                                                    continue;
+                                                }
+                                            }
                                         }
                                         Err(e) => {
                                             eprintln!("  Failed to open channel: {}", e);
