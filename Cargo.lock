@@ -1559,7 +1559,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "rexec"
+name = "remote-exec"
 version = "0.1.0"
 dependencies = [
  "anyhow",

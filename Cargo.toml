@@ -1,7 +1,12 @@
 [package]
-name = "rexec"
+name = "remote-exec"
 version = "0.1.0"
 edition = "2024"
+description = "Remote code execution + folder sync over SSH with auto-reconnect resilience"
+license = "GPL-3.0"
+repository = "https://github.com/Menghuan1918/rexec"
+keywords = ["ssh", "remote-execution", "rsync", "cli", "sync"]
+categories = ["command-line-utilities", "development-tools"]
 
 [dependencies]
 russh = "0.51"
