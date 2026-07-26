@@ -4,7 +4,7 @@
 //! Communication with the local side uses the binary frame protocol over
 //! stdin/stdout (which are connected to the SSH channel).
 
-use std::io::SeekFrom;
+use std::io::{IsTerminal, SeekFrom};
 use std::process::Stdio;
 use std::time::Duration;
 
@@ -42,6 +42,24 @@ async fn write_frame(
     Ok(true)
 }
 
+/// Parse an env block received over stdin: `KEY=VALUE\0KEY2=VALUE2\0...`.
+/// Entries without `=` or with an empty key are skipped.
+fn parse_env_block(buf: &[u8]) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for entry in buf.split(|&b| b == 0) {
+        if entry.is_empty() {
+            continue;
+        }
+        let s = String::from_utf8_lossy(entry);
+        if let Some((k, v)) = s.split_once('=')
+            && !k.is_empty()
+        {
+            out.push((k.to_string(), v.to_string()));
+        }
+    }
+    out
+}
+
 /// Worker mode: spawn a child process, stream its output via the frame protocol.
 ///
 /// Runs on the remote host. stdin/stdout are connected to the SSH channel.
@@ -71,10 +89,26 @@ pub async fn worker(command: &str) -> Result<()> {
     let mut stdout = tokio::io::stdout();
     let mut stdout_ok = true;
 
-    // Spawn child process
-    let mut child = tokio::process::Command::new("sh")
-        .arg("-c")
-        .arg(command)
+    // Read environment variables sent over stdin by the local rexec.
+    // The local side writes `KEY=VALUE\0...` then EOFs stdin, so secrets never
+    // appear in the remote process's argv. When invoked directly on a tty
+    // (manual debugging) there is nothing to read — skip to avoid blocking.
+    let child_env: Vec<(String, String)> = if !std::io::stdin().is_terminal() {
+        let mut stdin = tokio::io::stdin();
+        let mut buf = Vec::new();
+        let _ = stdin.read_to_end(&mut buf).await;
+        parse_env_block(&buf)
+    } else {
+        Vec::new()
+    };
+
+    // Spawn child process with the env vars applied.
+    let mut child_cmd = tokio::process::Command::new("sh");
+    child_cmd.arg("-c").arg(command);
+    for (k, v) in &child_env {
+        child_cmd.env(k, v);
+    }
+    let mut child = child_cmd
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
