@@ -8,6 +8,13 @@ repository = "https://github.com/Menghuan1918/rexec"
 keywords = ["ssh", "remote-execution", "rsync", "cli", "sync"]
 categories = ["command-line-utilities", "development-tools"]
 
+# Keep the CLI command name `rexec` regardless of the crate/package name,
+# so the deployed skill, ~/.local/bin install, and remote ~/.rexec/rexec
+# path all stay consistent with the `rexec` command users invoke.
+[[bin]]
+name = "rexec"
+path = "src/main.rs"
+
 [dependencies]
 russh = "0.51"
 russh-keys = "0.49"
