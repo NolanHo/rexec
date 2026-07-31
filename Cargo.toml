@@ -10,6 +10,7 @@ categories = ["command-line-utilities", "development-tools"]
 
 [dependencies]
 russh = "0.51"
+rsa = "0.9"
 russh-keys = "0.49"
 ssh2-config = "0.5"
 tokio = { version = "1", features = ["full"] }
