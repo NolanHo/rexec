@@ -4,8 +4,9 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
 use russh::client;
-use russh::keys::PrivateKeyWithHashAlg;
+use russh::keys::HashAlg;
 use russh::keys::PrivateKey;
+use russh::keys::PrivateKeyWithHashAlg;
 use russh::{ChannelMsg, client::AuthResult};
 
 use crate::RemoteHost;
@@ -34,7 +35,9 @@ async fn authenticate(
     // 2. Try identity file from ssh config
     if let Some(id_file) = &remote.identity_file
         && let Ok(key) = load_private_key(id_file) {
-            let key_with_hash = PrivateKeyWithHashAlg::new(Arc::new(key), None);
+            // RSA: None would map to legacy ssh-rsa (SHA-1), which modern OpenSSH
+            // rejects; explicitly use rsa-sha2-256.
+            let key_with_hash = PrivateKeyWithHashAlg::new(Arc::new(key), Some(HashAlg::Sha256));
             let result = session
                 .authenticate_publickey(&user, key_with_hash)
                 .await?;
@@ -49,7 +52,7 @@ async fn authenticate(
         let path = home.join(".ssh").join(name);
         if path.exists()
             && let Ok(key) = load_private_key(&path) {
-                let key_with_hash = PrivateKeyWithHashAlg::new(Arc::new(key), None);
+                let key_with_hash = PrivateKeyWithHashAlg::new(Arc::new(key), Some(HashAlg::Sha256));
                 let result = session
                     .authenticate_publickey(&user, key_with_hash)
                     .await?;
