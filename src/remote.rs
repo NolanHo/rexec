@@ -60,6 +60,24 @@ fn parse_env_block(buf: &[u8]) -> Vec<(String, String)> {
     out
 }
 
+/// Extract the command and remaining env vars from a stdin env block.
+/// The block is `__REXEC_CMD__=<command>\0` followed by `KEY=VALUE\0` entries.
+/// The command never appears in the worker's argv (sent over stdin instead),
+/// so `pkill -f`/`pgrep -f` cannot match the worker by command content.
+fn extract_command_and_env(buf: &[u8]) -> Result<(String, Vec<(String, String)>)> {
+    let mut entries = parse_env_block(buf);
+    let cmd_idx = entries.iter().position(|(k, _)| k == "__REXEC_CMD__");
+    let command = match cmd_idx {
+        Some(i) => entries.remove(i).1,
+        None => {
+            return Err(anyhow!(
+                "worker received no __REXEC_CMD__ over stdin (run via `rexec <host> run`)"
+            ))
+        }
+    };
+    Ok((command, entries))
+}
+
 /// Worker mode: spawn a child process, stream its output via the frame protocol.
 ///
 /// Runs on the remote host. stdin/stdout are connected to the SSH channel.
@@ -68,7 +86,7 @@ fn parse_env_block(buf: &[u8]) -> Vec<(String, String)> {
 ///
 /// The child process is always waited on, even if the worker encounters errors.
 /// The log file is cleaned up on successful exit (exit code 0).
-pub async fn worker(command: &str) -> Result<()> {
+pub async fn worker() -> Result<()> {
     // Ignore SIGHUP — survive SSH disconnect
     unsafe {
         libc::signal(libc::SIGHUP, libc::SIG_IGN);
@@ -89,22 +107,24 @@ pub async fn worker(command: &str) -> Result<()> {
     let mut stdout = tokio::io::stdout();
     let mut stdout_ok = true;
 
-    // Read environment variables sent over stdin by the local rexec.
-    // The local side writes `KEY=VALUE\0...` then EOFs stdin, so secrets never
-    // appear in the remote process's argv. When invoked directly on a tty
-    // (manual debugging) there is nothing to read — skip to avoid blocking.
-    let child_env: Vec<(String, String)> = if !std::io::stdin().is_terminal() {
+    // Read command + environment sent over stdin by the local rexec.
+    // The local side writes `__REXEC_CMD__=<command>\0` first (the command to
+    // run), then `KEY=VALUE\0`... (env vars), then EOFs stdin. This keeps the
+    // command and secrets out of the worker's argv, so `pkill -f`/`pgrep -f`
+    // cannot match the worker by command content. When invoked directly on a
+    // tty (manual debugging) there is nothing to read — error out.
+    let (command, child_env): (String, Vec<(String, String)>) = if !std::io::stdin().is_terminal() {
         let mut stdin = tokio::io::stdin();
         let mut buf = Vec::new();
         let _ = stdin.read_to_end(&mut buf).await;
-        parse_env_block(&buf)
+        extract_command_and_env(&buf)?
     } else {
-        Vec::new()
+        return Err(anyhow!("worker requires a command over stdin (run via `rexec <host> run`)"));
     };
 
     // Spawn child process with the env vars applied.
     let mut child_cmd = tokio::process::Command::new("sh");
-    child_cmd.arg("-c").arg(command);
+    child_cmd.arg("-c").arg(&command);
     for (k, v) in &child_env {
         child_cmd.env(k, v);
     }
@@ -292,5 +312,41 @@ pub async fn attach(pid: u32, offset: u64) -> Result<()> {
         }
 
         tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_extract_command_and_env() {
+        let buf = b"__REXEC_CMD__=echo hello\0KEY=val\0";
+        let (cmd, env) = extract_command_and_env(buf).unwrap();
+        assert_eq!(cmd, "echo hello");
+        assert_eq!(env, vec![("KEY".to_string(), "val".to_string())]);
+    }
+
+    #[test]
+    fn test_extract_command_with_equals_in_value() {
+        // command containing '=' must not be split
+        let buf = b"__REXEC_CMD__=python -c 'print(1+1)'\0A=b\0";
+        let (cmd, env) = extract_command_and_env(buf).unwrap();
+        assert_eq!(cmd, "python -c 'print(1+1)'");
+        assert_eq!(env, vec![("A".to_string(), "b".to_string())]);
+    }
+
+    #[test]
+    fn test_extract_command_only_no_env() {
+        let buf = b"__REXEC_CMD__=ls\0";
+        let (cmd, env) = extract_command_and_env(buf).unwrap();
+        assert_eq!(cmd, "ls");
+        assert!(env.is_empty());
+    }
+
+    #[test]
+    fn test_extract_command_missing_is_error() {
+        let buf = b"KEY=val\0";
+        assert!(extract_command_and_env(buf).is_err());
     }
 }

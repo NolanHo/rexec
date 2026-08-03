@@ -24,9 +24,21 @@ rexec <host> run --sync ./project:/home/user/project -- "python main.py"
 # Run only (no sync)
 rexec <host> run -- "bash deploy.sh"
 
-# ssh-config alias or user@host:port both work
+# ssh-config alias or user@host:port both work (for run AND --sync)
 rexec prod run -- "systemctl status nginx"
-rexec root@1.2.3.4:2222 run -- "df -h"
+rexec root@1.2.3.4:2222 run --sync ./deploy.sh:/opt/deploy.sh -- "bash /opt/deploy.sh"
+
+# Override port globally (applies to SSH and rsync)
+rexec -p 2222 root@1.2.3.4 run -- "df -h"
+
+# Sync + run a local script in one step
+rexec <host> script ./deploy.sh -- arg1 arg2
+
+# List hosts from ~/.ssh/config
+rexec list
+
+# Quiet: stdout carries only the command's output
+rexec -q <host> run -- "echo hi"
 ```
 
 ### `run` options
@@ -37,6 +49,29 @@ rexec root@1.2.3.4:2222 run -- "df -h"
 | `-e KEY=VALUE` / `--env KEY=VALUE` | Set an env var on the remote command. Repeatable. Secrets never appear in the remote `ps`. |
 | `--env-file PATH` | Read `KEY=VALUE` lines from a local file (supports `#` comments and `export ` prefix). Repeatable. |
 | `-- <command...>` | Command to run on the remote (joined and passed to `sh -c`). |
+
+### Global options
+
+| Option | Description |
+|--------|-------------|
+| `-p PORT` / `--port PORT` | SSH port (overrides `host:port` and ssh-config `Port`) |
+| `-q` / `--quiet` | Suppress progress/status output (Remote PID, exit, sync, reconnect) |
+
+### `script` — sync and run a local script
+
+```bash
+rexec <host> script [--interpreter CMD] [--sync-to REMOTE_DIR] [-e K=V] [--env-file F] <local_script> [-- args...]
+```
+
+Syncs the script to `~/.rexec/scripts/` (or `--sync-to`), then runs it. Interpreter auto-detected: `#!` shebang runs directly; `.py` → `python3`; else `sh`. Override with `--interpreter`.
+
+### `list` — show configured hosts
+
+```bash
+rexec list [alias]
+```
+
+Reads `~/.ssh/config` and prints each host's alias/hostname/port/user (pure-wildcard entries skipped). Pass an alias for single-host details.
 
 ### Environment variables
 
@@ -69,6 +104,8 @@ rexec dev run --sync ./deploy.sh:/opt/app/deploy.sh -- "bash /opt/app/deploy.sh"
 - **Long-running jobs: run rexec in the background.** rexec streams until the remote process exits, which may outlast a foreground shell's timeout (and get killed mid-stream). Launch long jobs with a background command — `&`, `nohup`, or your agent's background-task tool — so the remote worker isn't cut off. If interrupted, rexec prints the remote PID; the worker keeps running (see Disconnect behavior to resume).
 - **Output not streaming?** When stdout is not a TTY (pipes, `cmd | tail`, docker build), programs block-buffer their output, so rexec shows nothing until they flush or exit. Avoid `| tail`/`| head`; stream the command directly, or force line buffering with `stdbuf -oL -eL <cmd>` / `PYTHONUNBUFFERED=1` (pass via `-e`).
 - **Local edit → sync → remote run** is the recommended loop: edit locally, then `rexec <host> run --sync ./dir:/remote/dir -- "..."` pushes and executes in one step.
+- **Use `--quiet` for scriptable output.** `rexec -q <host> run -- "..."` suppresses Remote PID/exit/sync/reconnect lines so stdout holds only the command's output — no need to `grep -v` them.
+- **`pkill -f`/`pgrep -f` won't match the worker.** The command and env vars are sent over stdin, not argv, so the remote worker's cmdline is just `~/.rexec/rexec worker`. Only the spawned `sh -c <cmd>` child matches command patterns — which is the process you usually want to manage.
 
 ## Disconnect behavior
 

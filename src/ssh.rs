@@ -157,7 +157,7 @@ impl russh::client::Handler for ClientHandler {
             Ok(true) => Ok(true),
             Ok(false) => {
                 // Host not in known_hosts — accept and persist
-                eprintln!(
+                crate::status!(
                     "⚠ Accepting new host key for {}:{} (not in known_hosts)",
                     self.host, self.port
                 );
@@ -296,7 +296,7 @@ pub async fn ensure_remote_binary(
 
     // Upload binary
     upload_binary(session, host).await?;
-    eprintln!("✓ Deployed rexec v{} to remote", local_version);
+    crate::status!("✓ Deployed rexec v{} to remote", local_version);
     Ok(())
 }
 

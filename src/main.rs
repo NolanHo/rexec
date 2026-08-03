@@ -1,5 +1,6 @@
 use std::io::BufReader;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
@@ -13,11 +14,34 @@ mod ssh;
 
 use protocol::{FrameReader, FrameType};
 
+/// Global quiet flag. When set, all progress/status output (Remote PID,
+/// exit, sync, reconnect, host-key prompts) is suppressed so stdout/stderr
+/// carry only the remote command's own output.
+pub(crate) static QUIET: AtomicBool = AtomicBool::new(false);
+
+/// Print a progress/status line to stderr unless --quiet is set.
+#[macro_export]
+macro_rules! status {
+    ($($t:tt)*) => {{
+        if !crate::QUIET.load(std::sync::atomic::Ordering::Relaxed) {
+            eprintln!($($t)*);
+        }
+    }};
+}
+
 #[derive(Parser)]
 #[command(name = "rexec", version, about = "Remote code execution + folder sync over SSH")]
 struct Cli {
     /// SSH host alias (resolved via ~/.ssh/config) or user@host:port
     host: Option<String>,
+
+    /// SSH port (overrides host:port and ssh-config Port)
+    #[arg(short = 'p', long = "port", value_name = "PORT", global = true)]
+    port: Option<u16>,
+
+    /// Suppress progress/status output (Remote PID, exit, sync, reconnect)
+    #[arg(short = 'q', long = "quiet", global = true)]
+    quiet: bool,
 
     #[command(subcommand)]
     action: Action,
@@ -47,11 +71,40 @@ enum Action {
         command: Vec<String>,
     },
 
-    /// [internal] Run as worker on the remote host
-    Worker {
+    /// Sync a local script to the remote and run it (interpreter auto-detected)
+    Script {
+        /// Set an environment variable on the remote command (KEY=VALUE). Repeatable.
+        #[arg(short = 'e', long = "env", value_name = "KEY=VALUE")]
+        env: Vec<String>,
+
+        /// Read environment variables from a local file (KEY=VALUE per line). Repeatable.
+        #[arg(long = "env-file", value_name = "PATH")]
+        env_file: Vec<PathBuf>,
+
+        /// Remote directory to sync the script into (default ~/.rexec/scripts)
+        #[arg(long = "sync-to", value_name = "REMOTE_DIR")]
+        sync_to: Option<String>,
+
+        /// Interpreter to run the script with (default: shebang or extension)
+        #[arg(long = "interpreter", value_name = "CMD")]
+        interpreter: Option<String>,
+
+        /// Local script file to sync and run
+        script: PathBuf,
+
+        /// Arguments passed to the script (use -- to separate options)
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
-        command: Vec<String>,
+        args: Vec<String>,
     },
+
+    /// List SSH hosts configured in ~/.ssh/config
+    List {
+        /// Optional: show resolved details for a single alias
+        alias: Option<String>,
+    },
+
+    /// [internal] Run as worker on the remote host (reads command from stdin)
+    Worker,
 
     /// [internal] Attach to a running worker's log
     Attach {
@@ -117,40 +170,49 @@ fn parse_env_file(path: &Path) -> Result<Vec<(String, String)>> {
     Ok(out)
 }
 
-fn resolve_host(host: &str) -> Result<RemoteHost> {
-    if host.contains('@') || (host.contains(':') && !host.chars().next().unwrap().is_alphabetic()) {
-        return parse_user_host_port(host);
+fn resolve_host(host: &str, port_override: Option<u16>) -> Result<RemoteHost> {
+    let mut remote = if host.contains('@')
+        || (host.contains(':') && !host.chars().next().unwrap().is_alphabetic())
+    {
+        parse_user_host_port(host)?
+    } else {
+        let ssh_config_path = dirs::home_dir()
+            .context("cannot determine home directory")?
+            .join(".ssh/config");
+
+        if !ssh_config_path.exists() {
+            RemoteHost {
+                hostname: host.to_string(),
+                port: None,
+                user: None,
+                identity_file: None,
+            }
+        } else {
+            let config_str = std::fs::read_to_string(&ssh_config_path)
+                .with_context(|| format!("reading {}", ssh_config_path.display()))?;
+            let mut reader = BufReader::new(config_str.as_bytes());
+            let config = SshConfig::default().parse(&mut reader, ParseRule::ALLOW_UNKNOWN_FIELDS)?;
+            let host_config = config.query(host);
+            RemoteHost {
+                hostname: host_config
+                    .host_name
+                    .clone()
+                    .unwrap_or_else(|| host.to_string()),
+                port: host_config.port,
+                user: host_config.user.clone(),
+                identity_file: host_config
+                    .identity_file
+                    .as_ref()
+                    .and_then(|v| v.first().cloned()),
+            }
+        }
+    };
+
+    // --port overrides host:port and ssh-config Port.
+    if let Some(p) = port_override {
+        remote.port = Some(p);
     }
-
-    let ssh_config_path = dirs::home_dir()
-        .context("cannot determine home directory")?
-        .join(".ssh/config");
-
-    if !ssh_config_path.exists() {
-        return Ok(RemoteHost {
-            hostname: host.to_string(),
-            port: None,
-            user: None,
-            identity_file: None,
-        });
-    }
-
-    let config_str = std::fs::read_to_string(&ssh_config_path)
-        .with_context(|| format!("reading {}", ssh_config_path.display()))?;
-    let mut reader = BufReader::new(config_str.as_bytes());
-    let config = SshConfig::default().parse(&mut reader, ParseRule::ALLOW_UNKNOWN_FIELDS)?;
-
-    let host_config = config.query(host);
-
-    Ok(RemoteHost {
-        hostname: host_config.host_name.clone().unwrap_or_else(|| host.to_string()),
-        port: host_config.port,
-        user: host_config.user.clone(),
-        identity_file: host_config
-            .identity_file
-            .as_ref()
-            .and_then(|v| v.first().cloned()),
-    })
+    Ok(remote)
 }
 
 fn parse_user_host_port(s: &str) -> Result<RemoteHost> {
@@ -174,15 +236,24 @@ fn parse_user_host_port(s: &str) -> Result<RemoteHost> {
     })
 }
 
-async fn do_sync(local: &Path, remote: &str, host: &str) -> Result<()> {
+async fn do_sync(local: &Path, remote_path: &str, remote: &RemoteHost) -> Result<()> {
     let ssh_opts = "-o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new -o ServerAliveInterval=5 -o ServerAliveCountMax=3";
-    let ssh_e = format!("ssh {}", ssh_opts);
+    let ssh_e = match remote.port {
+        Some(p) => format!("ssh -p {} {}", p, ssh_opts),
+        None => format!("ssh {}", ssh_opts),
+    };
+    // rsync target host must NOT contain ":port" (rsync would treat it as a
+    // path); use user@hostname and pass the port via `ssh -p`.
+    let rsync_host = match &remote.user {
+        Some(u) => format!("{}@{}", u, remote.hostname),
+        None => remote.hostname.clone(),
+    };
 
     // Single file: rsync the file directly (no --delete, no trailing-slash
     // rewriting). If `remote` ends with '/', rsync drops the file into that
     // remote directory; otherwise it writes to the given file path.
     if local.is_file() {
-        let remote_target = format!("{}:{}", host, remote);
+        let remote_target = format!("{}:{}", rsync_host, remote_path);
         let mut child = tokio::process::Command::new("rsync")
             .args(["-az", "-e", ssh_e.as_str(), &local.to_string_lossy(), &remote_target])
             .stdin(std::process::Stdio::null())
@@ -190,7 +261,7 @@ async fn do_sync(local: &Path, remote: &str, host: &str) -> Result<()> {
             .stderr(std::process::Stdio::inherit())
             .spawn()
             .context("failed to spawn rsync")?;
-        return wait_rsync(&mut child, local, host, remote).await;
+        return wait_rsync(&mut child, local, &rsync_host, remote, remote_path).await;
     }
 
     if !local.is_dir() {
@@ -207,21 +278,21 @@ async fn do_sync(local: &Path, remote: &str, host: &str) -> Result<()> {
     } else {
         format!("{}/", local_str)
     };
-    let remote_arg = if remote.ends_with('/') {
-        remote.to_string()
+    let remote_arg = if remote_path.ends_with('/') {
+        remote_path.to_string()
     } else {
-        format!("{}/", remote)
+        format!("{}/", remote_path)
     };
 
     let mut child = tokio::process::Command::new("rsync")
-        .args(["-az", "--delete", "-e", ssh_e.as_str(), &local_arg, &format!("{}:{}", host, remote_arg)])
+        .args(["-az", "--delete", "-e", ssh_e.as_str(), &local_arg, &format!("{}:{}", rsync_host, remote_arg)])
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::inherit())
         .spawn()
         .context("failed to spawn rsync")?;
 
-    wait_rsync(&mut child, local, host, &remote_arg).await
+    wait_rsync(&mut child, local, &rsync_host, remote, &remote_arg).await
 }
 
 /// Wait for an rsync child process with a timeout, surfacing a manual-recovery
@@ -229,7 +300,8 @@ async fn do_sync(local: &Path, remote: &str, host: &str) -> Result<()> {
 async fn wait_rsync(
     child: &mut tokio::process::Child,
     local: &Path,
-    host: &str,
+    rsync_host: &str,
+    remote: &RemoteHost,
     remote_path: &str,
 ) -> Result<()> {
     let timeout = Duration::from_secs(300);
@@ -244,15 +316,20 @@ async fn wait_rsync(
         }
         Err(_) => {
             let _ = child.kill().await;
+            let port_hint = remote
+                .port
+                .map(|p| format!(" -p {}", p))
+                .unwrap_or_default();
             return Err(anyhow!(
                 "rsync timed out after {} seconds. \
-                 Use `rsync -az -e ssh {}:{}` manually to diagnose.",
+                 Use `rsync -az -e 'ssh{}' {}:{}` manually to diagnose.",
                 timeout.as_secs(),
-                host, remote_path
+                port_hint,
+                rsync_host, remote_path
             ));
         }
     }
-    println!("✓ Synced {} -> {}:{}", local.display(), host, remote_path);
+    status!("✓ Synced {} -> {}:{}", local.display(), rsync_host, remote_path);
     Ok(())
 }
 
@@ -379,6 +456,44 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn test_detect_runner_shebang() {
+        let dir = std::env::temp_dir();
+        let p = dir.join("rexec_test_shebang.sh");
+        std::fs::write(&p, "#!/bin/bash\necho hi\n").unwrap();
+        assert_eq!(detect_runner(&p).unwrap(), None);
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn test_detect_runner_by_extension() {
+        let dir = std::env::temp_dir();
+        let py = dir.join("rexec_test_detect.py");
+        std::fs::write(&py, "print(1)\n").unwrap();
+        assert_eq!(detect_runner(&py).unwrap(), Some("python3".to_string()));
+        let sh = dir.join("rexec_test_detect.sh");
+        std::fs::write(&sh, "echo hi\n").unwrap();
+        assert_eq!(detect_runner(&sh).unwrap(), Some("sh".to_string()));
+        let _ = std::fs::remove_file(&py);
+        let _ = std::fs::remove_file(&sh);
+    }
+
+    #[test]
+    fn test_collect_env_flags() {
+        let env = vec!["A=b".to_string(), "C=d".to_string()];
+        assert_eq!(
+            collect_env(&env, &[]).unwrap(),
+            vec![
+                ("A".to_string(), "b".to_string()),
+                ("C".to_string(), "d".to_string())
+            ]
+        );
+        // missing '='
+        assert!(collect_env(&["noequal".to_string()], &[]).is_err());
+        // empty key
+        assert!(collect_env(&["=nokey".to_string()], &[]).is_err());
+    }
 }
 
 /// Simple shell quoting for a single argument.
@@ -404,25 +519,29 @@ async fn run_command(
     let mut session = ssh::connect(remote).await?;
     ssh::ensure_remote_binary(&mut session, host).await?;
 
-    // Start worker on remote
-    let worker_cmd = format!("~/.rexec/rexec worker -- {}", shell_quote(command)?);
+    // Start worker on remote. The command itself is NOT passed on argv (so
+    // `pkill -f`/`pgrep -f` cannot match the worker by command content); it is
+    // sent over stdin as a special env entry, alongside any -e/--env vars.
+    let worker_cmd = "~/.rexec/rexec worker";
     let mut channel = session.channel_open_session().await?;
-    channel.exec(true, worker_cmd.as_str()).await?;
+    channel.exec(true, worker_cmd).await?;
 
-    // Send environment variables to the worker over the channel's stdin.
-    // The worker reads these before spawning the child, so secrets stay out of
-    // the remote process's argv (ps). Format: KEY=VALUE\0... terminated by EOF.
-    if !env.is_empty() {
-        let mut payload = Vec::new();
-        for (k, v) in env {
-            payload.extend_from_slice(k.as_bytes());
-            payload.push(b'=');
-            payload.extend_from_slice(v.as_bytes());
-            payload.push(0);
-        }
-        channel.data(payload.as_slice()).await?;
+    // Send the command + environment to the worker over the channel's stdin.
+    // The worker reads these before spawning the child, so neither the command
+    // nor secrets appear in the remote process's argv (ps).
+    // Format: `__REXEC_CMD__=<command>\0` first, then `KEY=VALUE\0`..., EOF.
+    let mut payload = Vec::new();
+    payload.extend_from_slice(b"__REXEC_CMD__=");
+    payload.extend_from_slice(command.as_bytes());
+    payload.push(0);
+    for (k, v) in env {
+        payload.extend_from_slice(k.as_bytes());
+        payload.push(b'=');
+        payload.extend_from_slice(v.as_bytes());
+        payload.push(0);
     }
-    // Signal stdin EOF so the worker's read completes (even with no env).
+    channel.data(payload.as_slice()).await?;
+    // Signal stdin EOF so the worker's read completes.
     channel.eof().await?;
 
     let mut frame_reader = FrameReader::new();
@@ -465,11 +584,11 @@ async fn run_command(
                 if sig.is_none() {
                     // Signal handler task failed to init — disable polling to avoid busy-loop
                     signal_available = false;
-                    eprintln!("⚠ Signal handler unavailable; Ctrl+C will not work");
+                    status!("⚠ Signal handler unavailable; Ctrl+C will not work");
                     continue;
                 }
                 if let Some(p) = pid {
-                    eprintln!(
+                    status!(
                         "\n⚠ Interrupted by signal. Remote process still running.\n  PID: {}",
                         p
                     );
@@ -502,7 +621,7 @@ async fn run_command(
                                 FrameType::Started => {
                                     pid = frame.as_pid();
                                     if let Some(p) = pid {
-                                        eprintln!("Remote PID: {}", p);
+                                        status!("Remote PID: {}", p);
                                     }
                                 }
                                 FrameType::Exited => {
@@ -510,9 +629,9 @@ async fn run_command(
                                     std::io::stdout().flush()?;
                                     let code = frame.as_exit_code().unwrap_or(-1);
                                     if code == 0 {
-                                        eprintln!("\n✓ Remote process exited");
+                                        status!("\n✓ Remote process exited");
                                     } else {
-                                        eprintln!("\n✗ Remote process exited with code {}", code);
+                                        status!("\n✗ Remote process exited with code {}", code);
                                     }
                                     return Ok(());
                                 }
@@ -532,7 +651,7 @@ async fn run_command(
                             }
                         };
 
-                        eprintln!(
+                        status!(
                             "\n⚠ Connection lost. Remote process still running.\n  PID: {}",
                             pid_val
                         );
@@ -544,7 +663,7 @@ async fn run_command(
                         let mut reconnected = false;
 
                         for retry in 1..=max_retries {
-                            eprintln!(
+                            status!(
                                 "  Retry {}/{} in {:?}...",
                                 retry, max_retries, backoff
                             );
@@ -557,11 +676,11 @@ async fn run_command(
                                 } => {
                                     if sig.is_none() {
                                         signal_available = false;
-                                        eprintln!("⚠ Signal handler unavailable");
+                                        status!("⚠ Signal handler unavailable");
                                         continue;
                                     }
                                     if let Some(p) = pid {
-                                        eprintln!(
+                                        status!(
                                             "\n⚠ Interrupted by signal. Remote process still running.\n  PID: {}",
                                             p
                                         );
@@ -586,18 +705,18 @@ async fn run_command(
                                                     // Preserve total offset across FrameReader reset
                                                     base_offset = offset;
                                                     frame_reader = FrameReader::new();
-                                                    eprintln!("✓ Reconnected. Resuming...");
+                                                    status!("✓ Reconnected. Resuming...");
                                                     reconnected = true;
                                                     break;
                                                 }
                                                 Err(e) => {
-                                                    eprintln!("  Failed to exec attach: {}", e);
+                                                    status!("  Failed to exec attach: {}", e);
                                                     continue;
                                                 }
                                             }
                                         }
                                         Err(e) => {
-                                            eprintln!("  Failed to open channel: {}", e);
+                                            status!("  Failed to open channel: {}", e);
                                             continue;
                                         }
                                     }
@@ -623,69 +742,219 @@ async fn run_command(
     }
 }
 
+/// Collect env vars from `-e/--env` flags first, then `--env-file` contents.
+fn collect_env(env: &[String], env_file: &[PathBuf]) -> Result<Vec<(String, String)>> {
+    let mut env_vars: Vec<(String, String)> = Vec::new();
+    for e in env {
+        let (k, v) = e
+            .split_once('=')
+            .ok_or_else(|| anyhow!("--env expects KEY=VALUE, got '{}'", e))?;
+        if k.is_empty() {
+            return Err(anyhow!("--env key is empty in '{}'", e));
+        }
+        env_vars.push((k.to_string(), v.to_string()));
+    }
+    for f in env_file {
+        env_vars.extend(parse_env_file(f)?);
+    }
+    Ok(env_vars)
+}
+
+/// Decide how to run a script. Returns `None` to execute it directly (script has
+/// a `#!` shebang), or `Some(cmd)` to run it via `cmd <script>`.
+fn detect_runner(script: &Path) -> Result<Option<String>> {
+    use std::io::Read;
+    let mut f =
+        std::fs::File::open(script).with_context(|| format!("opening script {}", script.display()))?;
+    let mut buf = [0u8; 2];
+    let n = f.read(&mut buf)?;
+    if n == 2 && &buf == b"#!" {
+        return Ok(None); // shebang → direct exec
+    }
+    match script.extension().and_then(|e| e.to_str()) {
+        Some("py") => Ok(Some("python3".to_string())),
+        _ => Ok(Some("sh".to_string())),
+    }
+}
+
+/// Sync a local script to the remote and run it (the `script` subcommand).
+async fn run_script(
+    remote: &RemoteHost,
+    host: &str,
+    script: &Path,
+    interpreter: Option<&str>,
+    sync_to: Option<&str>,
+    args: &[String],
+    env_vars: &[(String, String)],
+) -> Result<()> {
+    let basename = script
+        .file_name()
+        .ok_or_else(|| anyhow!("cannot determine script file name from {}", script.display()))?
+        .to_string_lossy()
+        .to_string();
+
+    // Ensure the remote dir exists (single-file rsync does not create parents)
+    // and resolve it to an absolute path. Using an absolute path for the
+    // runner command avoids relying on shell tilde expansion, which quoting
+    // would disable (python3 '$HOME/...' does not expand).
+    let remote_script = {
+        let mut session = ssh::connect(remote).await?;
+        ssh::ensure_remote_binary(&mut session, host).await?;
+        let home = ssh::exec_remote(&mut session, "printf %s \"$HOME\"")
+            .await?
+            .trim()
+            .to_string();
+        let dir = match sync_to {
+            Some(s) if s.starts_with('~') => format!("{}{}", home, &s[1..]),
+            Some(s) => s.to_string(),
+            None => format!("{}/.rexec/scripts", home),
+        };
+        ssh::exec_remote(&mut session, &format!("mkdir -p {}", shell_quote(&dir)?)).await?;
+        format!("{}/{}", dir, basename)
+    };
+
+    do_sync(script, &remote_script, remote).await?;
+
+    let runner = match interpreter {
+        Some(i) => Some(i.to_string()),
+        None => detect_runner(script)?,
+    };
+    let mut parts: Vec<String> = Vec::new();
+    match &runner {
+        Some(r) => {
+            parts.push(r.clone());
+            parts.push(shell_quote(&remote_script)?);
+        }
+        None => {
+            // shebang: chmod +x then run directly
+            let q = shell_quote(&remote_script)?;
+            parts.push(format!("chmod +x {} && {}", q, q));
+        }
+    }
+    for a in args {
+        parts.push(shell_quote(a)?);
+    }
+    let command = parts.join(" ");
+    run_command(remote, host, &command, env_vars).await?;
+    Ok(())
+}
+
+/// List SSH hosts from ~/.ssh/config (the `list` subcommand).
+fn list_hosts(alias: Option<&str>) -> Result<()> {
+    let path = dirs::home_dir()
+        .context("cannot determine home directory")?
+        .join(".ssh/config");
+    if !path.exists() {
+        return Err(anyhow!("~/.ssh/config not found at {}", path.display()));
+    }
+    let config_str = std::fs::read_to_string(&path)
+        .with_context(|| format!("reading {}", path.display()))?;
+    let mut reader = BufReader::new(config_str.as_bytes());
+    let config = SshConfig::default().parse(&mut reader, ParseRule::ALLOW_UNKNOWN_FIELDS)?;
+
+    let default_user = std::env::var("USER").unwrap_or_else(|_| "root".to_string());
+
+    if let Some(a) = alias {
+        let p = config.query(a);
+        let host = p.host_name.clone().unwrap_or_else(|| a.to_string());
+        let port = p.port.unwrap_or(22);
+        let user = p.user.clone().unwrap_or_else(|| default_user);
+        println!("{:<24} {}@{}:{}", a, user, host, port);
+        if let Some(id) = &p.identity_file {
+            if let Some(first) = id.first() {
+                println!("{:<24} identity: {}", "", first.display());
+            }
+        }
+        return Ok(());
+    }
+
+    println!("{:<24} {:<28} {:<6} {}", "ALIAS", "HOSTNAME", "PORT", "USER");
+    for host in config.get_hosts() {
+        let patterns: Vec<String> = host.pattern.iter().map(|c| c.to_string()).collect();
+        // Skip pure-wildcard entries (e.g. "Host *") — no useful alias.
+        if patterns.iter().all(|p| p == "*") {
+            continue;
+        }
+        let alias = patterns.join(" ");
+        let hostname = host
+            .params
+            .host_name
+            .clone()
+            .unwrap_or_else(|| alias.split_whitespace().next().unwrap_or("").to_string());
+        let port = host.params.port.unwrap_or(22);
+        let user = host.params.user.clone().unwrap_or_else(|| default_user.clone());
+        println!("{:<24} {:<28} {:<6} {}", alias, hostname, port, user);
+    }
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
+    QUIET.store(cli.quiet, Ordering::Relaxed);
 
-    match (cli.host, cli.action) {
+    match (cli.host, cli.action, cli.port) {
         // ── Local operations ──
-        (Some(host), Action::Init) => {
-            let remote = resolve_host(&host)?;
+        (Some(host), Action::Init, port) => {
+            let remote = resolve_host(&host, port)?;
             let mut session = ssh::connect(&remote).await?;
             ssh::check_and_install_deps(&mut session).await?;
         }
-        (Some(host), Action::Run { sync, env, env_file, command }) => {
+        (Some(host), Action::Run { sync, env, env_file, command }, port) => {
             if command.is_empty() {
                 return Err(anyhow!(
                     "no command provided. Usage: rexec <host> run [--sync LOCAL:REMOTE] [--env KEY=VALUE]... -- <command...>"
                 ));
             }
-            let remote = resolve_host(&host)?;
+            let remote = resolve_host(&host, port)?;
             if let Some(sync_arg) = &sync {
                 let (local, remote_path) = parse_sync_arg(sync_arg)?;
-                do_sync(&local, &remote_path, &host).await?;
+                do_sync(&local, &remote_path, &remote).await?;
             }
-
-            // Collect env vars: -e/--env flags first, then --env-file contents.
-            let mut env_vars: Vec<(String, String)> = Vec::new();
-            for e in &env {
-                let (k, v) = e
-                    .split_once('=')
-                    .ok_or_else(|| anyhow!("--env expects KEY=VALUE, got '{}'", e))?;
-                if k.is_empty() {
-                    return Err(anyhow!("--env key is empty in '{}'", e));
-                }
-                env_vars.push((k.to_string(), v.to_string()));
-            }
-            for f in &env_file {
-                env_vars.extend(parse_env_file(f)?);
-            }
-
+            let env_vars = collect_env(&env, &env_file)?;
             let command = command.join(" ");
             run_command(&remote, &host, &command, &env_vars).await?;
         }
+        (Some(host), Action::Script { script, interpreter, sync_to, env, env_file, args }, port) => {
+            let remote = resolve_host(&host, port)?;
+            let env_vars = collect_env(&env, &env_file)?;
+            run_script(
+                &remote,
+                &host,
+                &script,
+                interpreter.as_deref(),
+                sync_to.as_deref(),
+                &args,
+                &env_vars,
+            )
+            .await?;
+        }
+
+        // ── Host listing (no host needed) ──
+        (_, Action::List { alias }, _) => {
+            list_hosts(alias.as_deref())?;
+        }
 
         // ── Remote operations (internal, invoked via SSH exec) ──
-        (None, Action::Worker { command }) => {
-            if command.is_empty() {
-                return Err(anyhow!("no command provided for worker"));
-            }
-            let command = command.join(" ");
-            remote::worker(&command).await?;
+        (None, Action::Worker, _) => {
+            remote::worker().await?;
         }
-        (None, Action::Attach { pid, offset }) => {
+        (None, Action::Attach { pid, offset }, _) => {
             remote::attach(pid, offset).await?;
         }
 
         // ── Mismatches ──
-        (Some(_), Action::Worker { .. }) | (Some(_), Action::Attach { .. }) => {
+        (Some(_), Action::Worker, _) | (Some(_), Action::Attach { .. }, _) => {
             return Err(anyhow!("worker/attach are internal commands, not used with a host"));
         }
-        (None, Action::Init) => {
+        (None, Action::Init, _) => {
             return Err(anyhow!("init requires a host"));
         }
-        (None, Action::Run { .. }) => {
+        (None, Action::Run { .. }, _) => {
             return Err(anyhow!("run requires a host"));
+        }
+        (None, Action::Script { .. }, _) => {
+            return Err(anyhow!("script requires a host"));
         }
     }
 
