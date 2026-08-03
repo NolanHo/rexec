@@ -4,16 +4,51 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
 use russh::client;
-use russh::keys::PrivateKeyWithHashAlg;
+use russh::keys::HashAlg;
 use russh::keys::PrivateKey;
+use russh::keys::PrivateKeyWithHashAlg;
 use russh::{ChannelMsg, client::AuthResult};
 
 use crate::RemoteHost;
 
 /// Attempt to load a private key from a path.
+///
+/// Tries OpenSSH's own format first (`-----BEGIN OPENSSH PRIVATE KEY-----`).
+/// Falls back to legacy PKCS#1 PEM (`-----BEGIN RSA PRIVATE KEY-----`), which
+/// `PrivateKey::from_openssh` rejects because it only accepts the OpenSSH PEM
+/// label. PKCS#8 (`-----BEGIN PRIVATE KEY-----`) is also handled via the same
+/// RSA path.
 fn load_private_key(path: &Path) -> Result<PrivateKey> {
-    PrivateKey::from_openssh(&std::fs::read_to_string(path)?)
-        .with_context(|| format!("loading private key from {}", path.display()))
+    let pem = std::fs::read_to_string(path)
+        .with_context(|| format!("reading private key from {}", path.display()))?;
+
+    match PrivateKey::from_openssh(&pem) {
+        Ok(key) => Ok(key),
+        Err(openssh_err) => {
+            // Legacy PEM formats that `PrivateKey::from_openssh` rejects
+            // (it only accepts the `OPENSSH PRIVATE KEY` label). Parse the raw
+            // RSA key directly, then wrap it into an SSH PrivateKey for russh
+            // to sign with. Try PKCS#1 (`RSA PRIVATE KEY`) then PKCS#8
+            // (`PRIVATE KEY`).
+            let rsa_key = {
+                use rsa::pkcs1::DecodeRsaPrivateKey;
+                rsa::RsaPrivateKey::from_pkcs1_pem(&pem)
+            }
+            .or_else(|_| {
+                use rsa::pkcs8::DecodePrivateKey;
+                rsa::RsaPrivateKey::from_pkcs8_pem(&pem)
+            })
+            .with_context(|| {
+                format!("parsing {} as OpenSSH/PKCS#1/PKCS#8", path.display())
+            })?;
+            let keypair = russh::keys::ssh_key::private::RsaKeypair::try_from(&rsa_key)
+                .context("converting RSA key to SSH keypair")?;
+            let key_data = russh::keys::ssh_key::private::KeypairData::Rsa(keypair);
+            PrivateKey::new(key_data, String::new())
+                .with_context(|| format!("building PrivateKey from {}", path.display()))
+                .map_err(|e| e.context(openssh_err))
+        }
+    }
 }
 
 /// Try to authenticate using SSH agent first, then fall back to identity files.
@@ -34,7 +69,9 @@ async fn authenticate(
     // 2. Try identity file from ssh config
     if let Some(id_file) = &remote.identity_file
         && let Ok(key) = load_private_key(id_file) {
-            let key_with_hash = PrivateKeyWithHashAlg::new(Arc::new(key), None);
+            // RSA: None would map to legacy ssh-rsa (SHA-1), which modern OpenSSH
+            // rejects; explicitly use rsa-sha2-256.
+            let key_with_hash = PrivateKeyWithHashAlg::new(Arc::new(key), Some(HashAlg::Sha256));
             let result = session
                 .authenticate_publickey(&user, key_with_hash)
                 .await?;
@@ -49,7 +86,7 @@ async fn authenticate(
         let path = home.join(".ssh").join(name);
         if path.exists()
             && let Ok(key) = load_private_key(&path) {
-                let key_with_hash = PrivateKeyWithHashAlg::new(Arc::new(key), None);
+                let key_with_hash = PrivateKeyWithHashAlg::new(Arc::new(key), Some(HashAlg::Sha256));
                 let result = session
                     .authenticate_publickey(&user, key_with_hash)
                     .await?;

@@ -1567,6 +1567,7 @@ dependencies = [
  "dirs",
  "libc",
  "rand",
+ "rsa",
  "russh",
  "russh-keys",
  "ssh2-config",
