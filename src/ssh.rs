@@ -220,45 +220,69 @@ pub async fn connect(remote: &RemoteHost) -> Result<client::Handle<ClientHandler
 }
 
 /// Upload the local rexec binary to ~/.rexec/rexec on the remote host.
-pub async fn upload_binary(session: &mut client::Handle<ClientHandler>) -> Result<()> {
-    // Read local binary
+///
+/// Uses `rsync` over SSH (same mechanism as `--sync`) instead of streaming the
+/// binary through a russh channel. Streaming a multi-MB payload via
+/// `channel.data()` deadlocks on channel flow control once the send window is
+/// exhausted, leaving a truncated remote binary that segfaults on launch.
+pub async fn upload_binary(
+    session: &mut client::Handle<ClientHandler>,
+    host: &str,
+) -> Result<()> {
+    // Resolve the running binary's real path (follows /proc/self/exe).
     let self_path = std::fs::read_link("/proc/self/exe").context("reading /proc/self/exe")?;
-    let binary = std::fs::read(&self_path)
-        .with_context(|| format!("reading binary {}", self_path.display()))?;
 
-    // Create remote directory and receive binary via cat
-    let mut channel = session.channel_open_session().await?;
-    channel
-        .exec(
-            true,
-            "mkdir -p ~/.rexec/logs && cat > ~/.rexec/rexec && chmod +x ~/.rexec/rexec",
-        )
-        .await?;
-
-    // Send binary data in chunks (SSH max packet ~32768)
-    for chunk in binary.chunks(32768) {
-        channel.data(chunk).await?;
+    // Ensure the remote dir exists and learn the remote home's absolute path so
+    // rsync can target it without relying on `~` expansion.
+    let home = exec_remote(session, "mkdir -p ~/.rexec/logs && printf '%s' ~").await?;
+    let home = home.trim().to_string();
+    if home.is_empty() {
+        return Err(anyhow!("could not determine remote HOME for worker upload"));
     }
-    channel.eof().await?;
+    let remote_target = format!("{}:{}/.rexec/rexec", host, home.trim_end_matches('/'));
 
-    // Wait for completion
-    while let Some(msg) = channel.wait().await {
-        match msg {
-            ChannelMsg::ExitStatus { exit_status } => {
-                if exit_status != 0 {
-                    return Err(anyhow!("upload failed (exit {})", exit_status));
-                }
-            }
-            ChannelMsg::Eof => break,
-            _ => {}
-        }
+    let ssh_opts = "-o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new -o ServerAliveInterval=5 -o ServerAliveCountMax=3";
+    let ssh_e = format!("ssh {}", ssh_opts);
+    let self_path_str = self_path.to_string_lossy().into_owned();
+
+    let child = tokio::process::Command::new("rsync")
+        .args([
+            "-az",
+            "-e",
+            ssh_e.as_str(),
+            self_path_str.as_str(),
+            remote_target.as_str(),
+        ])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .context("failed to spawn rsync for worker upload")?;
+
+    let output = tokio::time::timeout(Duration::from_secs(300), child.wait_with_output())
+        .await
+        .context("rsync timed out while uploading worker")?
+        .context("failed to wait for rsync")?;
+
+    if !output.status.success() {
+        return Err(anyhow!(
+            "rsync failed with status {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
     }
+
+    // Belt-and-suspenders: ensure the executable bit survives any umask quirk.
+    exec_remote(session, "chmod +x ~/.rexec/rexec").await?;
 
     Ok(())
 }
 
 /// Ensure the remote host has a matching rexec binary. Upload if missing or outdated.
-pub async fn ensure_remote_binary(session: &mut client::Handle<ClientHandler>) -> Result<()> {
+pub async fn ensure_remote_binary(
+    session: &mut client::Handle<ClientHandler>,
+    host: &str,
+) -> Result<()> {
     let local_version = env!("CARGO_PKG_VERSION");
     let expected = format!("rexec {}", local_version);
 
@@ -271,7 +295,7 @@ pub async fn ensure_remote_binary(session: &mut client::Handle<ClientHandler>) -
     }
 
     // Upload binary
-    upload_binary(session).await?;
+    upload_binary(session, host).await?;
     eprintln!("✓ Deployed rexec v{} to remote", local_version);
     Ok(())
 }

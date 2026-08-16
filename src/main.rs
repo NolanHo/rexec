@@ -395,9 +395,14 @@ fn shell_quote(s: &str) -> Result<String> {
 /// `unused_assignments`: `session = new_session` on reconnect keeps the SSH
 /// handle alive (channel holds an implicit ref), but the compiler can't see it.
 #[allow(unused_assignments)]
-async fn run_command(remote: &RemoteHost, command: &str, env: &[(String, String)]) -> Result<()> {
+async fn run_command(
+    remote: &RemoteHost,
+    host: &str,
+    command: &str,
+    env: &[(String, String)],
+) -> Result<()> {
     let mut session = ssh::connect(remote).await?;
-    ssh::ensure_remote_binary(&mut session).await?;
+    ssh::ensure_remote_binary(&mut session, host).await?;
 
     // Start worker on remote
     let worker_cmd = format!("~/.rexec/rexec worker -- {}", shell_quote(command)?);
@@ -657,7 +662,7 @@ async fn main() -> Result<()> {
             }
 
             let command = command.join(" ");
-            run_command(&remote, &command, &env_vars).await?;
+            run_command(&remote, &host, &command, &env_vars).await?;
         }
 
         // ── Remote operations (internal, invoked via SSH exec) ──
