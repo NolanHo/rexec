@@ -1,0 +1,42 @@
+# Release workflow: builds rexec for all supported platforms natively (no
+# cross toolchains) and attaches the binaries to a GitHub Release.
+#
+# The client downloads these assets to deploy the worker when the remote
+# platform differs from the local one (e.g. macOS local → Linux remote), so
+# asset names must match the `rexec-<os>-<arch>` convention used in src/ssh.rs.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Build ${{ matrix.asset }}
+    runs-on: ${{ matrix.runs_on }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runs_on: ubuntu-latest
+            asset: rexec-linux-amd64
+          - runs_on: ubuntu-24.04-arm
+            asset: rexec-linux-arm64
+          - runs_on: macos-13
+            asset: rexec-macos-amd64
+          - runs_on: macos-latest
+            asset: rexec-macos-arm64
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - run: cargo build --release
+
+      - name: Rename binary to asset name
+        run: cp target/release/remote-exec ${{ matrix.asset }}
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ matrix.asset }}

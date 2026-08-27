@@ -72,7 +72,7 @@ fn extract_command_and_env(buf: &[u8]) -> Result<(String, Vec<(String, String)>)
         None => {
             return Err(anyhow!(
                 "worker received no __REXEC_CMD__ over stdin (run via `rexec <host> run`)"
-            ))
+            ));
         }
     };
     Ok((command, entries))
@@ -97,8 +97,7 @@ pub async fn worker() -> Result<()> {
     // Create log directory and file
     let home = dirs::home_dir().context("cannot determine home directory")?;
     let log_dir = home.join(".rexec").join("logs");
-    std::fs::create_dir_all(&log_dir)
-        .with_context(|| format!("creating {}", log_dir.display()))?;
+    std::fs::create_dir_all(&log_dir).with_context(|| format!("creating {}", log_dir.display()))?;
     let log_path = log_dir.join(format!("{}.log", pid));
     let mut log_file = tokio::fs::File::create(&log_path)
         .await
@@ -119,7 +118,9 @@ pub async fn worker() -> Result<()> {
         let _ = stdin.read_to_end(&mut buf).await;
         extract_command_and_env(&buf)?
     } else {
-        return Err(anyhow!("worker requires a command over stdin (run via `rexec <host> run`)"));
+        return Err(anyhow!(
+            "worker requires a command over stdin (run via `rexec <host> run`)"
+        ));
     };
 
     // Spawn child process with the env vars applied.
@@ -139,7 +140,13 @@ pub async fn worker() -> Result<()> {
     let mut child_stderr = child.stderr.take().unwrap();
 
     // Send Started frame (non-fatal if log write fails)
-    write_frame(&Frame::started(pid), &mut log_file, &mut stdout, &mut stdout_ok).await?;
+    write_frame(
+        &Frame::started(pid),
+        &mut log_file,
+        &mut stdout,
+        &mut stdout_ok,
+    )
+    .await?;
 
     // Channel for collecting output frames from stdout/stderr readers
     let (frame_tx, mut frame_rx) = mpsc::channel::<Frame>(256);
@@ -237,7 +244,10 @@ pub async fn attach(pid: u32, offset: u64) -> Result<()> {
             stdout.flush().await?;
             return Ok(());
         }
-        return Err(anyhow!("log file not found for PID {} and process is alive", pid));
+        return Err(anyhow!(
+            "log file not found for PID {} and process is alive",
+            pid
+        ));
     }
 
     let mut stdout = tokio::io::stdout();

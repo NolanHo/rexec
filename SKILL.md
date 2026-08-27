@@ -114,5 +114,6 @@ rexec dev run --sync ./deploy.sh:/opt/app/deploy.sh -- "bash /opt/app/deploy.sh"
 
 ## Prerequisites
 
-- Local: `rsync`, SSH agent or keys.
-- Remote: `rsync`, `sh` (`rexec <host> init` verifies/installs).
+- Local (macOS or Linux): `rsync`, `curl`, SSH agent or keys.
+- Remote: Linux only — `rsync`, `sh` (`rexec <host> init` verifies/installs).
+- Cross-platform (e.g. macOS local → Linux remote) works out of the box: the worker is downloaded from GitHub Releases (needs a released tag matching the rexec version; cached in `~/.rexec/cache/`). Same-platform pairs deploy the running binary directly.

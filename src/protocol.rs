@@ -174,12 +174,8 @@ impl FrameReader {
             if self.buf.len() < HEADER_LEN {
                 return None;
             }
-            let len = u32::from_be_bytes([
-                self.buf[1],
-                self.buf[2],
-                self.buf[3],
-                self.buf[4],
-            ]) as usize;
+            let len =
+                u32::from_be_bytes([self.buf[1], self.buf[2], self.buf[3], self.buf[4]]) as usize;
 
             // Sanity check: reject absurdly large frames (max 16 MiB)
             if len > 16 * 1024 * 1024 {
@@ -318,14 +314,22 @@ mod tests {
     fn test_no_value_collision() {
         // Ensure output and input types don't share the same byte value
         let all_types = [
-            FrameType::Stdout, FrameType::Stderr,
-            FrameType::Started, FrameType::Exited,
-            FrameType::Stdin, FrameType::Resize,
-            FrameType::Signal, FrameType::Eof,
+            FrameType::Stdout,
+            FrameType::Stderr,
+            FrameType::Started,
+            FrameType::Exited,
+            FrameType::Stdin,
+            FrameType::Resize,
+            FrameType::Signal,
+            FrameType::Eof,
         ];
         let mut seen = std::collections::HashSet::new();
         for ft in &all_types {
-            assert!(seen.insert(*ft as u8), "duplicate byte value: {:#04x}", *ft as u8);
+            assert!(
+                seen.insert(*ft as u8),
+                "duplicate byte value: {:#04x}",
+                *ft as u8
+            );
         }
     }
 
@@ -359,7 +363,7 @@ mod tests {
     #[test]
     fn test_consumed_bytes_tracking() {
         let f1 = Frame::stdout(b"aaa".to_vec()); // 5 + 3 = 8 bytes
-        let f2 = Frame::stderr(b"bb".to_vec());   // 5 + 2 = 7 bytes
+        let f2 = Frame::stderr(b"bb".to_vec()); // 5 + 2 = 7 bytes
 
         let mut combined = Vec::new();
         combined.extend_from_slice(&f1.encode());

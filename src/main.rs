@@ -30,7 +30,11 @@ macro_rules! status {
 }
 
 #[derive(Parser)]
-#[command(name = "rexec", version, about = "Remote code execution + folder sync over SSH")]
+#[command(
+    name = "rexec",
+    version,
+    about = "Remote code execution + folder sync over SSH"
+)]
 struct Cli {
     /// SSH host alias (resolved via ~/.ssh/config) or user@host:port
     host: Option<String>,
@@ -191,7 +195,8 @@ fn resolve_host(host: &str, port_override: Option<u16>) -> Result<RemoteHost> {
             let config_str = std::fs::read_to_string(&ssh_config_path)
                 .with_context(|| format!("reading {}", ssh_config_path.display()))?;
             let mut reader = BufReader::new(config_str.as_bytes());
-            let config = SshConfig::default().parse(&mut reader, ParseRule::ALLOW_UNKNOWN_FIELDS)?;
+            let config =
+                SshConfig::default().parse(&mut reader, ParseRule::ALLOW_UNKNOWN_FIELDS)?;
             let host_config = config.query(host);
             RemoteHost {
                 hostname: host_config
@@ -255,7 +260,13 @@ async fn do_sync(local: &Path, remote_path: &str, remote: &RemoteHost) -> Result
     if local.is_file() {
         let remote_target = format!("{}:{}", rsync_host, remote_path);
         let mut child = tokio::process::Command::new("rsync")
-            .args(["-az", "-e", ssh_e.as_str(), &local.to_string_lossy(), &remote_target])
+            .args([
+                "-az",
+                "-e",
+                ssh_e.as_str(),
+                &local.to_string_lossy(),
+                &remote_target,
+            ])
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::inherit())
@@ -285,7 +296,14 @@ async fn do_sync(local: &Path, remote_path: &str, remote: &RemoteHost) -> Result
     };
 
     let mut child = tokio::process::Command::new("rsync")
-        .args(["-az", "--delete", "-e", ssh_e.as_str(), &local_arg, &format!("{}:{}", rsync_host, remote_arg)])
+        .args([
+            "-az",
+            "--delete",
+            "-e",
+            ssh_e.as_str(),
+            &local_arg,
+            &format!("{}:{}", rsync_host, remote_arg),
+        ])
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::inherit())
@@ -325,11 +343,17 @@ async fn wait_rsync(
                  Use `rsync -az -e 'ssh{}' {}:{}` manually to diagnose.",
                 timeout.as_secs(),
                 port_hint,
-                rsync_host, remote_path
+                rsync_host,
+                remote_path
             ));
         }
     }
-    status!("✓ Synced {} -> {}:{}", local.display(), rsync_host, remote_path);
+    status!(
+        "✓ Synced {} -> {}:{}",
+        local.display(),
+        rsync_host,
+        remote_path
+    );
     Ok(())
 }
 
@@ -347,7 +371,11 @@ mod tests {
             .output()
             .expect("failed to run sh");
         let result = String::from_utf8(output.stdout).unwrap();
-        assert_eq!(result, input, "shell_quote roundtrip failed for {:?}", input);
+        assert_eq!(
+            result, input,
+            "shell_quote roundtrip failed for {:?}",
+            input
+        );
     }
 
     #[test]
@@ -408,12 +436,29 @@ mod tests {
     #[test]
     fn test_run_env_and_command_parsing() {
         // -e/--env flags parse before the trailing command; --env-file accepts a path.
-        let cli = Cli::parse_from(["rexec", "h", "run", "-e", "A=b", "--env", "C=d", "--", "echo", "hi"]);
+        let cli = Cli::parse_from([
+            "rexec", "h", "run", "-e", "A=b", "--env", "C=d", "--", "echo", "hi",
+        ]);
         match cli.action {
-            Action::Run { env, env_file, command, .. } => {
-                assert_eq!(env, vec!["A=b".to_string(), "C=d".to_string()], "env: {:?}", env);
+            Action::Run {
+                env,
+                env_file,
+                command,
+                ..
+            } => {
+                assert_eq!(
+                    env,
+                    vec!["A=b".to_string(), "C=d".to_string()],
+                    "env: {:?}",
+                    env
+                );
                 assert!(env_file.is_empty());
-                assert_eq!(command, vec!["echo".to_string(), "hi".to_string()], "cmd: {:?}", command);
+                assert_eq!(
+                    command,
+                    vec!["echo".to_string(), "hi".to_string()],
+                    "cmd: {:?}",
+                    command
+                );
             }
             _ => panic!("not Run"),
         }
@@ -764,8 +809,8 @@ fn collect_env(env: &[String], env_file: &[PathBuf]) -> Result<Vec<(String, Stri
 /// a `#!` shebang), or `Some(cmd)` to run it via `cmd <script>`.
 fn detect_runner(script: &Path) -> Result<Option<String>> {
     use std::io::Read;
-    let mut f =
-        std::fs::File::open(script).with_context(|| format!("opening script {}", script.display()))?;
+    let mut f = std::fs::File::open(script)
+        .with_context(|| format!("opening script {}", script.display()))?;
     let mut buf = [0u8; 2];
     let n = f.read(&mut buf)?;
     if n == 2 && &buf == b"#!" {
@@ -789,7 +834,12 @@ async fn run_script(
 ) -> Result<()> {
     let basename = script
         .file_name()
-        .ok_or_else(|| anyhow!("cannot determine script file name from {}", script.display()))?
+        .ok_or_else(|| {
+            anyhow!(
+                "cannot determine script file name from {}",
+                script.display()
+            )
+        })?
         .to_string_lossy()
         .to_string();
 
@@ -847,8 +897,8 @@ fn list_hosts(alias: Option<&str>) -> Result<()> {
     if !path.exists() {
         return Err(anyhow!("~/.ssh/config not found at {}", path.display()));
     }
-    let config_str = std::fs::read_to_string(&path)
-        .with_context(|| format!("reading {}", path.display()))?;
+    let config_str =
+        std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
     let mut reader = BufReader::new(config_str.as_bytes());
     let config = SshConfig::default().parse(&mut reader, ParseRule::ALLOW_UNKNOWN_FIELDS)?;
 
@@ -868,7 +918,10 @@ fn list_hosts(alias: Option<&str>) -> Result<()> {
         return Ok(());
     }
 
-    println!("{:<24} {:<28} {:<6} {}", "ALIAS", "HOSTNAME", "PORT", "USER");
+    println!(
+        "{:<24} {:<28} {:<6} {}",
+        "ALIAS", "HOSTNAME", "PORT", "USER"
+    );
     for host in config.get_hosts() {
         let patterns: Vec<String> = host.pattern.iter().map(|c| c.to_string()).collect();
         // Skip pure-wildcard entries (e.g. "Host *") — no useful alias.
@@ -882,7 +935,11 @@ fn list_hosts(alias: Option<&str>) -> Result<()> {
             .clone()
             .unwrap_or_else(|| alias.split_whitespace().next().unwrap_or("").to_string());
         let port = host.params.port.unwrap_or(22);
-        let user = host.params.user.clone().unwrap_or_else(|| default_user.clone());
+        let user = host
+            .params
+            .user
+            .clone()
+            .unwrap_or_else(|| default_user.clone());
         println!("{:<24} {:<28} {:<6} {}", alias, hostname, port, user);
     }
     Ok(())
@@ -900,7 +957,16 @@ async fn main() -> Result<()> {
             let mut session = ssh::connect(&remote).await?;
             ssh::check_and_install_deps(&mut session).await?;
         }
-        (Some(host), Action::Run { sync, env, env_file, command }, port) => {
+        (
+            Some(host),
+            Action::Run {
+                sync,
+                env,
+                env_file,
+                command,
+            },
+            port,
+        ) => {
             if command.is_empty() {
                 return Err(anyhow!(
                     "no command provided. Usage: rexec <host> run [--sync LOCAL:REMOTE] [--env KEY=VALUE]... -- <command...>"
@@ -915,7 +981,18 @@ async fn main() -> Result<()> {
             let command = command.join(" ");
             run_command(&remote, &host, &command, &env_vars).await?;
         }
-        (Some(host), Action::Script { script, interpreter, sync_to, env, env_file, args }, port) => {
+        (
+            Some(host),
+            Action::Script {
+                script,
+                interpreter,
+                sync_to,
+                env,
+                env_file,
+                args,
+            },
+            port,
+        ) => {
             let remote = resolve_host(&host, port)?;
             let env_vars = collect_env(&env, &env_file)?;
             run_script(
@@ -945,7 +1022,9 @@ async fn main() -> Result<()> {
 
         // ── Mismatches ──
         (Some(_), Action::Worker, _) | (Some(_), Action::Attach { .. }, _) => {
-            return Err(anyhow!("worker/attach are internal commands, not used with a host"));
+            return Err(anyhow!(
+                "worker/attach are internal commands, not used with a host"
+            ));
         }
         (None, Action::Init, _) => {
             return Err(anyhow!("init requires a host"));

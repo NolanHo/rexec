@@ -2,13 +2,15 @@
 
 A CLI to sync local files/folders and run commands on remote hosts over SSH, designed to survive SSH disconnections. The remote worker keeps running after SSH drops; the CLI auto-reconnects and resumes output from the last byte.
 
+**Platforms**: local macOS/Linux → remote Linux (amd64/arm64). When the two differ (e.g. macOS local → Linux remote), the worker binary for the remote is downloaded from GitHub Releases automatically — the remote needs no internet access.
+
 ## Features
 
 - **Folder/file sync**: rsync a local file or folder to the remote before running
 - **Script run**: one-command sync + run a local script (`script` subcommand)
 - **Host listing**: list SSH hosts from `~/.ssh/config` (`list` subcommand)
 - **Disconnect resilience**: remote worker ignores SIGHUP and writes to a log; CLI reconnects with backoff and resumes from the last byte
-- **Auto binary deploy**: uploads itself to the remote on first use, version-checked each run
+- **Auto binary deploy**: deploys a version-matched worker to the remote on first use — uploads itself when platforms match, otherwise downloads the prebuilt worker from GitHub Releases (e.g. macOS local → Linux remote)
 - **Secrets/command out of argv**: env vars and the command are sent over stdin, never visible in the remote worker's `ps` / `pkill -f` / `pgrep -f`
 - **SSH config**: resolves host aliases from `~/.ssh/config`; `user@host:port` literals work everywhere (run **and** sync)
 - **Quiet mode**: `--quiet` suppresses progress lines so stdout carries only the command's own output
@@ -16,8 +18,14 @@ A CLI to sync local files/folders and run commands on remote hosts over SSH, des
 ## Install
 
 ```bash
+# From source
 cargo build --release
 cp target/release/remote-exec ~/.local/bin/rexec
+
+# Or download a prebuilt binary (linux/macos × amd64/arm64 — pick your platform)
+curl -fL -o ~/.local/bin/rexec \
+  https://github.com/Menghuan1918/rexec/releases/latest/download/rexec-macos-arm64
+chmod +x ~/.local/bin/rexec
 ```
 
 ## Usage
@@ -88,7 +96,7 @@ Reads `~/.ssh/config` and prints each host's alias, hostname, port, and user (pu
 
 1. If `--sync` is given, runs `rsync -az [--delete] -e "ssh [-p PORT] ..."` to sync the local file/folder to the remote. The port from `host:port` or `--port` is passed to rsync via `ssh -p` (so `user@host:port` works for sync too).
 2. Connects via russh (pure Rust SSH), authenticates via agent → identity-file → default keys.
-3. Ensures `~/.rexec/rexec` exists on the remote and matches the local version (auto-uploads if not).
+3. Ensures `~/.rexec/rexec` exists on the remote and matches the local version. If the remote platform matches the local one, it uploads the running binary via rsync; otherwise it downloads the version-pinned worker from GitHub Releases (cached in `~/.rexec/cache/`, so each version/target is downloaded once) and rsyncs that over.
 4. Starts `~/.rexec/rexec worker` over the SSH channel. The **command and env vars are sent over stdin** (not argv), so neither appears in the remote worker's `ps`/`pkill -f`/`pgrep -f` output.
 5. The worker ignores SIGHUP, spawns `sh -c <command>`, and streams stdout/stderr back via a binary frame protocol — writing every frame to `~/.rexec/logs/<pid>.log` and to the SSH channel.
 6. On SSH disconnect: the worker keeps running; the CLI reconnects with exponential backoff (1s→30s, max 10) and resumes from the last byte offset via `~/.rexec/rexec attach --pid <PID> --offset <N>`.
@@ -118,6 +126,16 @@ cargo build --release
 # Binary at target/release/remote-exec
 ```
 
+### Releasing
+
+Push a tag to trigger `.github/workflows/release.yml`, which builds native binaries for linux/macos × amd64/arm64 and attaches them to a GitHub Release:
+
+```bash
+git tag v0.1.3 && git push origin v0.1.3
+```
+
+Cross-platform deploys (e.g. macOS local → Linux remote) download these release assets pinned to the running version, so a version must be released before it can deploy a mismatched remote platform.
+
 ## Dependencies
 
 - `russh` — pure Rust SSH client
@@ -127,4 +145,5 @@ cargo build --release
 - `anyhow` — error handling
 - `dirs`, `libc`, `rsa`, `russh-keys`, `rand`
 - `rsync` (system) — required for sync (local + remote)
+- `curl` (system) — required locally, to download cross-platform workers from GitHub Releases
 - `sh` (system) — required on the remote
