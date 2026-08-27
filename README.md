@@ -128,10 +128,10 @@ cargo build --release
 
 ### Releasing
 
-Push a tag to trigger `.github/workflows/release.yml`, which builds native binaries for linux/macos × amd64/arm64 and attaches them to a GitHub Release:
+Push a tag to trigger the release chain: `.github/workflows/release.yml` builds native binaries for linux/macos × amd64/arm64 and attaches them to a GitHub Release; `.github/workflows/publish.yml` then auto-publishes the crate to [crates.io](https://crates.io/crates/remote-exec) via trusted publishing (OIDC token exchange, no stored API token):
 
 ```bash
-git tag v0.1.3 && git push origin v0.1.3
+git tag v0.2.1 && git push origin v0.2.1
 ```
 
 Cross-platform deploys (e.g. macOS local → Linux remote) download these release assets pinned to the running version, so a version must be released before it can deploy a mismatched remote platform.

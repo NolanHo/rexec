@@ -1,0 +1,40 @@
+# Auto-publish the crate to crates.io when a GitHub Release is published.
+#
+# Uses crates.io trusted publishing: a short-lived registry token is obtained
+# by exchanging the workflow's OIDC token — no long-lived API token is stored
+# as a secret. The trusted-publisher entry configured on crates.io must match
+# this file: repository Menghuan1918/rexec, workflow filename publish.yml,
+# no environment.
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Publish exactly the tagged source, not the default branch head.
+          ref: ${{ github.event.release.tag_name }}
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Ensure tag matches Cargo.toml version
+        run: |
+          version="$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)"
+          if [ "v$version" != "${{ github.event.release.tag_name }}" ]; then
+            echo "tag ${{ github.event.release.tag_name }} does not match Cargo.toml version $version" >&2
+            exit 1
+          fi
+
+      - uses: rust-lang/crates-io-auth-action@v1
+        id: auth
+
+      - run: cargo publish --locked
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
