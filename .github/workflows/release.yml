@@ -5,12 +5,21 @@
 # platform differs from the local one (e.g. macOS local → Linux remote), so
 # asset names must match the `rexec-<os>-<arch>` convention used in src/ssh.rs.
 #
-# Every entry sets an explicit rustc target. linux/macos-arm64 build natively;
-# macos-amd64 is cross-compiled on an arm64 runner (the intel macos-13 runners
-# are retired).
+# Every entry sets an explicit rustc target. Linux builds are statically
+# linked against musl so the worker runs on any distro regardless of its
+# glibc version (e.g. servers on glibc 2.35 can't run ubuntu-24.04-built
+# binaries). macos-amd64 is cross-compiled on an arm64 runner (the intel
+# macos-13 runners are retired).
+#
+# workflow_dispatch lets you rebuild the assets for an already-released tag.
 on:
   push:
     tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to rebuild assets for (e.g. v0.2.0)"
+        required: true
 
 permissions:
   contents: write
@@ -25,10 +34,10 @@ jobs:
         include:
           - runs_on: ubuntu-latest
             asset: rexec-linux-amd64
-            target: x86_64-unknown-linux-gnu
+            target: x86_64-unknown-linux-musl
           - runs_on: ubuntu-24.04-arm
             asset: rexec-linux-arm64
-            target: aarch64-unknown-linux-gnu
+            target: aarch64-unknown-linux-musl
           - runs_on: macos-latest
             asset: rexec-macos-amd64
             target: x86_64-apple-darwin
@@ -37,16 +46,23 @@ jobs:
             target: aarch64-apple-darwin
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref_name }}
+
+      - name: Install musl toolchain (Linux targets)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq musl-tools
 
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
 
-      - run: cargo build --release --target ${{ matrix.target }}
+      - run: cargo build --release --locked --target ${{ matrix.target }}
 
       - name: Rename binary to asset name
         run: cp target/${{ matrix.target }}/release/remote-exec ${{ matrix.asset }}
 
       - uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ inputs.tag || github.ref_name }}
           files: ${{ matrix.asset }}
