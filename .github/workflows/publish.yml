@@ -1,4 +1,10 @@
-# Auto-publish the crate to crates.io when a GitHub Release is published.
+# Auto-publish the crate to crates.io when a version tag is pushed
+# (same trigger as release.yml, which builds the GitHub Release binaries).
+#
+# A `workflow_dispatch` input is provided to publish an already-released tag
+# manually — needed for the v0.2.0 release, whose tag predates this workflow.
+# (Releases created by release.yml via GITHUB_TOKEN do NOT emit a usable
+# `release` event to other workflows, so that trigger can't be used here.)
 #
 # Uses crates.io trusted publishing: a short-lived registry token is obtained
 # by exchanging the workflow's OIDC token — no long-lived API token is stored
@@ -6,8 +12,13 @@
 # this file: repository Menghuan1918/rexec, workflow filename publish.yml,
 # no environment.
 on:
-  release:
-    types: [published]
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to publish (e.g. v0.2.0)"
+        required: true
 
 permissions:
   contents: read
@@ -20,15 +31,16 @@ jobs:
       - uses: actions/checkout@v4
         with:
           # Publish exactly the tagged source, not the default branch head.
-          ref: ${{ github.event.release.tag_name }}
+          ref: ${{ inputs.tag || github.ref_name }}
 
       - uses: dtolnay/rust-toolchain@stable
 
       - name: Ensure tag matches Cargo.toml version
         run: |
+          tag="${{ inputs.tag || github.ref_name }}"
           version="$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)"
-          if [ "v$version" != "${{ github.event.release.tag_name }}" ]; then
-            echo "tag ${{ github.event.release.tag_name }} does not match Cargo.toml version $version" >&2
+          if [ "v$version" != "$tag" ]; then
+            echo "tag $tag does not match Cargo.toml version $version" >&2
             exit 1
           fi
 

@@ -128,7 +128,7 @@ cargo build --release
 
 ### Releasing
 
-Push a tag to trigger the release chain: `.github/workflows/release.yml` builds native binaries for linux/macos × amd64/arm64 and attaches them to a GitHub Release; `.github/workflows/publish.yml` then auto-publishes the crate to [crates.io](https://crates.io/crates/remote-exec) via trusted publishing (OIDC token exchange, no stored API token):
+Push a tag to trigger both release workflows: `.github/workflows/release.yml` builds native binaries for linux/macos × amd64/arm64 and attaches them to a GitHub Release, while `.github/workflows/publish.yml` publishes the crate to [crates.io](https://crates.io/crates/remote-exec) via trusted publishing (OIDC token exchange, no API token stored as a secret). A tag can also be published manually: `gh workflow run publish.yml -f tag=v0.2.1`.
 
 ```bash
 git tag v0.2.1 && git push origin v0.2.1
