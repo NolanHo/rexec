@@ -1,9 +1,13 @@
-# Release workflow: builds rexec for all supported platforms natively (no
-# cross toolchains) and attaches the binaries to a GitHub Release.
+# Release workflow: builds rexec for all supported platforms and attaches the
+# binaries to a GitHub Release.
 #
 # The client downloads these assets to deploy the worker when the remote
 # platform differs from the local one (e.g. macOS local → Linux remote), so
 # asset names must match the `rexec-<os>-<arch>` convention used in src/ssh.rs.
+#
+# Every entry sets an explicit rustc target. linux/macos-arm64 build natively;
+# macos-amd64 is cross-compiled on an arm64 runner (the intel macos-13 runners
+# are retired).
 on:
   push:
     tags: ["v*"]
@@ -21,21 +25,27 @@ jobs:
         include:
           - runs_on: ubuntu-latest
             asset: rexec-linux-amd64
+            target: x86_64-unknown-linux-gnu
           - runs_on: ubuntu-24.04-arm
             asset: rexec-linux-arm64
-          - runs_on: macos-13
+            target: aarch64-unknown-linux-gnu
+          - runs_on: macos-latest
             asset: rexec-macos-amd64
+            target: x86_64-apple-darwin
           - runs_on: macos-latest
             asset: rexec-macos-arm64
+            target: aarch64-apple-darwin
     steps:
       - uses: actions/checkout@v4
 
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
 
-      - run: cargo build --release
+      - run: cargo build --release --target ${{ matrix.target }}
 
       - name: Rename binary to asset name
-        run: cp target/release/remote-exec ${{ matrix.asset }}
+        run: cp target/${{ matrix.target }}/release/remote-exec ${{ matrix.asset }}
 
       - uses: softprops/action-gh-release@v2
         with:
