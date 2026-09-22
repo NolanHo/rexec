@@ -115,7 +115,7 @@ On Windows the local side of `--sync` must be an MSYS2/WSL-style path (`/c/proj`
 |--------|-------------|
 | `-p PORT` / `--port PORT` | SSH port (overrides `host:port` and ssh-config `Port`) |
 | `-v` / `--verbose` | Print the decision trace (resolution, auth, deploy, reconnect, timings) even on success. Errors always carry it |
-| `--json` | Emit one machine-readable result summary line on stderr (see Output contract). Applies to `run`/`script`/`plan`/`init`; the local-only subcommands (`list`, `history …`) ignore it |
+| `--json` | Emit one machine-readable result summary line on stderr (see Output contract). Applies to `run`/`script`/`plan`/`init`; `list` emits its own host array; `history …` ignores it |
 | `--no-history` | Do not record this run in the local execution history (same as `REXEC_HISTORY=0`); reading `rexec history …` still works |
 | `--reveal-secrets` | Print secret values (env vars) instead of `***` in output. Values are **recorded** locally either way; without this flag every printed surface masks them |
 | `-q` / `--quiet` | Suppress the remaining warning/progress lines. Errors are never suppressed |
@@ -136,7 +136,23 @@ Syncs the script to `~/.rexec/scripts/` (or `--sync-to`), then runs it. The inte
 rexec list [alias]
 ```
 
-Reads `~/.ssh/config` and prints each host's alias, hostname, port, and user (pure-wildcard entries like `Host *` are skipped). Pass an alias for the resolved details of a single host.
+Reads `~/.ssh/config` (Include-expanded) and prints the host inventory. Two stages by design: the default table is name-level — `ALIAS  HOSTNAME  DESCRIPTION` — because an alias is all `rexec <alias> run` needs; the connection details are one flag (or one host) away.
+
+```bash
+rexec list                      # alias, hostname, description
+rexec list --long               # + port, user, identity
+rexec list my-server            # resolved details for one alias
+rexec list --filter prod        # substring over alias/hostname/user/description
+rexec list -f 'web*' -f staging # repeatable; every pattern must match (globs hit alias/hostname)
+rexec list --user root --port 2222
+rexec list --json               # machine-readable array
+```
+
+- **Descriptions** come from either place (the sidecar wins when both exist):
+  - a `# rexec: <text>` comment line directly above a `Host` line in the ssh config — including `Include`d files, since the config is read through the Include-expanding loader; it attaches to every concrete pattern on that line;
+  - `~/.rexec/hosts.conf`, one `alias = description` per line (`#` comments allowed) — for annotating aliases without editing their config. It only *annotates* hosts that exist in the ssh config; it never defines a host.
+- **Filtering**: `--filter/-f PATTERN` is a case-insensitive substring over alias, hostname, user and description; with `*`/`?` it is a glob over alias and hostname instead. Repeatable (all must match), and `--user`/`--port` are exact field filters. An empty result prints a note on stderr and exits 0.
+- Pure-wildcard entries (`Host *`) are skipped: there is no alias to run.
 
 ### `history` — recorded runs
 

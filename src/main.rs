@@ -209,8 +209,28 @@ enum Action {
 
     /// List SSH hosts configured in ~/.ssh/config
     List {
-        /// Optional: show resolved details for a single alias
+        /// Optional: show resolved details (user, port, identity, description)
+        /// for a single alias
         alias: Option<String>,
+
+        /// Also show the detail columns (port, user, identity); the default
+        /// table is name-level only — an alias is all `rexec <alias> run` needs
+        #[arg(short = 'l', long = "long")]
+        long: bool,
+
+        /// Keep hosts whose alias/hostname/user/description matches PATTERN
+        /// (case-insensitive substring; `*`/`?` make it a glob over
+        /// alias+hostname). Repeatable — every pattern must match
+        #[arg(short = 'f', long = "filter", value_name = "PATTERN")]
+        filter: Vec<String>,
+
+        /// Keep hosts whose resolved user equals NAME (case-insensitive)
+        #[arg(long = "user", value_name = "NAME")]
+        user: Option<String>,
+
+        /// Keep hosts whose resolved port equals PORT
+        #[arg(long = "port", value_name = "PORT")]
+        port: Option<u16>,
     },
 
     /// Show what a run WOULD do — resolution, deploy decision, launch command —
@@ -1665,6 +1685,101 @@ mod tests {
             "no Include lines may survive: {text}"
         );
         std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    fn host_entry(alias: &str, hostname: &str, user: &str, desc: Option<&str>) -> HostEntry {
+        HostEntry {
+            alias: alias.to_string(),
+            hostname: hostname.to_string(),
+            port: 22,
+            user: user.to_string(),
+            identity: None,
+            description: desc.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn test_glob_match() {
+        assert!(glob_match("web*", "web1"));
+        assert!(glob_match("web*", "WEB-prod"));
+        assert!(glob_match("*prod*", "a-prod-b"));
+        assert!(glob_match("h?st", "host"));
+        assert!(glob_match("*", "anything"));
+        assert!(glob_match("exact", "exact"));
+        assert!(!glob_match("h?st", "hoost"));
+        assert!(!glob_match("web*", "app1"));
+        assert!(!glob_match("a*b*c", "a-b")); // trailing literal missing
+        assert!(glob_match("a*b*c", "a1b2c"));
+    }
+
+    #[test]
+    fn test_host_matches_filters() {
+        let e = host_entry("mint-dev", "192.168.4.70", "root", Some("H20 training box"));
+        let no = |p: &[&str]| p.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        // plain patterns: substring over alias, hostname, user and description
+        assert!(host_matches(&e, &no(&["mint"]), None, None));
+        assert!(host_matches(&e, &no(&["168.4"]), None, None), "hostname");
+        assert!(
+            host_matches(&e, &no(&["ROOT"]), None, None),
+            "user, case-folded"
+        );
+        assert!(
+            host_matches(&e, &no(&["training"]), None, None),
+            "description"
+        );
+        assert!(!host_matches(&e, &no(&["web"]), None, None));
+        // globs match alias/hostname only
+        assert!(host_matches(&e, &no(&["mint-*"]), None, None));
+        assert!(host_matches(&e, &no(&["192.168.*"]), None, None));
+        assert!(
+            !host_matches(&e, &no(&["*raining*"]), None, None),
+            "no glob over description"
+        );
+        // several patterns must all match
+        assert!(host_matches(&e, &no(&["mint", "70"]), None, None));
+        assert!(!host_matches(&e, &no(&["mint", "web"]), None, None));
+        // exact field filters
+        assert!(host_matches(&e, &[], Some("root"), Some(22)));
+        assert!(!host_matches(&e, &[], Some("nolan"), None));
+        assert!(!host_matches(&e, &[], None, Some(2222)));
+    }
+
+    #[test]
+    fn test_descriptions_from_config_text_and_sidecar() {
+        // The annotation attaches to the Host line that follows it, survives a
+        // blank line, and covers every concrete pattern on that line.
+        let text = "# rexec: fleet head node\n\nHost fleet-0 fleet-head\n  HostName 1.2.3.4\n# rexec: training box\nHost train-1\n  Port 2222\nHost *\n  User root\n";
+        let map = descriptions_from_config_text(text);
+        assert_eq!(
+            map.get("fleet-0").map(String::as_str),
+            Some("fleet head node")
+        );
+        assert_eq!(
+            map.get("fleet-head").map(String::as_str),
+            Some("fleet head node")
+        );
+        assert_eq!(map.get("train-1").map(String::as_str), Some("training box"));
+        assert!(!map.contains_key("*"), "wildcards get no annotation");
+
+        // A directive between comment and Host detaches the annotation.
+        let detached = "# rexec: stale\nUser root\nHost later\n";
+        assert!(descriptions_from_config_text(detached).is_empty());
+
+        // Sidecar: `alias = description`, comments/blanks ignored, last wins.
+        let dir = std::env::temp_dir().join(format!("rexec-sidecar-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let side = dir.join("hosts.conf");
+        std::fs::write(
+            &side,
+            "# comment\nalpha = first\nalpha = second\n\nbeta = only\n= noname\nemptydesc =\n",
+        )
+        .unwrap();
+        let side_map = descriptions_from_sidecar(&side);
+        assert_eq!(side_map.get("alpha").map(String::as_str), Some("second"));
+        assert_eq!(side_map.get("beta").map(String::as_str), Some("only"));
+        assert_eq!(side_map.len(), 2, "nameless/valueless lines are skipped");
+        assert!(descriptions_from_sidecar(&dir.join("missing.conf")).is_empty());
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
@@ -3347,9 +3462,197 @@ async fn plan_command(
 }
 
 /// List SSH hosts from ~/.ssh/config (the `list` subcommand).
-fn list_hosts(alias: Option<&str>) -> Result<()> {
-    let (_path, config) = load_user_ssh_config()?;
+/// One row of `rexec list`: everything the table can show, collected once so
+/// filtering, the short/long shapes and `--json` all read the same data.
+struct HostEntry {
+    alias: String,
+    hostname: String,
+    port: u16,
+    user: String,
+    /// Resolved `IdentityFile` (first one configured), shown in `--long`.
+    identity: Option<String>,
+    description: Option<String>,
+}
 
+/// Descriptions for hosts, from two places (a sidecar entry wins):
+///
+/// 1. A `# rexec: <text>` comment line directly above a `Host` line in the
+///    ssh config — including `Include`d files, because the config is read
+///    through the Include-expanding loader. The comment attaches to every
+///    concrete pattern on that line (wildcards and negations are skipped).
+/// 2. `~/.rexec/hosts.conf`, one `alias = description` per line (`#` comments
+///    and blank lines ignored) — for aliases whose config lives somewhere you
+///    do not want to edit, or that come from a generator.
+fn host_descriptions(config_path: &Path) -> std::collections::HashMap<String, String> {
+    let text = load_ssh_config_text(config_path).unwrap_or_default();
+    let mut out = descriptions_from_config_text(&text);
+    if let Some(home) = dirs::home_dir() {
+        // Sidecar entries win: they are the explicit, rexec-owned annotation.
+        out.extend(descriptions_from_sidecar(
+            &home.join(".rexec").join("hosts.conf"),
+        ));
+    }
+    out
+}
+
+/// The `# rexec: <text>` half of [`host_descriptions`], over an already
+/// Include-expanded config text.
+fn descriptions_from_config_text(text: &str) -> std::collections::HashMap<String, String> {
+    let mut out = std::collections::HashMap::new();
+    let mut pending: Option<String> = None;
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if let Some(rest) = trimmed
+            .strip_prefix('#')
+            .map(str::trim_start)
+            .and_then(|c| {
+                c.strip_prefix("rexec:")
+                    .or_else(|| c.strip_prefix("REXEC:"))
+            })
+        {
+            let text = rest.trim();
+            if !text.is_empty() {
+                pending = Some(text.to_string());
+            }
+            continue;
+        }
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue; // blank/other comments keep the annotation attached
+        }
+        if is_host_line(line) {
+            let patterns = trimmed
+                .split_once(|c: char| c.is_whitespace() || c == '=')
+                .map(|(_, rest)| rest)
+                .unwrap_or("")
+                .trim_start_matches('=')
+                .split_whitespace();
+            if let Some(desc) = &pending {
+                for p in patterns {
+                    if p != "*" && !p.starts_with('!') {
+                        out.entry(p.to_string()).or_insert_with(|| desc.clone());
+                    }
+                }
+            }
+            pending = None;
+            continue;
+        }
+        // Any other directive ends the annotation's reach.
+        pending = None;
+    }
+
+    out
+}
+
+/// The `~/.rexec/hosts.conf` half: one `alias = description` per line.
+///
+/// Read errors (missing file included) yield an empty map — a listing must not
+/// fail because an optional annotation file is absent.
+fn descriptions_from_sidecar(path: &Path) -> std::collections::HashMap<String, String> {
+    let mut out = std::collections::HashMap::new();
+    let Ok(content) = std::fs::read_to_string(path) else {
+        return out;
+    };
+    for line in content.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if let Some((alias, desc)) = line.split_once('=') {
+            let (alias, desc) = (alias.trim(), desc.trim());
+            if !alias.is_empty() && !desc.is_empty() {
+                out.insert(alias.to_string(), desc.to_string());
+            }
+        }
+    }
+    out
+}
+
+/// Case-insensitive glob over a string: `*` matches any run (including empty),
+/// `?` exactly one character. Written out rather than pulled from a glob crate
+/// because the target is a name, not a path.
+fn glob_match(pattern: &str, text: &str) -> bool {
+    let (p, t): (Vec<char>, Vec<char>) = (
+        pattern.to_ascii_lowercase().chars().collect(),
+        text.to_ascii_lowercase().chars().collect(),
+    );
+    let (mut pi, mut ti) = (0usize, 0usize);
+    let (mut star, mut mark) = (None::<usize>, 0usize);
+    while ti < t.len() {
+        if pi < p.len() && (p[pi] == '?' || p[pi] == t[ti]) {
+            pi += 1;
+            ti += 1;
+        } else if pi < p.len() && p[pi] == '*' {
+            star = Some(pi);
+            mark = ti;
+            pi += 1;
+        } else if let Some(sp) = star {
+            pi = sp + 1;
+            mark += 1;
+            ti = mark;
+        } else {
+            return false;
+        }
+    }
+    while pi < p.len() && p[pi] == '*' {
+        pi += 1;
+    }
+    pi == p.len()
+}
+
+/// Does a host survive the filters?
+///
+/// A pattern with `*`/`?` glob-matches the alias and hostname only (a glob over
+/// a description is rarely what someone means); a plain pattern is a
+/// case-insensitive substring test over alias, hostname, user and description —
+/// so `-f prod`, `-f sk-`, `-f web1` and `-f "training box"` all do the obvious
+/// thing. Several patterns must all match; `--user`/`--port` are exact.
+fn host_matches(
+    entry: &HostEntry,
+    patterns: &[String],
+    user: Option<&str>,
+    port: Option<u16>,
+) -> bool {
+    if let Some(u) = user
+        && !entry.user.eq_ignore_ascii_case(u)
+    {
+        return false;
+    }
+    if let Some(p) = port
+        && entry.port != p
+    {
+        return false;
+    }
+    patterns.iter().all(|pat| {
+        if pat.contains('*') || pat.contains('?') {
+            glob_match(pat, &entry.alias) || glob_match(pat, &entry.hostname)
+        } else {
+            let needle = pat.to_ascii_lowercase();
+            entry.alias.to_ascii_lowercase().contains(&needle)
+                || entry.hostname.to_ascii_lowercase().contains(&needle)
+                || entry.user.to_ascii_lowercase().contains(&needle)
+                || entry
+                    .description
+                    .as_deref()
+                    .is_some_and(|d| d.to_ascii_lowercase().contains(&needle))
+        }
+    })
+}
+
+/// `rexec list`: the host inventory.
+///
+/// Two stages by design: the default table is name-level (alias, hostname,
+/// description) because an alias is all a `rexec <alias> run` needs; `--long`
+/// adds the connection details, and passing an alias prints them for that one
+/// host. stdout carries the table (or the `--json` array) and nothing else.
+fn list_hosts(
+    alias: Option<&str>,
+    long: bool,
+    filter: &[String],
+    user: Option<&str>,
+    port: Option<u16>,
+) -> Result<()> {
+    let (path, config) = load_user_ssh_config()?;
+    let descriptions = host_descriptions(&path);
     let default_user = default_user();
 
     if let Some(a) = alias {
@@ -3363,13 +3666,14 @@ fn list_hosts(alias: Option<&str>) -> Result<()> {
         {
             println!("{:<24} identity: {}", "", first.display());
         }
+        if let Some(desc) = descriptions.get(a) {
+            println!("{:<24} description: {}", "", desc);
+        }
         return Ok(());
     }
 
-    println!(
-        "{:<24} {:<28} {:<6} {}",
-        "ALIAS", "HOSTNAME", "PORT", "USER"
-    );
+    // Collect every named host block, then filter.
+    let mut entries: Vec<HostEntry> = Vec::new();
     for host in config.get_hosts() {
         let patterns: Vec<String> = host.pattern.iter().map(|c| c.to_string()).collect();
         // Skip pure-wildcard entries (e.g. "Host *") — no useful alias.
@@ -3382,13 +3686,94 @@ fn list_hosts(alias: Option<&str>) -> Result<()> {
             .host_name
             .clone()
             .unwrap_or_else(|| alias.split_whitespace().next().unwrap_or("").to_string());
-        let port = host.params.port.unwrap_or(22);
-        let user = host
-            .params
-            .user
-            .clone()
-            .unwrap_or_else(|| default_user.clone());
-        println!("{:<24} {:<28} {:<6} {}", alias, hostname, port, user);
+        entries.push(HostEntry {
+            description: patterns.iter().find_map(|p| descriptions.get(p).cloned()),
+            alias,
+            hostname,
+            port: host.params.port.unwrap_or(22),
+            user: host
+                .params
+                .user
+                .clone()
+                .unwrap_or_else(|| default_user.clone()),
+            identity: host
+                .params
+                .identity_file
+                .as_ref()
+                .and_then(|v| v.first())
+                .map(|p| p.display().to_string()),
+        });
+    }
+    let total = entries.len();
+    entries.retain(|e| host_matches(e, filter, user, port));
+
+    if JSON_SUMMARY.load(Ordering::Relaxed) {
+        let rows: Vec<serde_json::Value> = entries
+            .iter()
+            .map(|e| {
+                serde_json::json!({
+                    "alias": e.alias,
+                    "hostname": e.hostname,
+                    "port": e.port,
+                    "user": e.user,
+                    "identity": e.identity,
+                    "description": e.description,
+                })
+            })
+            .collect();
+        println!("{}", serde_json::Value::Array(rows));
+        return Ok(());
+    }
+
+    if entries.is_empty() {
+        eprintln!(
+            "no hosts match ({} configured{})",
+            total,
+            if filter.is_empty() && user.is_none() && port.is_none() {
+                ""
+            } else {
+                " — adjust --filter/--user/--port"
+            }
+        );
+        return Ok(());
+    }
+
+    // Name-level by default: the port/user/identity columns are stage two.
+    if long {
+        println!(
+            "{:<24} {:<28} {:<6} {:<12} {:<30} DESCRIPTION",
+            "ALIAS", "HOSTNAME", "PORT", "USER", "IDENTITY"
+        );
+        for e in &entries {
+            println!(
+                "{:<24} {:<28} {:<6} {:<12} {:<30} {}",
+                e.alias,
+                e.hostname,
+                e.port,
+                e.user,
+                e.identity
+                    .as_deref()
+                    .map(|i| single_line(i, 28))
+                    .unwrap_or_else(|| "-".to_string()),
+                e.description
+                    .as_deref()
+                    .map(|d| single_line(d, 60))
+                    .unwrap_or_default()
+            );
+        }
+    } else {
+        println!("{:<24} {:<28} DESCRIPTION", "ALIAS", "HOSTNAME");
+        for e in &entries {
+            println!(
+                "{:<24} {:<28} {}",
+                e.alias,
+                e.hostname,
+                e.description
+                    .as_deref()
+                    .map(|d| single_line(d, 60))
+                    .unwrap_or_default()
+            );
+        }
     }
     Ok(())
 }
@@ -4296,8 +4681,9 @@ async fn main() -> Result<()> {
         Ordering::Relaxed,
     );
 
-    // The JSON summary describes an execution run; `list` and `history` (and
-    // the internal worker/attach commands) have no such summary to report.
+    // The JSON summary describes an execution run; `history` (and the internal
+    // worker/attach commands) have no such summary to report. `list` has its
+    // own JSON shape (a host array) and reads the global flag directly.
     let json = cli.json
         && !matches!(
             cli.action,
@@ -4419,8 +4805,18 @@ async fn main() -> Result<()> {
             }
 
             // ── Host listing (no host needed) ──
-            (_, Action::List { alias }, _) => {
-                list_hosts(alias.as_deref())?;
+            (
+                _,
+                Action::List {
+                    alias,
+                    long,
+                    filter,
+                    user,
+                    port,
+                },
+                _,
+            ) => {
+                list_hosts(alias.as_deref(), long, &filter, user.as_deref(), port)?;
             }
 
             // ── Local run history (no host: it is a local store) ──
