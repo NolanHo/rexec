@@ -16,7 +16,7 @@ A CLI to sync local files/folders and run commands on remote hosts over SSH, des
 - **Silent on success, full context on failure**: a successful run prints only the command's own stdout/stderr; `-v` adds the decision trace (resolution, auth, deploy, reconnect). Failures always print the error plus that trace in one shot, and a non-zero remote exit prints a one-line warning with the remote log path
 - **Dry run**: `plan` shows resolution, platform, deploy decision and launch command without executing or deploying
 - **Execution history**: every `run`/`script` that reaches the remote is recorded locally (`~/.rexec/history`) — command and env verbatim, output capped at 1 MiB per stream (head+tail), exit code/timing/decision trace — and queried with `rexec history list|show|grep|stats|fetch|prune`; `--no-history` or `REXEC_HISTORY=0` turns recording off. Failures before the worker is contacted (unknown alias, bad `--sync` path, malformed `-e`) are not recorded
-- **Machine-readable**: `--json` emits one JSON summary line on stderr (stdout stays pure command output)
+- **Machine-readable**: `--json` emits one JSON summary line on stderr (stdout stays pure command output; `run`/`script`/`plan`/`init` only)
 - **Quiet mode**: `-q` suppresses the remaining warning/progress lines (errors are never suppressed)
 
 ## Install

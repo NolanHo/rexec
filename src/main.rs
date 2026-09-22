@@ -790,6 +790,10 @@ fn resolve_host(
         .then(|| host.parse::<std::net::Ipv6Addr>().ok())
         .flatten();
     let literal = bare_v6.is_some() || is_literal_host(host);
+    // Where the port came from, for the `-p` trace line: an inline `host:port`
+    // must be distinguishable from a port inherited out of ssh-config (a
+    // literal target can inherit one from a `Host *` block).
+    let mut port_from_input = false;
     let mut remote = if literal {
         let mut parsed = match bare_v6 {
             Some(v6) => RemoteHost {
@@ -800,6 +804,7 @@ fn resolve_host(
             },
             None => parse_user_host_port(host)?,
         };
+        port_from_input = parsed.port.is_some();
         // A literal target still inherits config params — the global `Host *`
         // block (Port/User/IdentityFile) and any block matching the literal
         // (`Host *.example.com`, `Host prod.example.com`). This is what `ssh`
@@ -867,13 +872,15 @@ fn resolve_host(
     };
 
     // --port overrides host:port and ssh-config Port — record which value it
-    // replaced, so a surprising -p is visible in the trace.
+    // replaced, so a surprising -p is visible in the trace. The source is
+    // decided by provenance, not by shape: a literal target can inherit its
+    // port from ssh-config (`Host * Port`), which must not be reported as an
+    // inline `host:port`.
     if let Some(p) = port_override {
-        let source = match (remote.port, literal) {
+        let source = match (remote.port, port_from_input) {
             (Some(old), true) => format!("from host:port {old}"),
             (Some(old), false) => format!("from ssh-config {old}"),
-            (None, true) => "no port given (default 22)".to_string(),
-            (None, false) => "no Port in ssh-config (default 22)".to_string(),
+            (None, _) => "no port configured (default 22)".to_string(),
         };
         remote.port = Some(p);
         trace.add(format!("-p override: {p} ({source})"));

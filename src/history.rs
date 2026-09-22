@@ -553,7 +553,8 @@ fn select_evictions(
     max_bytes: u64,
 ) -> Vec<String> {
     // Older than the cutoff = strictly before `now - keep_days`. `keep_days = 0`
-    // therefore prunes everything that is not from this very second.
+    // therefore prunes everything from an earlier second — except the newest
+    // run, which the loop below protects unconditionally.
     let cutoff = now_secs.saturating_sub(keep_days.saturating_mul(SECS_PER_DAY));
 
     let mut ordered: Vec<&RunEntry> = entries.iter().collect();
