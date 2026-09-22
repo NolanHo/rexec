@@ -180,6 +180,12 @@ pub struct RunRecord {
     pub rexec_version: String,
     /// Decision trace (empty on a clean run unless `-v`).
     pub trace: Vec<String>,
+    /// Why the run failed, when it did: rexec-level failures (connect,
+    /// pre-flight `--sync`/env errors) carry their full error chain here; a
+    /// non-zero remote exit is reflected by `exit_code` instead. `default`
+    /// keeps records written before this field existed loadable.
+    #[serde(default)]
+    pub error: Option<String>,
 }
 
 /// Which captured artifact to read back.
@@ -809,6 +815,7 @@ mod tests {
             stderr_truncated: false,
             rexec_version: "0.3.1".to_string(),
             trace: vec!["resolved → web-1".to_string()],
+            error: Some("TCP connecting to 10.0.0.5:22: Connection refused".to_string()),
         }
     }
 
@@ -1051,6 +1058,29 @@ mod tests {
         let loaded = load_index_in(&root.path().join("index.jsonl")).unwrap();
         assert!(loaded.is_empty());
         assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn test_load_index_accepts_records_without_the_error_field() {
+        // Forward compatibility in the other direction: a record written before
+        // `error` existed must still load (the field is #[serde(default)]), and
+        // its absence must read as "no rexec-level error".
+        let root = TempRoot::new("load-legacy");
+        let idx = root.path().join("index.jsonl");
+        let line = concat!(
+            r#"{"id":"20260922T041533Z-1","ts_start":"2026-09-22T04:15:33Z","#,
+            r#""duration_ms":12,"host":"h","resolved":"root@h:22","command":"true","#,
+            r#""env":[],"exit_code":0,"pid":1,"deployed":false,"stdout_bytes":0,"#,
+            r#""stderr_bytes":0,"stdout_truncated":false,"stderr_truncated":false,"#,
+            r#""rexec_version":"0.3.0","trace":[]}"#,
+            "\n"
+        );
+        std::fs::write(&idx, line).unwrap();
+
+        let records = load_index_in(&idx).unwrap();
+        assert_eq!(records.len(), 1, "a legacy line must not be skipped");
+        assert_eq!(records[0].id, "20260922T041533Z-1");
+        assert!(records[0].error.is_none());
     }
 
     #[test]

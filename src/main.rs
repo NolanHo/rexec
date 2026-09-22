@@ -895,7 +895,27 @@ fn parse_user_host_port(s: &str) -> Result<RemoteHost> {
         (None, s)
     };
 
-    let (hostname, port) = if let Some((h, p)) = rest.rsplit_once(':') {
+    // Three shapes, in order: `[v6]` / `[v6]:port` (brackets are REQUIRED around
+    // a literal v6 that carries a port), a bare v6 address (no port syntax is
+    // possible), then the classic `host[:port]`. Splitting on the last ':' for
+    // everything would read `fe80::1` as host `fe80:` + port 1 and would leave
+    // the brackets of `[fe80::1]` inside the hostname.
+    let (hostname, port) = if let Some(inner) = rest.strip_prefix('[') {
+        let (host, tail) = inner
+            .split_once(']')
+            .ok_or_else(|| anyhow!("unclosed '[' in host {rest:?} — write [addr]:port"))?;
+        let port = match tail {
+            "" => None,
+            _ => Some(
+                tail.strip_prefix(':')
+                    .ok_or_else(|| anyhow!("unexpected {tail:?} after ']' in host {rest:?}"))?
+                    .parse::<u16>()?,
+            ),
+        };
+        (host.to_string(), port)
+    } else if let Ok(v6) = rest.parse::<std::net::Ipv6Addr>() {
+        (v6.to_string(), None)
+    } else if let Some((h, p)) = rest.rsplit_once(':') {
         (h.to_string(), Some(p.parse::<u16>()?))
     } else {
         (rest.to_string(), None)
@@ -1610,6 +1630,47 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_user_host_port_ipv6_and_legacy_forms() {
+        let p = |s: &str| parse_user_host_port(s).unwrap();
+        // Bracketed literals: the brackets are syntax, never part of the host.
+        let v6 = p("[fe80::1]:2222");
+        assert_eq!(v6.hostname, "fe80::1");
+        assert_eq!(v6.port, Some(2222));
+        let v6_no_port = p("[fe80::1]");
+        assert_eq!(v6_no_port.hostname, "fe80::1");
+        assert_eq!(v6_no_port.port, None);
+        // Bare v6 addresses carry no port syntax at all (the colons are not a
+        // separator): this used to parse as host `fe80:` + port 1.
+        let bare = p("fe80::1");
+        assert_eq!(bare.hostname, "fe80::1");
+        assert_eq!(bare.port, None);
+        // ... including after an explicit user.
+        let user_v6 = p("root@fe80::1");
+        assert_eq!(user_v6.user.as_deref(), Some("root"));
+        assert_eq!(user_v6.hostname, "fe80::1");
+        assert_eq!(user_v6.port, None);
+        let user_v6_port = p("root@[fd00::1]:2222");
+        assert_eq!(user_v6_port.hostname, "fd00::1");
+        assert_eq!(user_v6_port.port, Some(2222));
+        // Legacy shapes are unchanged.
+        let legacy = p("root@example.com:2222");
+        assert_eq!(legacy.user.as_deref(), Some("root"));
+        assert_eq!(legacy.hostname, "example.com");
+        assert_eq!(legacy.port, Some(2222));
+        assert_eq!(p("example.com").port, None);
+        assert_eq!(p("10.0.0.5:22").port, Some(22));
+        // Malformed brackets fail loudly instead of silently mangling the host.
+        assert!(
+            parse_user_host_port("[fe80::1").is_err(),
+            "unclosed bracket"
+        );
+        assert!(
+            parse_user_host_port("[fe80::1]x").is_err(),
+            "garbage after bracket"
+        );
+    }
+
+    #[test]
     fn test_include_args_forms() {
         assert_eq!(
             include_args("Include config.d/x.conf"),
@@ -2010,6 +2071,7 @@ mod tests {
             stderr_truncated: false,
             rexec_version: "0.3.1".to_string(),
             trace: vec!["resolve: literal root@host:22".to_string()],
+            error: None,
         }
     }
 
@@ -2503,6 +2565,9 @@ fn build_record(
         stderr_truncated: cap.stderr.truncated(),
         rexec_version: env!("CARGO_PKG_VERSION").to_string(),
         trace: trace.lines().to_vec(),
+        // Only rexec-level failures carry an error here; a remote non-zero exit
+        // is already visible in `exit_code`.
+        error: summary.error.clone(),
     }
 }
 
@@ -2546,8 +2611,16 @@ async fn run_command(
     // Record the intent before the first remote touch: the command and its env
     // are already known, so even a failure to connect leaves an analyzable
     // record (the ring captures are only allocated when recording is on).
+    // A capture created earlier (pre-flight, in the CLI arm) keeps its id and
+    // start time; only the command/env it could not know yet are filled in.
     if history::enabled() {
-        *capture = Some(RunCapture::new(command, env));
+        match capture {
+            Some(cap) => {
+                cap.command = command.to_string();
+                cap.env = env.to_vec();
+            }
+            None => *capture = Some(RunCapture::new(command, env)),
+        }
     }
 
     let mut session = ssh::connect_traced(remote, trace).await?;
@@ -3646,6 +3719,9 @@ fn history_show(id: &str, stdout: bool, stderr: bool, trace: bool, meta: bool) -
             println!("env:       {}={}", single_line(k, 60), single_line(v, 200));
         }
     }
+    if let Some(err) = &rec.error {
+        println!("error:     {}", single_line(err, 400));
+    }
     println!(
         "artifacts: {} (meta.json, stdout.log, stderr.log)",
         run_dir.display()
@@ -4149,12 +4225,26 @@ async fn main() -> Result<()> {
                     ));
                 }
                 let remote = resolve_host(&host, port, &mut trace)?;
+                summary.resolved = resolved_label(&remote);
+                // Record the attempt BEFORE the pre-flight steps: a failed
+                // `--sync` or env parse is exactly the kind of run history
+                // should explain, and `run_command` (which fills in the
+                // command/env and allocates the captures) is never reached for
+                // them.
+                if history::enabled() && capture.is_none() {
+                    capture = Some(RunCapture::new("", &[]));
+                }
                 if let Some(sync_arg) = &sync {
                     let (local, remote_path) = parse_sync_arg(sync_arg)?;
+                    trace.add(format!("sync: {} → {}", local.display(), remote_path));
                     do_sync(&local, &remote_path, &remote).await?;
                 }
                 let env_vars = collect_env(&env, &env_file)?;
                 let command = command.join(" ");
+                if let Some(cap) = capture.as_mut() {
+                    cap.command = command.clone();
+                    cap.env = env_vars.clone();
+                }
                 run_command(
                     &remote,
                     &host,
@@ -4179,6 +4269,12 @@ async fn main() -> Result<()> {
                 port,
             ) => {
                 let remote = resolve_host(&host, port, &mut trace)?;
+                summary.resolved = resolved_label(&remote);
+                // Same early capture as `run`: a failure while parsing env or
+                // during the script's own sync must still leave a record.
+                if history::enabled() && capture.is_none() {
+                    capture = Some(RunCapture::new("", &[]));
+                }
                 let env_vars = collect_env(&env, &env_file)?;
                 run_script(
                     &remote,
