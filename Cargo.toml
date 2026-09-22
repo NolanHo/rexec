@@ -1,6 +1,6 @@
 [package]
 name = "remote-exec"
-version = "0.2.1"
+version = "0.3.0"
 edition = "2024"
 description = "Remote code execution + folder sync over SSH with auto-reconnect resilience"
 license = "GPL-3.0"
@@ -20,3 +20,4 @@ dirs = "6"
 rand = "0.8"
 libc = "0.2"
 glob = "0.3"
+russh-sftp = "2"

@@ -14,6 +14,139 @@ use tokio::sync::mpsc;
 
 use crate::protocol::{Frame, FrameReader, FrameType};
 
+// ---------------------------------------------------------------------------
+// Platform layer
+//
+// Worker/attach logic is shared; only these helpers (and the script-file
+// suffix) differ per platform. Unix (Linux/macOS) is the fully supported path.
+// Windows remotes (OpenSSH-for-Windows sshd) are supported experimentally: the
+// frame protocol, log paths (`dirs::home_dir()`), attach replay and the
+// script-file indirection are platform-independent, but two limitations are
+// documented at their definitions — no SIGHUP to ignore (so disconnect
+// survival is *not* guaranteed) and a liveness probe that shells out to
+// `tasklist` instead of `kill(pid, 0)`.
+// ---------------------------------------------------------------------------
+
+/// Suffix of the per-worker command script: `.sh` where `sh` interprets it,
+/// `.cmd` where `cmd /C` does. Chosen by `cfg` so that `cleanup_stale_scripts`
+/// sweeps exactly the files this platform's workers write.
+#[cfg(unix)]
+const SCRIPT_SUFFIX: &str = ".sh";
+#[cfg(windows)]
+const SCRIPT_SUFFIX: &str = ".cmd";
+
+/// File name of the command script for a worker PID.
+///
+/// The suffix is passed in rather than read from `SCRIPT_SUFFIX` so the naming
+/// rule is a pure function, testable on every platform despite the suffix
+/// itself being `cfg`-selected.
+fn script_file_name(pid: u32, suffix: &str) -> String {
+    format!("{}{}", pid, suffix)
+}
+
+/// Ignore SIGHUP so the worker survives SSH disconnection.
+///
+/// Unix: sshd delivers SIGHUP to the session's process group when the
+/// connection drops; ignoring it keeps the worker (and the child it spawned)
+/// alive so `attach` can reconnect to the log afterwards.
+#[cfg(unix)]
+fn ignore_sighup() {
+    unsafe {
+        libc::signal(libc::SIGHUP, libc::SIG_IGN);
+    }
+}
+
+/// Windows has no SIGHUP. OpenSSH-on-Windows tears a session down by
+/// terminating the process tree, and a process cannot refuse that, so there is
+/// nothing to install here. Consequence: disconnect survival on Windows
+/// remotes is NOT guaranteed — a documented experimental limitation of the
+/// Windows path, not a bug this layer can work around.
+#[cfg(windows)]
+fn ignore_sighup() {}
+
+/// Is a process with this PID alive?
+///
+/// Unix: `kill(pid, 0) == 0` — the standard POSIX liveness probe (`ESRCH`
+/// means the process is gone).
+#[cfg(unix)]
+fn is_alive(pid: u32) -> bool {
+    unsafe { libc::kill(pid as i32, 0) == 0 }
+}
+
+/// Does `tasklist /FI "PID eq <pid>"` output contain that PID?
+///
+/// `tasklist` prints the matching process row, or a localized "no tasks"
+/// message when nothing matches. Only ASCII digit runs are compared, so the
+/// answer does not depend on the OEM codepage or on the surrounding column
+/// text, and comparing whole runs (rather than substrings) keeps PID 1234 from
+/// matching a 12345 row. Split out from `is_alive` so the rule is testable on
+/// every platform — `cfg(any(windows, test))` keeps it out of unix non-test
+/// builds, where it would be dead code.
+#[cfg(any(windows, test))]
+fn tasklist_output_has_pid(stdout: &str, pid: u32) -> bool {
+    let needle = pid.to_string();
+    stdout
+        .split(|c: char| !c.is_ascii_digit())
+        .any(|token| token == needle)
+}
+
+/// Windows liveness probe.
+///
+/// There is no `kill(pid, 0)` equivalent in `std`, and `OpenProcess` with
+/// `PROCESS_QUERY_LIMITED_INFORMATION` would need the `windows-sys` crate —
+/// the worker deliberately stays free of windows-only deps, so probe with
+/// `tasklist /FI "PID eq <pid>"`, which prints the matching row or
+/// "No tasks are running..." when there is none. Zero new deps, and good
+/// enough for the two callers, which both only need a best-effort answer
+/// (stale-script hygiene and the attach decision).
+///
+/// Cost, and a known Windows-only wart: unlike `kill(pid, 0)` this spawns a
+/// process, and `attach` probes once per 100 ms tick — so an attach that lasts
+/// a minute spawns ~600 short-lived `tasklist` processes. Functional, but
+/// throttling/memoizing the probe (e.g. a 1 s TTL) is the obvious follow-up if
+/// the churn ever matters.
+#[cfg(windows)]
+fn is_alive(pid: u32) -> bool {
+    let Ok(out) = std::process::Command::new("tasklist")
+        .args(["/FI", &format!("PID eq {}", pid)])
+        .output()
+    else {
+        // tasklist could not be spawned at all — report alive, because a false
+        // "alive" only delays stale-script cleanup, while a false "dead" would
+        // delete a live worker's script and let `attach` synthesize an exit
+        // while the worker is still writing frames.
+        return true;
+    };
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    if !out.status.success() && stdout.trim().is_empty() {
+        // Same reasoning as above: the probe produced no usable answer.
+        return true;
+    }
+    tasklist_output_has_pid(&stdout, pid)
+}
+
+/// Command that interprets a worker's script file.
+///
+/// Unix: `sh <script>`. Windows: `cmd /C <script.cmd>` — `cmd` executes the
+/// batch file named in argv. The script-file indirection is kept on Windows
+/// for the same reason as on unix: the command text stays out of the child's
+/// cmdline, so a command that matches its own pattern (the classic
+/// `pkill -f`/`taskkill` self-kill) cannot match the shell carrying it.
+#[cfg(unix)]
+fn spawn_shell(script: &std::path::Path) -> tokio::process::Command {
+    let mut cmd = tokio::process::Command::new("sh");
+    cmd.arg(script);
+    cmd
+}
+
+/// See the unix variant for why the script-file indirection is preserved.
+#[cfg(windows)]
+fn spawn_shell(script: &std::path::Path) -> tokio::process::Command {
+    let mut cmd = tokio::process::Command::new("cmd");
+    cmd.args(["/C"]).arg(script);
+    cmd
+}
+
 /// Write a frame to both the log file and stdout (SSH channel).
 ///
 /// Log file is written first (source of truth), then stdout.
@@ -82,15 +215,14 @@ fn extract_command_and_env(buf: &[u8]) -> Result<(String, Vec<(String, String)>)
 ///
 /// Runs on the remote host. stdin/stdout are connected to the SSH channel.
 /// Output is written to both the log file (always) and stdout (when connected).
-/// SIGHUP is ignored so the worker survives SSH disconnection.
+/// SIGHUP is ignored so the worker survives SSH disconnection (unix; see
+/// `ignore_sighup` for the Windows limitation).
 ///
 /// The child process is always waited on, even if the worker encounters errors.
 /// The log file is cleaned up on successful exit (exit code 0).
 pub async fn worker() -> Result<()> {
-    // Ignore SIGHUP — survive SSH disconnect
-    unsafe {
-        libc::signal(libc::SIGHUP, libc::SIG_IGN);
-    }
+    // Ignore SIGHUP — survive SSH disconnect (no-op on Windows)
+    ignore_sighup();
 
     let pid = std::process::id();
 
@@ -123,13 +255,14 @@ pub async fn worker() -> Result<()> {
         ));
     };
 
-    // Run the command from a private script file (`sh <script>`) instead of
-    // `sh -c <command>`. With `sh -c`, the full command text is exposed in the
-    // child's cmdline, so a command containing `pkill -f <pattern>` matches
-    // (and kills) the very shell that carries it — the classic
-    // `sh -c "pkill -f foo"` self-kill. A script path in argv keeps the
-    // cmdline clean; the command's own target processes still match pkill
-    // normally because their cmdlines are their own.
+    // Run the command from a private script file (`sh <script>`, or
+    // `cmd /C <script.cmd>` on Windows) instead of `sh -c <command>`. With
+    // `sh -c`, the full command text is exposed in the child's cmdline, so a
+    // command containing `pkill -f <pattern>` matches (and kills) the very
+    // shell that carries it — the classic `sh -c "pkill -f foo"` self-kill.
+    // A script path in argv keeps the cmdline clean; the command's own target
+    // processes still match pkill normally because their cmdlines are their
+    // own.
     let run_dir = home.join(".rexec").join("run");
     create_private_dir(&run_dir)?;
     cleanup_stale_scripts(&run_dir);
@@ -139,8 +272,7 @@ pub async fn worker() -> Result<()> {
     let _script_guard = ScriptGuard(script_path.clone());
 
     // Spawn child process with the env vars applied.
-    let mut child_cmd = tokio::process::Command::new("sh");
-    child_cmd.arg(&script_path);
+    let mut child_cmd = spawn_shell(&script_path);
     for (k, v) in &child_env {
         child_cmd.env(k, v);
     }
@@ -250,39 +382,57 @@ impl Drop for ScriptGuard {
 /// holds command scripts that may contain secrets — other local users must
 /// not be able to enumerate them.
 fn create_private_dir(dir: &std::path::Path) -> Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-
     // DirBuilder::create_dir_all is unstable; fs::create_dir_all has no mode
     // parameter. Parents (~/.rexec) may be created with the default umask —
     // they hold no secrets; the leaf is tightened before any script lands.
     std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
-    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
-        .with_context(|| format!("chmod 700 {}", dir.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
+            .with_context(|| format!("chmod 700 {}", dir.display()))?;
+    }
+    // Windows: no chmod equivalent is attempted. NTFS permissions are
+    // inherited from the parent, i.e. `~/.rexec` under the user profile, whose
+    // ACL is already user-private by default. Documented limitation: on a
+    // profile with loosened ACLs the run dir is not additionally tightened.
     Ok(())
 }
 
-/// Write `command` to `<run_dir>/<pid>.sh` with owner-only permissions.
+/// Write `command` to `<run_dir>/<pid>.sh` (unix) / `<pid>.cmd` (Windows).
 ///
-/// The file is created exclusively with mode 0600 (no 0644 window; O_EXCL
-/// never follows a symlink into a victim file) because the command may
+/// The file is created exclusively with mode 0600 on unix (no 0644 window;
+/// O_EXCL never follows a symlink into a victim file) because the command may
 /// contain secrets. A trailing newline is appended so the last line is
-/// well-formed for `sh`. On write failure the partial file is removed.
+/// well-formed for the interpreter. On write failure the partial file is
+/// removed.
 fn write_command_script(
     run_dir: &std::path::Path,
     pid: u32,
     command: &str,
 ) -> Result<std::path::PathBuf> {
     use std::io::Write;
-    use std::os::unix::fs::OpenOptionsExt;
 
-    let path = run_dir.join(format!("{}.sh", pid));
+    let path = run_dir.join(script_file_name(pid, SCRIPT_SUFFIX));
     // A pre-existing file with this name can only be stale (the PID is this
     // worker's own) or an attack (symlink) — remove it and create exclusively.
+    #[cfg(unix)]
     let open_new = || {
+        use std::os::unix::fs::OpenOptionsExt;
         std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
             .mode(0o600)
+            .open(&path)
+    };
+    // Windows: no mode bits to set — the file inherits the private run dir's
+    // ACL (see `create_private_dir`). `create_new` still refuses to follow a
+    // pre-existing symlink/junction at this name.
+    #[cfg(windows)]
+    let open_new = || {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
             .open(&path)
     };
     let mut f = match open_new() {
@@ -307,9 +457,9 @@ fn write_command_script(
 
 /// Remove script files left behind by workers that died without cleanup.
 ///
-/// A file `<pid>.sh` is stale when no process with that PID exists, or when
-/// it is older than `MAX_AGE_SECS` (covers PID reuse by an unrelated process).
-/// Files owned by live PIDs are never touched.
+/// A file `<pid>.sh` (unix) / `<pid>.cmd` (Windows) is stale when no process
+/// with that PID exists, or when it is older than `MAX_AGE_SECS` (covers PID
+/// reuse by an unrelated process). Files owned by live PIDs are never touched.
 fn cleanup_stale_scripts(run_dir: &std::path::Path) {
     const MAX_AGE_SECS: u64 = 7 * 24 * 3600;
     let entries = match std::fs::read_dir(run_dir) {
@@ -320,7 +470,7 @@ fn cleanup_stale_scripts(run_dir: &std::path::Path) {
         let path = entry.path();
         let name = entry.file_name();
         let name_str = name.to_string_lossy();
-        let Some(stem) = name_str.strip_suffix(".sh") else {
+        let Some(stem) = name_str.strip_suffix(SCRIPT_SUFFIX) else {
             continue; // not a worker script
         };
         // Positive PIDs only: u32 rejects "-1", the filter rejects "0"
@@ -328,8 +478,9 @@ fn cleanup_stale_scripts(run_dir: &std::path::Path) {
         let Some(owner_pid) = stem.parse::<u32>().ok().filter(|p| *p > 0) else {
             continue; // not a worker script
         };
-        // kill(pid, 0) == 0 → alive (ours or reused by anyone: keep).
-        let alive = unsafe { libc::kill(owner_pid as i32, 0) == 0 };
+        // kill(pid, 0) == 0 on unix / tasklist hit on Windows → alive (ours or
+        // reused by anyone: keep).
+        let alive = is_alive(owner_pid);
         let too_old = entry
             .metadata()
             .ok()
@@ -360,7 +511,7 @@ pub async fn attach(pid: u32, offset: u64) -> Result<()> {
     if !log_path.exists() {
         // Log file may have been deleted by the worker after successful exit.
         // Check if the process is still alive — if dead, assume success.
-        let alive = unsafe { libc::kill(pid as i32, 0) == 0 };
+        let alive = is_alive(pid);
         if !alive {
             // Worker exited and cleaned up — synthesize success exit
             let mut stdout = tokio::io::stdout();
@@ -430,7 +581,7 @@ pub async fn attach(pid: u32, offset: u64) -> Result<()> {
         }
 
         // Check if worker process is still alive
-        let alive = unsafe { libc::kill(pid as i32, 0) == 0 };
+        let alive = is_alive(pid);
         if !alive && file_size <= offset {
             // Worker is dead and no more data to read.
             // Give one more chance for the filesystem to sync.
@@ -486,11 +637,55 @@ mod tests {
     }
 
     #[test]
+    fn test_script_suffix_matches_platform() {
+        // The suffix is `cfg`-selected; assert the mapping without `cfg`-gating
+        // the test itself so it also guards a future Windows test run.
+        if cfg!(windows) {
+            assert_eq!(SCRIPT_SUFFIX, ".cmd", "cmd /C interprets .cmd scripts");
+        } else {
+            assert_eq!(SCRIPT_SUFFIX, ".sh", "sh interprets .sh scripts");
+        }
+    }
+
+    #[test]
+    fn test_script_file_name_uses_given_suffix() {
+        // Pure naming rule: the platform suffix and any other suffix both work,
+        // so this holds on every platform.
+        assert_eq!(
+            script_file_name(4242, SCRIPT_SUFFIX),
+            format!("4242{}", SCRIPT_SUFFIX)
+        );
+        assert_eq!(script_file_name(7, ".sh"), "7.sh");
+    }
+
+    #[test]
+    fn test_is_alive_true_for_own_pid() {
+        // Our own process is trivially alive; exercises the platform probe
+        // (kill(pid, 0) on unix, tasklist on Windows).
+        assert!(is_alive(std::process::id()), "own PID must report alive");
+    }
+
+    #[test]
+    fn test_tasklist_output_matches_pid_token() {
+        // Shape of a `tasklist /FI "PID eq 1234"` hit.
+        let row = "Image Name     PID Session Name  Session#    Mem Usage\r\n\
+                   cmd.exe       1234 Console              1      2,048 K\r\n";
+        assert!(tasklist_output_has_pid(row, 1234));
+        // Whole-token match: 123 must not be satisfied by the 1234 row.
+        assert!(!tasklist_output_has_pid(row, 123));
+        // A localized "no tasks" message carries no digits.
+        assert!(!tasklist_output_has_pid(
+            "INFO: No tasks are running which match the specified criteria.",
+            1234
+        ));
+    }
+
+    #[test]
     fn test_write_command_script_content_and_mode() {
         let dir = std::env::temp_dir().join(format!("rexec-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = write_command_script(&dir, 4242, "echo hi").unwrap();
-        assert_eq!(path, dir.join("4242.sh"));
+        assert_eq!(path, dir.join(script_file_name(4242, SCRIPT_SUFFIX)));
         let content = std::fs::read_to_string(&path).unwrap();
         assert_eq!(content, "echo hi\n");
         #[cfg(unix)]
@@ -509,8 +704,11 @@ mod tests {
 
         // A stale leftover at the target name must not survive as our inode:
         // pre-existing world-readable mode is not inherited.
-        let path = dir.join("4242.sh");
+        let path = dir.join(script_file_name(4242, SCRIPT_SUFFIX));
         std::fs::write(&path, "stale\n").unwrap();
+        // Loosening the mode only means something where mode bits exist; the
+        // assertion below is unix-only too.
+        #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
@@ -571,19 +769,39 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
 
         // Live PID (this test process): script must be kept.
-        let live = dir.join(format!("{}.sh", std::process::id()));
+        let live = dir.join(script_file_name(std::process::id(), SCRIPT_SUFFIX));
         std::fs::write(&live, "keep\n").unwrap();
 
         // Dead PID: spawn a process, wait for it to exit, use its PID.
         // (Theoretical flake: the OS could reuse the PID before the sweep —
         // acceptably improbable on a test host.)
-        let mut child = std::process::Command::new("sleep")
-            .arg("0.01")
-            .spawn()
-            .unwrap();
-        let dead_pid = child.id();
-        let _ = child.wait().unwrap();
-        let stale = dir.join(format!("{}.sh", dead_pid));
+        #[cfg(unix)]
+        let dead_pid = {
+            let mut child = std::process::Command::new("sleep")
+                .arg("0.01")
+                .spawn()
+                .unwrap();
+            let pid = child.id();
+            let _ = child.wait().unwrap();
+            pid
+        };
+        // Windows has no bundled `sleep`; a `cmd` that exits immediately gives
+        // the same "process that is definitely gone" PID.
+        #[cfg(windows)]
+        let dead_pid = {
+            let mut child = std::process::Command::new("cmd")
+                .args(["/C", "exit"])
+                .spawn()
+                .unwrap();
+            let pid = child.id();
+            let _ = child.wait().unwrap();
+            pid
+        };
+        assert!(
+            !is_alive(dead_pid),
+            "an exited process must not report alive"
+        );
+        let stale = dir.join(script_file_name(dead_pid, SCRIPT_SUFFIX));
         std::fs::write(&stale, "remove\n").unwrap();
 
         // Non-PID names: untouched by the sweep.
@@ -605,7 +823,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
 
         // Own PID, but mtime set to the epoch: older than MAX_AGE.
-        let path = dir.join(format!("{}.sh", std::process::id()));
+        let path = dir.join(script_file_name(std::process::id(), SCRIPT_SUFFIX));
         std::fs::write(&path, "ancient\n").unwrap();
         let f = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
         f.set_times(

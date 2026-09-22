@@ -2,14 +2,14 @@
 
 A CLI to sync local files/folders and run commands on remote hosts over SSH, designed to survive SSH disconnections. The remote worker keeps running after SSH drops; the CLI auto-reconnects and resumes output from the last byte.
 
-**Platforms**: local macOS/Linux → remote Linux (amd64/arm64). When the two differ (e.g. macOS local → Linux remote), the worker binary for the remote is downloaded from GitHub Releases automatically — the remote needs no internet access.
+**Platforms**: local macOS/Linux/Windows → remote Linux/macOS supported, remote Windows **experimental** (it compiles, but is not live-verified and disconnect survival is not guaranteed there). When the two differ (e.g. macOS local → Linux remote), the worker binary for the remote is downloaded from GitHub Releases automatically — the remote needs no internet access. rsync-dependent features (`--sync`, folder sync) need an `rsync` from MSYS2 or WSL when the local side is Windows.
 
 ## Features
 
 - **Folder/file sync**: rsync a local file or folder to the remote before running
 - **Script run**: one-command sync + run a local script (`script` subcommand)
 - **Host listing**: list SSH hosts from `~/.ssh/config` (`list` subcommand)
-- **Disconnect resilience**: remote worker ignores SIGHUP and writes to a log; CLI reconnects with backoff and resumes from the last byte
+- **Disconnect resilience**: remote worker ignores SIGHUP and writes to a log; CLI reconnects with backoff and resumes from the last byte (Linux/macOS remotes; Windows remotes are experimental and do not guarantee disconnect survival)
 - **Auto binary deploy**: deploys a version-matched worker to the remote on first use — uploads itself when platforms match, otherwise downloads the prebuilt worker from GitHub Releases (e.g. macOS local → Linux remote)
 - **Secrets/command out of argv**: env vars and the command are sent over stdin and the command runs from a private script file — neither appears on any cmdline, so `pkill -f`/`pgrep -f` can't match them by command content (env vars are still visible in `/proc/<pid>/environ` to the same user)
 - **SSH config**: resolves host aliases from `~/.ssh/config`; `user@host:port` literals work everywhere (run **and** sync)
@@ -22,10 +22,14 @@ A CLI to sync local files/folders and run commands on remote hosts over SSH, des
 cargo build --release
 cp target/release/remote-exec ~/.local/bin/rexec
 
-# Or download a prebuilt binary (linux/macos × amd64/arm64 — pick your platform)
+# Or download a prebuilt binary (linux/macos/windows × amd64/arm64 — pick your platform)
 curl -fL -o ~/.local/bin/rexec \
   https://github.com/Menghuan1918/rexec/releases/latest/download/rexec-macos-arm64
 chmod +x ~/.local/bin/rexec
+
+# Windows: same assets, named rexec.exe (no chmod step)
+curl.exe -fL -o rexec.exe \
+  https://github.com/Menghuan1918/rexec/releases/latest/download/rexec-windows-amd64
 ```
 
 ## Usage
@@ -69,6 +73,8 @@ rexec -q <host> run -- "echo only-this"
 | `--env-file PATH` | Read `KEY=VALUE` lines from a local file (supports `#` comments and `export ` prefix). Repeatable. |
 | `-- <command...>` | Command to run on the remote (joined; executed by the worker from a private script file). |
 
+On Windows the local side of `--sync` must be an MSYS2/WSL-style path (`/c/proj`), not a drive path: `C:\proj:/remote/dir` is rejected, since `LOCAL:REMOTE` splitting would read `C` as a host. `--sync` and the `script` subcommand (both rsync-based) work with Linux/macOS remotes only — they cannot target a Windows remote.
+
 ### Global options
 
 | Option | Description |
@@ -95,7 +101,7 @@ Reads `~/.ssh/config` and prints each host's alias, hostname, port, and user (pu
 ## How it works
 
 1. If `--sync` is given, runs `rsync -az [--delete] -e "ssh [-p PORT] ..."` to sync the local file/folder to the remote. The port from `host:port` or `--port` is passed to rsync via `ssh -p` (so `user@host:port` works for sync too).
-2. Connects via russh (pure Rust SSH), authenticates via agent → identity-file → default keys.
+2. Connects via russh (pure Rust SSH), authenticates via agent → identity-file → default keys (Windows locals: identity-file/default keys only — russh's agent client speaks the unix socket protocol).
 3. Ensures `~/.rexec/rexec` exists on the remote and matches the local version. If the remote platform matches the local one, it uploads the running binary via rsync; otherwise it downloads the version-pinned worker from GitHub Releases (cached in `~/.rexec/cache/`, so each version/target is downloaded once) and rsyncs that over.
 4. Starts `~/.rexec/rexec worker` over the SSH channel. The **command and env vars are sent over stdin** (not argv), so neither appears in the remote worker's `ps`/`pkill -f`/`pgrep -f` output.
 5. The worker ignores SIGHUP, writes the command to a private script (`~/.rexec/run/<pid>.sh`, mode 0600, removed on exit; stale ones swept on startup), spawns `sh <script>`, and streams stdout/stderr back via a binary frame protocol — writing every frame to `~/.rexec/logs/<pid>.log` and to the SSH channel. The script-file indirection keeps command text out of every process's cmdline, so `sh -c "pkill -f foo"`-style self-kills cannot happen.
@@ -128,10 +134,10 @@ cargo build --release
 
 ### Releasing
 
-Push a tag to trigger both release workflows: `.github/workflows/release.yml` builds native binaries for linux/macos × amd64/arm64 and attaches them to a GitHub Release, while `.github/workflows/publish.yml` publishes the crate to [crates.io](https://crates.io/crates/remote-exec) via trusted publishing (OIDC token exchange, no API token stored as a secret). A tag can also be published manually: `gh workflow run publish.yml -f tag=v0.2.1`.
+Push a tag to trigger both release workflows: `.github/workflows/release.yml` builds native binaries for linux/macos/windows × amd64/arm64 and attaches them to a GitHub Release, while `.github/workflows/publish.yml` publishes the crate to [crates.io](https://crates.io/crates/remote-exec) via trusted publishing (OIDC token exchange, no API token stored as a secret). A tag can also be published manually: `gh workflow run publish.yml -f tag=v0.3.0`.
 
 ```bash
-git tag v0.2.1 && git push origin v0.2.1
+git tag v0.3.0 && git push origin v0.3.0
 ```
 
 Cross-platform deploys (e.g. macOS local → Linux remote) download these release assets pinned to the running version, so a version must be released before it can deploy a mismatched remote platform.
@@ -144,6 +150,6 @@ Cross-platform deploys (e.g. macOS local → Linux remote) download these releas
 - `tokio` — async runtime
 - `anyhow` — error handling
 - `dirs`, `libc`, `rsa`, `russh-keys`, `rand`
-- `rsync` (system) — required for sync (local + remote)
+- `rsync` (system) — required for sync (local + remote; on Windows install it via MSYS2 or WSL)
 - `curl` (system) — required locally, to download cross-platform workers from GitHub Releases
-- `sh` (system) — required on the remote
+- `sh` (system) — required on a Linux/macOS remote

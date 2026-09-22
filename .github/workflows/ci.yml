@@ -1,0 +1,30 @@
+# CI: run the test suite on the supported local platforms.
+#
+# The Windows leg exists so the cfg(windows) branches (signal handling,
+# platform probes, launch-command builders) are compiled AND their pure
+# helpers run — tests that spawn a local `sh` are #[cfg(unix)] and are
+# skipped there.
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --check
+      - run: cargo test --locked
