@@ -27,6 +27,8 @@ rexec <host> run -- "bash deploy.sh"
 # ssh-config alias or user@host:port both work (for run AND --sync)
 rexec prod run -- "systemctl status nginx"
 rexec root@1.2.3.4:2222 run --sync ./deploy.sh:/opt/deploy.sh -- "bash /opt/deploy.sh"
+# A name that is not a configured alias is an error (with near-miss suggestions):
+# literal targets need an explicit user@host, IP or dotted hostname.
 
 # Override port globally (applies to SSH and rsync)
 rexec -p 2222 root@1.2.3.4 run -- "df -h"
@@ -37,9 +39,25 @@ rexec <host> script ./deploy.sh -- arg1 arg2
 # List hosts from ~/.ssh/config
 rexec list
 
-# Quiet: stdout carries only the command's output
+# Dry run: what a run WOULD do (resolution, deploy decision, launch command)
+rexec <host> plan -- "python main.py"
+
+# Why did it do that? -v prints the decision trace (resolution, auth, deploy)
+rexec -v <host> run -- "df -h"
+
+# Machine-readable summary on stderr (stdout stays pure command output)
+rexec --json <host> run -- "uname -a"
+
+# Quiet: only errors/warnings remain (errors are never suppressed)
 rexec -q <host> run -- "echo hi"
 ```
+
+### Output contract
+
+- **Success is silent**: stdout/stderr carry the command's own output and nothing else. `-v/--verbose` adds the decision trace (resolved target, auth attempts, platform/deploy decision, remote PID, reconnects, timings).
+- **Errors/warnings carry full context in one shot** — no re-run with `-v` needed. An unknown host alias fails listing the 2–3 closest configured aliases plus the hint to use `user@host` for a literal host (an alias is never silently treated as a raw hostname). A worker that dies before starting reports its own stderr and the launch command.
+- **Non-zero remote exit** prints exactly one warning line to stderr: `⚠ remote exit <code> (log: ~/.rexec/logs/<pid>.log)`; exit code 0 prints nothing. rexec's own exit status is 1 only when rexec itself fails.
+- **`--json`** writes one JSON line to stderr, last (after the trace/warning): `host`, `resolved`, `pid`, `exit_code`, `duration_ms`, `deployed`, `stdout_bytes`, `stderr_bytes`, `log_path` (`null` for now — the warning line carries the remote log path), `error` (failure only), always in that order. stdout is never polluted.
 
 ### `run` options
 
@@ -55,7 +73,18 @@ rexec -q <host> run -- "echo hi"
 | Option | Description |
 |--------|-------------|
 | `-p PORT` / `--port PORT` | SSH port (overrides `host:port` and ssh-config `Port`) |
-| `-q` / `--quiet` | Suppress progress/status output (Remote PID, exit, sync, reconnect) |
+| `-v` / `--verbose` | Print the decision trace (resolution, auth, deploy, reconnect) even on success; errors always carry it |
+| `--json` | Emit one machine-readable result summary line on stderr |
+| `-q` / `--quiet` | Suppress remaining warning/progress lines (errors are never suppressed) |
+
+### `plan` — dry run (no execution, no deploy)
+
+```bash
+rexec <host> plan -- "<command>"
+```
+
+Connects, resolves the host, probes the remote platform and installed worker, then prints the resolution, deploy decision (`nothing — up-to-date` / `upload self` / `download <asset> from <url>`), the exact launch command and the script-file indirection note; exits 0. Use it to check what a run would do — including why a worker would be re-uploaded — without touching the remote state.
+
 
 ### `script` — sync and run a local script
 
@@ -104,12 +133,12 @@ rexec dev run --sync ./deploy.sh:/opt/app/deploy.sh -- "bash /opt/app/deploy.sh"
 - **Long-running jobs: run rexec in the background.** rexec streams until the remote process exits, which may outlast a foreground shell's timeout (and get killed mid-stream). Launch long jobs with a background command — `&`, `nohup`, or your agent's background-task tool — so the remote worker isn't cut off. If interrupted, rexec prints the remote PID; the worker keeps running (see Disconnect behavior to resume).
 - **Output not streaming?** When stdout is not a TTY (pipes, `cmd | tail`, docker build), programs block-buffer their output, so rexec shows nothing until they flush or exit. Avoid `| tail`/`| head`; stream the command directly, or force line buffering with `stdbuf -oL -eL <cmd>` / `PYTHONUNBUFFERED=1` (pass via `-e`).
 - **Local edit → sync → remote run** is the recommended loop: edit locally, then `rexec <host> run --sync ./dir:/remote/dir -- "..."` pushes and executes in one step.
-- **Use `--quiet` for scriptable output.** `rexec -q <host> run -- "..."` suppresses Remote PID/exit/sync/reconnect lines so stdout holds only the command's output — no need to `grep -v` them.
+- **Output is silent on success — nothing to filter.** stdout/stderr hold only the command's own output, so `rexec <host> run -- "..." | ...` needs no `grep -v`. Add `-v` for the decision trace, `--json` for a one-line machine-readable summary on stderr (never on stdout), and `-q` to also drop the remaining warning/progress lines. Failures never lose context: the error always carries the trace, and a non-zero remote exit prints a one-line warning with the remote log path.
 - **`pkill -f`/`pgrep -f` won't match the worker or its shell by command text.** The command and env vars are sent over stdin, not argv, and the command runs from a private script file (`sh ~/.rexec/run/<pid>.sh`, mode 0600, deleted on exit) instead of `sh -c <cmd>` — no process in the chain exposes the command text in its cmdline, so the classic `sh -c "pkill -f foo"` self-kill cannot happen. Target processes still match `pkill -f` normally (their cmdlines are their own). Caveat: a pattern that matches the chain's fixed strings (`rexec`, `.sh`, `run/`) still hits — scope patterns to command content. Also note `$0` inside the command is now the script path, not `sh`.
 
 ## Disconnect behavior
 
-- **SSH drops:** the remote worker keeps running and writing to a log; the CLI reconnects (backoff 1s→30s, up to 10 tries) and resumes output from the last byte — no data lost. (Linux/macOS remotes; Windows remotes are experimental and do not guarantee survival.)
+- **SSH drops:** the remote worker keeps running and writing to a log; the CLI reconnects (backoff 1s→30s, up to 10 tries) and resumes output from the last byte — no data lost. (Linux/macOS remotes; Windows remotes are experimental and do not guarantee survival.) Reconnect progress lines are verbose-only (`-v`); a recovered run stays silent, and a failed reconnect reports the remote PID plus the decision trace.
 - **CLI killed (Ctrl+C / SIGTERM):** prints the remote PID; the remote process continues. Re-attach later with `ssh <host> "~/.rexec/rexec attach --pid <PID> --offset 0"` (Linux/macOS remotes; on a Windows remote use the full `%USERPROFILE%\.rexec\rexec.exe` path under cmd).
 
 ## Prerequisites

@@ -12,8 +12,11 @@ A CLI to sync local files/folders and run commands on remote hosts over SSH, des
 - **Disconnect resilience**: remote worker ignores SIGHUP and writes to a log; CLI reconnects with backoff and resumes from the last byte (Linux/macOS remotes; Windows remotes are experimental and do not guarantee disconnect survival)
 - **Auto binary deploy**: deploys a version-matched worker to the remote on first use — uploads itself when platforms match, otherwise downloads the prebuilt worker from GitHub Releases (e.g. macOS local → Linux remote)
 - **Secrets/command out of argv**: env vars and the command are sent over stdin and the command runs from a private script file — neither appears on any cmdline, so `pkill -f`/`pgrep -f` can't match them by command content (env vars are still visible in `/proc/<pid>/environ` to the same user)
-- **SSH config**: resolves host aliases from `~/.ssh/config`; `user@host:port` literals work everywhere (run **and** sync)
-- **Quiet mode**: `--quiet` suppresses progress lines so stdout carries only the command's own output
+- **SSH config**: resolves host aliases from `~/.ssh/config` (Include-expanded); `user@host:port` literals work everywhere (run **and** sync). An unknown alias is an error with near-miss suggestions — it is never silently treated as a raw hostname (use `user@host` for literal hosts)
+- **Silent on success, full context on failure**: a successful run prints only the command's own stdout/stderr; `-v` adds the decision trace (resolution, auth, deploy, reconnect). Failures always print the error plus that trace in one shot, and a non-zero remote exit prints a one-line warning with the remote log path
+- **Dry run**: `plan` shows resolution, platform, deploy decision and launch command without executing or deploying
+- **Machine-readable**: `--json` emits one JSON summary line on stderr (stdout stays pure command output)
+- **Quiet mode**: `-q` suppresses the remaining warning/progress lines (errors are never suppressed)
 
 ## Install
 
@@ -60,9 +63,34 @@ rexec <host> script -e API_KEY=sk-xxx ./fetch.py
 rexec list
 rexec list my-server
 
-# Suppress progress output (Remote PID, exit, sync, reconnect)
-rexec -q <host> run -- "echo only-this"
+# Show what a run WOULD do — resolution, deploy decision, launch command —
+# without executing the command and without deploying anything
+rexec my-server plan -- "python train.py --epochs 100"
+
+# Ask why: -v prints the decision trace (resolution, auth, deploy, reconnect)
+rexec -v my-server run -- "df -h"
+
+# Machine-readable summary on stderr (stdout stays pure command output)
+rexec --json my-server run -- "uname -a"
+
+# Suppress the remaining warnings/progress (errors are never suppressed)
+rexec -q my-server run -- "echo only-this"
 ```
+
+### Output contract
+
+- **Success is silent.** In normal mode stdout/stderr carry the command's own output and nothing else. `-v/--verbose` adds the decision trace (resolved target, auth attempts, platform/deploy decision, remote PID, reconnect events, timings).
+- **Errors and warnings carry their full context in one shot.** A failure prints the error plus the decision trace — no need to re-run with `-v`. An unknown host alias fails with the 2–3 closest configured aliases and the hint to use `user@host` for a literal host. If the worker dies before it starts, the error includes the worker's own stderr and the launch command that was attempted.
+- **A non-zero remote exit prints one warning line** to stderr: `⚠ remote exit <code> (log: ~/.rexec/logs/<pid>.log)`. Exit code 0 prints nothing. (rexec's own exit status is 1 only when rexec itself fails.)
+- **`--json` emits exactly one JSON line on stderr, last** (after the trace/warning), with stable field order: `host`, `resolved`, `pid`, `exit_code`, `duration_ms`, `deployed`, `stdout_bytes`, `stderr_bytes`, `log_path` (always `null` for now — the warning line carries the remote log path), and `error` only on failure. stdout is never polluted.
+
+### `plan` — dry run
+
+```bash
+rexec <host> plan -- "<command>"
+```
+
+Connects, resolves the host, probes the remote platform and the installed worker, then prints the resolution, the deploy decision (`nothing — up-to-date` / `upload self` / `download <asset> from <url>`), the exact launch command, and the script-file indirection note. It exits 0 **without executing the command and without deploying anything** — safe to run against production hosts.
 
 ### `run` options
 
@@ -80,7 +108,11 @@ On Windows the local side of `--sync` must be an MSYS2/WSL-style path (`/c/proj`
 | Option | Description |
 |--------|-------------|
 | `-p PORT` / `--port PORT` | SSH port (overrides `host:port` and ssh-config `Port`) |
-| `-q` / `--quiet` | Suppress progress/status output (Remote PID, exit, sync, reconnect) |
+| `-v` / `--verbose` | Print the decision trace (resolution, auth, deploy, reconnect, timings) even on success. Errors always carry it |
+| `--json` | Emit one machine-readable result summary line on stderr (see Output contract) |
+| `-q` / `--quiet` | Suppress the remaining warning/progress lines. Errors are never suppressed |
+
+Run/plan/sync/script usage is unchanged otherwise: `rexec [-p PORT] [-v] [--json] <alias|user@host:port> <subcommand> ...`.
 
 ### `script` — sync and run a local script
 
@@ -106,7 +138,7 @@ Reads `~/.ssh/config` and prints each host's alias, hostname, port, and user (pu
 4. Starts `~/.rexec/rexec worker` over the SSH channel. The **command and env vars are sent over stdin** (not argv), so neither appears in the remote worker's `ps`/`pkill -f`/`pgrep -f` output.
 5. The worker ignores SIGHUP, writes the command to a private script (`~/.rexec/run/<pid>.sh`, mode 0600, removed on exit; stale ones swept on startup), spawns `sh <script>`, and streams stdout/stderr back via a binary frame protocol — writing every frame to `~/.rexec/logs/<pid>.log` and to the SSH channel. The script-file indirection keeps command text out of every process's cmdline, so `sh -c "pkill -f foo"`-style self-kills cannot happen.
 6. On SSH disconnect: the worker keeps running; the CLI reconnects with exponential backoff (1s→30s, max 10) and resumes from the last byte offset via `~/.rexec/rexec attach --pid <PID> --offset <N>`.
-7. On process completion: prints exit status; the log file is removed on exit code 0.
+7. On process completion: exit code 0 is silent (the log file is removed); a non-zero exit prints the one-line warning with the remote log path. `-v` additionally reports the resolved target, remote PID, deploy decision and timings.
 
 ## SSH Disconnection Behavior
 

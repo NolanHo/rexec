@@ -1,7 +1,7 @@
 use std::io::BufReader;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow};
 use clap::{Parser, Subcommand};
@@ -20,12 +20,74 @@ use protocol::{FrameReader, FrameType};
 /// carry only the remote command's own output.
 pub(crate) static QUIET: AtomicBool = AtomicBool::new(false);
 
+/// `--json` was requested. The deploy decision is only ever *reported* by the
+/// JSON summary, so the extra read-only probe behind it (see
+/// `probe_remote_worker_version`) runs only when someone reads the field — the
+/// traced deploy call records its decision in the trace either way.
+pub(crate) static JSON_SUMMARY: AtomicBool = AtomicBool::new(false);
+
+/// Exit code of the remote command, set while streaming frames. Propagated as
+/// rexec's own exit status (like ssh does), so `rexec … && next` and agents
+/// that check `$?` cannot mistake a failed remote run for a success.
+/// 0 = nothing to propagate; negative (signal-killed child) → 255.
+pub(crate) static REMOTE_EXIT: AtomicI32 = AtomicI32::new(0);
+
+/// Map a remote exit code onto a local process exit status: negatives (the
+/// worker could not obtain a real code, e.g. the child died of a signal)
+/// become 255, like ssh's own error status.
+pub(crate) fn remote_exit_status(code: i32) -> i32 {
+    if code < 0 { 255 } else { code }
+}
+
+/// How much of the worker's own stderr is kept for the "worker died before it
+/// started" error. Bounded so a chatty worker cannot balloon memory; the tail
+/// is what explains the failure.
+const WORKER_STDERR_KEEP: usize = 8 * 1024;
+
+/// True when the last byte written to local stderr was not a newline (the
+/// command's stderr frames can end mid-line: `printf 'x' >&2`).
+///
+/// Local diagnostics must start on a fresh line — otherwise the one-line
+/// `--json` summary would be glued to the command's output and stop being
+/// parseable. Tracked by the frame writers, cleared on read.
+static STDERR_TAIL_UNTERMINATED: AtomicBool = AtomicBool::new(false);
+
+/// Record what the frame writers just put on stderr.
+fn note_stderr_write(bytes: &[u8]) {
+    if let Some(last) = bytes.last() {
+        STDERR_TAIL_UNTERMINATED.store(*last != b'\n', Ordering::Relaxed);
+    }
+}
+
+/// Start a fresh stderr line if the previous write left one dangling.
+fn ensure_stderr_line_start() {
+    if STDERR_TAIL_UNTERMINATED.swap(false, Ordering::Relaxed) {
+        eprintln!();
+    }
+}
+
 /// Print a progress/status line to stderr unless --quiet is set.
 #[macro_export]
 macro_rules! status {
     ($($t:tt)*) => {{
         if !crate::QUIET.load(std::sync::atomic::Ordering::Relaxed) {
+            crate::ensure_stderr_line_start();
             eprintln!($($t)*);
+        }
+    }};
+}
+
+/// Print a progress line only in verbose mode.
+///
+/// Success is silent by default: in normal mode stdout/stderr carry the
+/// command's own output and nothing else. The same facts (remote PID, exit
+/// status, sync/reconnect progress) are one flag away under `-v`, and the
+/// decision trace always accompanies a failure.
+#[macro_export]
+macro_rules! progress {
+    ($($t:tt)*) => {{
+        if crate::diagnostics::mode().progress_lines() {
+            crate::status!($($t)*);
         }
     }};
 }
@@ -115,6 +177,14 @@ enum Action {
     List {
         /// Optional: show resolved details for a single alias
         alias: Option<String>,
+    },
+
+    /// Show what a run WOULD do — resolution, deploy decision, launch command —
+    /// without executing the command or deploying anything
+    Plan {
+        /// Command the plan is for (shown, never executed)
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        command: Vec<String>,
     },
 
     /// [internal] Run as worker on the remote host (reads command from stdin)
@@ -466,48 +536,227 @@ fn expand_tilde_path(p: &str) -> PathBuf {
     PathBuf::from(p)
 }
 
-fn resolve_host(host: &str, port_override: Option<u16>) -> Result<RemoteHost> {
-    let mut remote = if host.contains('@')
-        || (host.contains(':') && !host.chars().next().unwrap().is_alphabetic())
-    {
-        parse_user_host_port(host)?
-    } else {
-        let ssh_config_path = dirs::home_dir()
-            .context("cannot determine home directory")?
-            .join(".ssh/config");
+/// Path to the local OpenSSH user config.
+fn ssh_config_path() -> Result<PathBuf> {
+    Ok(dirs::home_dir()
+        .context("cannot determine home directory")?
+        .join(".ssh/config"))
+}
 
-        if !ssh_config_path.exists() {
-            RemoteHost {
-                hostname: host.to_string(),
-                port: None,
-                user: None,
-                identity_file: None,
+/// Parse `~/.ssh/config` with `Include` directives expanded.
+///
+/// Shared by `list_hosts` (whose output is unchanged) and by alias resolution,
+/// so both see exactly the same set of hosts.
+fn load_user_ssh_config() -> Result<(PathBuf, SshConfig)> {
+    let path = ssh_config_path()?;
+    if !path.exists() {
+        return Err(anyhow!("~/.ssh/config not found at {}", path.display()));
+    }
+    let config_str = load_ssh_config_text(&path)?;
+    let mut reader = BufReader::new(config_str.as_bytes());
+    let config = SshConfig::default()
+        .parse(&mut reader, ParseRule::ALLOW_UNKNOWN_FIELDS)
+        .context("parsing ssh config (after Include expansion)")?;
+    Ok((path, config))
+}
+
+/// Local user name, used the way `ssh` and `list` do when no `User` is
+/// configured for the host.
+fn default_user() -> String {
+    std::env::var("USER").unwrap_or_else(|_| "root".to_string())
+}
+
+/// `user@host:port` as the decision trace and the `--json` summary report it.
+fn resolved_label(remote: &RemoteHost) -> String {
+    format!(
+        "{}@{}:{}",
+        remote.user.clone().unwrap_or_else(default_user),
+        remote.hostname,
+        remote.port.unwrap_or(22)
+    )
+}
+
+/// True when `name` can only be a literal target, never an ssh-config alias.
+///
+/// Literal shapes: `user@host[:port]` (explicit user), `[IPv6][:port]`, and
+/// IP/FQDN shapes — a leading digit (`10.0.0.5`) or a dot
+/// (`host.example.com`). Anything else must resolve in ~/.ssh/config: the old
+/// silent fallback (treat the name as a raw hostname) turned every alias typo
+/// into a DNS failure or a connect timeout against a host that does not exist.
+fn is_literal_host(name: &str) -> bool {
+    name.contains('@')
+        || name.starts_with('[')
+        || name.starts_with(|c: char| c.is_ascii_digit())
+        || name.contains('.')
+}
+
+/// True when a concrete (`Host` line) clause in the config matches `name` —
+/// either a defined alias or a name covered by a wildcard block (`Host web*`).
+fn is_defined_alias(config: &SshConfig, name: &str) -> bool {
+    config.get_hosts().iter().any(|host| {
+        host.pattern
+            .iter()
+            .any(|c| !c.negated && c.pattern != "*" && c.intersects(name))
+    })
+}
+
+/// Concrete aliases defined in the config — wildcards, negations and the
+/// global `Host *` block excluded, deduplicated. This is the inventory the
+/// alias-miss error suggests from.
+fn defined_aliases(config: &SshConfig) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for host in config.get_hosts() {
+        for clause in &host.pattern {
+            if clause.negated || clause.pattern == "*" {
+                continue;
             }
-        } else {
-            let config_str = load_ssh_config_text(&ssh_config_path)?;
-            let mut reader = BufReader::new(config_str.as_bytes());
-            let config = SshConfig::default()
-                .parse(&mut reader, ParseRule::ALLOW_UNKNOWN_FIELDS)
-                .context("parsing ssh config (after Include expansion)")?;
-            let host_config = config.query(host);
-            RemoteHost {
-                hostname: host_config
-                    .host_name
-                    .clone()
-                    .unwrap_or_else(|| host.to_string()),
-                port: host_config.port,
-                user: host_config.user.clone(),
-                identity_file: host_config
-                    .identity_file
-                    .as_ref()
-                    .and_then(|v| v.first().cloned()),
-            }
+            out.push(clause.pattern.clone());
         }
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// Up to `max` configured aliases closest to `name`: prefix matches (either
+/// direction) rank above substring matches, then alphabetically. Deliberately
+/// simple — this is a nudge after a typo, not fuzzy matching.
+fn suggest_aliases(name: &str, aliases: &[String], max: usize) -> Vec<String> {
+    let needle = name.to_ascii_lowercase();
+    if needle.is_empty() {
+        return Vec::new();
+    }
+    let mut scored: Vec<(u8, &String)> = Vec::new();
+    for alias in aliases {
+        let lower = alias.to_ascii_lowercase();
+        // Wildcard blocks are not something the user can retype as a target.
+        if lower.is_empty() || lower.contains('*') || lower.contains('?') || lower.starts_with('!')
+        {
+            continue;
+        }
+        let score = if lower.starts_with(&needle) || needle.starts_with(&lower) {
+            0
+        } else if lower.contains(&needle) || needle.contains(&lower) {
+            1
+        } else {
+            continue;
+        };
+        scored.push((score, alias));
+    }
+    scored.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(b.1)));
+    scored
+        .into_iter()
+        .take(max)
+        .map(|(_, alias)| alias.clone())
+        .collect()
+}
+
+/// Error for a name that neither looks like a literal host nor resolves in
+/// `~/.ssh/config`.
+fn alias_miss_error(name: &str, aliases: &[String], config: &Path) -> anyhow::Error {
+    let mut msg = format!("host '{}' is not defined in {}", name, config.display());
+    let suggestions = suggest_aliases(name, aliases, 3);
+    if !suggestions.is_empty() {
+        msg.push_str(&format!("\n  did you mean: {}", suggestions.join(", ")));
+    }
+    msg.push_str(
+        "\n  hint: use user@host for a literal host (e.g. root@10.0.0.5), or -p PORT \
+         to override the port (alias:port is not supported); `rexec list` shows configured aliases",
+    );
+    anyhow!(msg)
+}
+
+/// Resolve a host argument to a concrete target, recording every decision in
+/// `trace`.
+///
+/// Literal shapes are parsed as-is; every other name MUST resolve in
+/// `~/.ssh/config` (Include-expanded). An unknown name is an error — never the
+/// old silent fallback to a raw hostname.
+fn resolve_host(
+    host: &str,
+    port_override: Option<u16>,
+    trace: &mut diagnostics::Trace,
+) -> Result<RemoteHost> {
+    let literal = is_literal_host(host);
+    let mut remote = if literal {
+        let mut parsed = parse_user_host_port(host)?;
+        // A literal name can still match a config block (`Host *.example.com`,
+        // `Host prod.example.com`): those params fill in what the CLI did not
+        // spell out, exactly as `ssh` applies them — dropping them would
+        // silently lose the User/Port/IdentityFile such blocks provide. A
+        // literal that matches no concrete block is untouched (global `Host *`
+        // defaults are not inherited here: raw targets never inherited them
+        // before, and this change does not alter that). Config problems are
+        // ignored on this path for the same reason: a literal target keeps
+        // working with no ~/.ssh/config at all.
+        if let Ok((_, config)) = load_user_ssh_config()
+            && is_defined_alias(&config, &parsed.hostname)
+        {
+            let params = config.query(&parsed.hostname);
+            parsed.hostname = params
+                .host_name
+                .clone()
+                .unwrap_or_else(|| parsed.hostname.clone());
+            if parsed.user.is_none() {
+                parsed.user = params.user.clone();
+            }
+            if parsed.port.is_none() {
+                parsed.port = params.port;
+            }
+            parsed.identity_file = params
+                .identity_file
+                .as_ref()
+                .and_then(|v| v.first().cloned());
+        }
+        trace.add(format!("resolve: literal {}", resolved_label(&parsed)));
+        parsed
+    } else {
+        let path = ssh_config_path()?;
+        if !path.exists() {
+            return Err(alias_miss_error(host, &[], &path));
+        }
+        let config = load_user_ssh_config()?.1;
+        if !is_defined_alias(&config, host) {
+            return Err(alias_miss_error(host, &defined_aliases(&config), &path));
+        }
+        let host_config = config.query(host);
+        let resolved = RemoteHost {
+            hostname: host_config
+                .host_name
+                .clone()
+                .unwrap_or_else(|| host.to_string()),
+            port: host_config.port,
+            user: host_config.user.clone(),
+            identity_file: host_config
+                .identity_file
+                .as_ref()
+                .and_then(|v| v.first().cloned()),
+        };
+        let key = resolved
+            .identity_file
+            .as_ref()
+            .map(|p| format!(" (key {})", p.display()))
+            .unwrap_or_default();
+        trace.add(format!(
+            "resolve: alias {} → {}{}",
+            host,
+            resolved_label(&resolved),
+            key
+        ));
+        resolved
     };
 
-    // --port overrides host:port and ssh-config Port.
+    // --port overrides host:port and ssh-config Port — record which value it
+    // replaced, so a surprising -p is visible in the trace.
     if let Some(p) = port_override {
+        let source = match (remote.port, literal) {
+            (Some(old), true) => format!("from host:port {old}"),
+            (Some(old), false) => format!("from ssh-config {old}"),
+            (None, true) => "no port given (default 22)".to_string(),
+            (None, false) => "no Port in ssh-config (default 22)".to_string(),
+        };
         remote.port = Some(p);
+        trace.add(format!("-p override: {p} ({source})"));
     }
     Ok(remote)
 }
@@ -657,7 +906,7 @@ async fn wait_rsync(
             ));
         }
     }
-    status!(
+    progress!(
         "✓ Synced {} -> {}:{}",
         local.display(),
         rsync_host,
@@ -1350,6 +1599,269 @@ mod tests {
         assert_eq!(local, PathBuf::from("./project"));
         assert_eq!(remote, "/srv/app");
     }
+
+    #[test]
+    fn test_is_literal_host() {
+        // Literal shapes: an explicit user, a bracketed IPv6, an IP, an FQDN.
+        for literal in [
+            "root@10.0.0.5",
+            "root@web1",
+            "user@host:2222",
+            "[2001:db8::1]:22",
+            "10.0.0.5",
+            "192.168.1.7:2222",
+            "host.example.com",
+            "web1.internal",
+            "1web",
+        ] {
+            assert!(is_literal_host(literal), "{literal:?} should be literal");
+        }
+        // Everything else MUST resolve as an ssh-config alias (the old code
+        // silently treated these as raw hostnames).
+        for alias in ["web1", "prod", "my-server", "web1:2222", "prod-01"] {
+            assert!(!is_literal_host(alias), "{alias:?} should need config");
+        }
+    }
+
+    #[test]
+    fn test_suggest_aliases_ranks_prefix_over_substring() {
+        let aliases: Vec<String> = [
+            "prod-web-2",
+            "staging",
+            "web1",
+            "web2",
+            "prod-db",
+            "*.internal",
+            "!blocked",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+
+        // Prefix matches ("web*") before substring matches ("prod-web-*").
+        assert_eq!(
+            suggest_aliases("web", &aliases, 3),
+            vec![
+                "web1".to_string(),
+                "web2".to_string(),
+                "prod-web-2".to_string()
+            ]
+        );
+        // Wildcards and negations are never suggested.
+        let suggestions = suggest_aliases("web", &aliases, 10);
+        assert!(
+            !suggestions
+                .iter()
+                .any(|s| s.contains('*') || s.contains('!'))
+        );
+        // No relation → no suggestion (the error just omits the line).
+        assert!(suggest_aliases("database", &aliases, 3).is_empty());
+        // `max` is honoured.
+        assert_eq!(
+            suggest_aliases("web", &aliases, 1),
+            vec!["web1".to_string()]
+        );
+        // Case-insensitive.
+        assert_eq!(
+            suggest_aliases("WEB1", &aliases, 1),
+            vec!["web1".to_string()]
+        );
+        assert!(suggest_aliases("", &aliases, 3).is_empty());
+    }
+
+    #[test]
+    fn test_alias_miss_error_lists_suggestions_and_hint() {
+        let aliases: Vec<String> = ["web1", "web2", "db1"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let msg = alias_miss_error("web", &aliases, Path::new("/home/u/.ssh/config")).to_string();
+        assert!(msg.contains("host 'web' is not defined"), "{msg}");
+        assert!(msg.contains("did you mean: web1, web2"), "{msg}");
+        assert!(msg.contains("use user@host for a literal host"), "{msg}");
+        // A name with no relation still gets the hint, just no suggestions.
+        let msg = alias_miss_error("nope", &aliases, Path::new("/home/u/.ssh/config")).to_string();
+        assert!(!msg.contains("did you mean"), "{msg}");
+        assert!(msg.contains("use user@host for a literal host"), "{msg}");
+    }
+
+    #[test]
+    fn test_plan_remote_asset_mapping() {
+        assert_eq!(
+            plan_remote_asset("Linux x86_64").as_deref(),
+            Some("linux-amd64")
+        );
+        assert_eq!(
+            plan_remote_asset("Linux aarch64").as_deref(),
+            Some("linux-arm64")
+        );
+        assert_eq!(
+            plan_remote_asset("Darwin arm64").as_deref(),
+            Some("macos-arm64")
+        );
+        assert_eq!(
+            plan_remote_asset("Windows_NT AMD64").as_deref(),
+            Some("windows-amd64")
+        );
+        assert_eq!(
+            plan_remote_asset("Windows_NT ARM64").as_deref(),
+            Some("windows-arm64")
+        );
+        // Unmapped probes (Git-Bash uname, missing binary) → no guess.
+        assert_eq!(plan_remote_asset("MINGW64_NT-10.0-19045"), None);
+        assert_eq!(plan_remote_asset(""), None);
+        assert_eq!(plan_remote_asset("Windows_NT X86"), None);
+    }
+
+    /// Structural check: braces/brackets/strings balance and every `"` inside a
+    /// string is escaped — enough to prove the hand-written serializer emits
+    /// ONE parseable JSON value without pulling in `serde_json`.
+    fn assert_json_balanced(line: &str) {
+        let mut depth = 0i32;
+        let mut in_string = false;
+        let mut escaped = false;
+        for c in line.chars() {
+            if in_string {
+                if escaped {
+                    escaped = false;
+                } else if c == '\\' {
+                    escaped = true;
+                } else if c == '"' {
+                    in_string = false;
+                }
+                continue;
+            }
+            match c {
+                '"' => in_string = true,
+                '{' | '[' => depth += 1,
+                '}' | ']' => depth -= 1,
+                _ => {}
+            }
+            assert!(depth >= 0, "unbalanced JSON: {line}");
+        }
+        assert!(!in_string, "unterminated string: {line}");
+        assert_eq!(depth, 0, "unbalanced JSON: {line}");
+    }
+
+    #[test]
+    fn test_summary_json_line_field_order_and_values() {
+        let summary = diagnostics::RunSummary {
+            host: "web1".to_string(),
+            resolved: "root@10.0.0.5:2222".to_string(),
+            pid: Some(4242),
+            exit_code: Some(1),
+            duration_ms: Some(812),
+            deployed: true,
+            stdout_bytes: 12,
+            stderr_bytes: 3,
+            log_path: None,
+            error: Some("boom".to_string()),
+        };
+        let line = summary_json_line(&summary);
+        assert_eq!(
+            line,
+            r#"{"host":"web1","resolved":"root@10.0.0.5:2222","pid":4242,"exit_code":1,"duration_ms":812,"deployed":true,"stdout_bytes":12,"stderr_bytes":3,"log_path":null,"error":"boom"}"#
+        );
+        assert_json_balanced(&line);
+        assert!(!line.contains('\n'), "must be exactly one line");
+    }
+
+    #[test]
+    fn test_summary_json_line_success_omits_error_and_nulls_options() {
+        let summary = diagnostics::RunSummary {
+            host: "prod".to_string(),
+            resolved: "root@example.com:22".to_string(),
+            pid: None,
+            exit_code: None,
+            duration_ms: Some(5),
+            deployed: false,
+            stdout_bytes: 0,
+            stderr_bytes: 0,
+            log_path: None,
+            error: None,
+        };
+        let line = summary_json_line(&summary);
+        assert_eq!(
+            line,
+            r#"{"host":"prod","resolved":"root@example.com:22","pid":null,"exit_code":null,"duration_ms":5,"deployed":false,"stdout_bytes":0,"stderr_bytes":0,"log_path":null}"#
+        );
+        assert!(!line.contains("\"error\""), "{line}");
+        assert_json_balanced(&line);
+    }
+
+    #[test]
+    fn test_summary_json_line_escapes_control_characters() {
+        let summary = diagnostics::RunSummary {
+            host: "we\"b\\1".to_string(),
+            resolved: String::new(),
+            pid: None,
+            exit_code: None,
+            duration_ms: None,
+            deployed: false,
+            stdout_bytes: 0,
+            stderr_bytes: 0,
+            log_path: Some("/tmp/a\tb.log".to_string()),
+            error: Some("line1\nline2\r\u{7}\u{1b}[0m".to_string()),
+        };
+        let line = summary_json_line(&summary);
+        assert!(line.contains(r#""host":"we\"b\\1""#), "{line}");
+        assert!(line.contains(r#""log_path":"/tmp/a\tb.log""#), "{line}");
+        assert!(
+            line.contains(r#""error":"line1\nline2\r\u0007\u001b[0m""#),
+            "{line}"
+        );
+        // No raw control characters survive into the line.
+        assert!(!line.chars().any(|c| (c as u32) < 0x20), "{line}");
+        assert_json_balanced(&line);
+    }
+
+    #[test]
+    fn test_worker_start_failure_carries_stderr_and_launch_command() {
+        let err = worker_start_failure(
+            b"worker requires a command over stdin\n",
+            "~/.rexec/rexec worker",
+            "web1",
+        )
+        .to_string();
+        assert!(
+            err.starts_with("connection lost before worker started"),
+            "{err}"
+        );
+        assert!(
+            err.contains("worker requires a command over stdin"),
+            "{err}"
+        );
+        assert!(
+            err.contains("launch command: ~/.rexec/rexec worker"),
+            "{err}"
+        );
+        assert!(err.contains("rexec web1 init"), "{err}");
+
+        // A worker that dies silently still names the launch command.
+        let err = worker_start_failure(b"", "~/.rexec/rexec worker", "web1").to_string();
+        assert!(err.contains("worker stderr: (none)"), "{err}");
+        assert!(
+            err.contains("launch command: ~/.rexec/rexec worker"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn test_attach_trace_appends_only_when_recorded() {
+        let mut trace = diagnostics::Trace::default();
+        let err = attach_trace(anyhow!("plain failure"), &trace);
+        assert_eq!(err.to_string(), "plain failure");
+
+        trace.add("resolve: literal root@10.0.0.5:22");
+        let err = attach_trace(anyhow!("with context"), &trace);
+        let text = err.to_string();
+        assert!(text.starts_with("with context\n"), "{text}");
+        assert!(text.contains("decision trace:"), "{text}");
+        assert!(
+            text.contains("→ resolve: literal root@10.0.0.5:22"),
+            "{text}"
+        );
+    }
 }
 
 /// Simple shell quoting for a single argument.
@@ -1361,7 +1873,85 @@ fn shell_quote(s: &str) -> Result<String> {
     Ok(format!("'{}'", s.replace('\'', "'\"'\"'")))
 }
 
+/// `rexec <CARGO_PKG_VERSION>` — the version string a remote worker must
+/// answer to count as up to date (same comparison `ssh.rs` makes).
+fn local_worker_version() -> String {
+    format!("rexec {}", env!("CARGO_PKG_VERSION"))
+}
+
+/// Remote worker version, read as `--version` output (`rexec x.y.z`), or
+/// `None` when nothing readable answers. Never deploys.
+///
+/// `cmd /c` is probed first because it is harmless on a POSIX remote
+/// (`cmd: command not found`), while the POSIX probe must NOT run on a Windows
+/// remote: `2>/dev/null` is not a cmd redirect and would create a stray
+/// `<drive>:\dev\null` (see `ssh::detect_remote_asset`). `%USERPROFILE%` is
+/// expanded by the nested `cmd`.
+async fn probe_remote_worker_version(
+    session: &russh::client::Handle<ssh::ClientHandler>,
+) -> Option<String> {
+    let windows = ssh::exec_remote(
+        session,
+        r#"cmd /c ""%USERPROFILE%\.rexec\rexec.exe" --version""#,
+    )
+    .await
+    .unwrap_or_default();
+    let output = if windows.trim().is_empty() {
+        ssh::exec_remote(session, "~/.rexec/rexec --version 2>/dev/null")
+            .await
+            .unwrap_or_default()
+    } else {
+        windows
+    };
+    let version = output.trim();
+    if version.is_empty() {
+        None
+    } else {
+        Some(version.to_string())
+    }
+}
+
+/// Error for a worker that died before its Started frame.
+///
+/// The worker's own stderr is the only explanation available for a failure
+/// that early (e.g. "worker requires a command over stdin" from an unexpected
+/// invocation, or a binary that cannot run on the remote), so the message
+/// carries it together with the launch command that was attempted. The
+/// decision trace is appended by the CLI boundary to every failure, not
+/// duplicated here.
+fn worker_start_failure(worker_stderr: &[u8], worker_cmd: &str, host: &str) -> anyhow::Error {
+    let text = String::from_utf8_lossy(worker_stderr);
+    let text = text.trim();
+    let mut msg = String::from("connection lost before worker started");
+    msg.push_str("\nworker stderr: ");
+    msg.push_str(if text.is_empty() { "(none)" } else { text });
+    msg.push_str(&format!("\nlaunch command: {worker_cmd}"));
+    msg.push_str(&format!(
+        "\nhint: `rexec {host} init` checks the remote deps; a worker that cannot run leaves its \
+         error above"
+    ));
+    anyhow!(msg)
+}
+
+/// Where the worker's log for `pid` lives on the remote, as a hint the user
+/// can paste into `ssh`. Windows remotes need the literal profile path —
+/// cmd.exe does not expand `~`.
+fn remote_log_hint(remote_env: &ssh::RemoteEnv, pid: u32) -> String {
+    if remote_env.is_windows {
+        format!(
+            "{}\\.rexec\\logs\\{}.log",
+            remote_env.home.trim_end_matches('\\'),
+            pid
+        )
+    } else {
+        format!("~/.rexec/logs/{pid}.log")
+    }
+}
+
 /// Core run logic: deploy worker, stream output, reconnect on disconnect.
+///
+/// Every decision lands in `trace` (printed on failure in any mode, on success
+/// only under `-v`) and every measured fact lands in `summary` (`--json`).
 ///
 /// `unused_assignments`: `session = new_session` on reconnect keeps the SSH
 /// handle alive (channel holds an implicit ref), but the compiler can't see it.
@@ -1371,9 +1961,22 @@ async fn run_command(
     host: &str,
     command: &str,
     env: &[(String, String)],
+    trace: &mut diagnostics::Trace,
+    summary: &mut diagnostics::RunSummary,
 ) -> Result<()> {
-    let mut session = ssh::connect(remote).await?;
-    let remote_env = ssh::ensure_remote_binary(&mut session, host).await?;
+    summary.resolved = resolved_label(remote);
+
+    // TODO(trace): done — the traced variant is on this branch, so it is
+    // called here (it records the target, handshake and every auth attempt).
+    // On a branch without it, this is the one line to swap back to
+    // `ssh::connect(remote).await` (losing the auth detail in the trace).
+    let mut session = ssh::connect_traced(remote, trace).await?;
+
+    // TODO(trace): done — `ensure_remote_binary_traced` records the platform
+    // probe, the version comparison and the upload outcome, and returns the
+    // deploy decision as `RemoteEnv.deployed`.
+    let remote_env = ssh::ensure_remote_binary_traced(&mut session, host, trace).await?;
+    summary.deployed = remote_env.deployed;
 
     // Start worker on remote. The command itself is NOT passed on argv (so
     // `pkill -f`/`pgrep -f` cannot match the worker by command content); it is
@@ -1381,8 +1984,9 @@ async fn run_command(
     // The launch command is platform-correct: POSIX `~` does not expand under
     // cmd.exe/PowerShell on Windows remotes.
     let worker_cmd = remote_env.worker_command();
+    trace.add(format!("worker: launching `{worker_cmd}`"));
     let mut channel = session.channel_open_session().await?;
-    channel.exec(true, worker_cmd).await?;
+    channel.exec(true, worker_cmd.clone()).await?;
 
     // Send the command + environment to the worker over the channel's stdin.
     // The worker reads these before spawning the child, so neither the command
@@ -1409,6 +2013,11 @@ async fn run_command(
     //   offset = base_offset + frame_reader.consumed_bytes()
     let mut base_offset: u64 = 0;
     let mut pid: Option<u32> = None;
+    // The worker's OWN stderr (SSH extended data — the command's stderr arrives
+    // as protocol frames). Streamed through as it arrives and kept for the
+    // "worker died before it started" error, where it is the only explanation
+    // available.
+    let mut worker_stderr: Vec<u8> = Vec::new();
     // Track whether signal handler is available — if it fails to init,
     // stop polling sig_rx to avoid busy-loop on None.
     let mut signal_available = true;
@@ -1462,7 +2071,7 @@ async fn run_command(
                 }
                 if let Some(p) = pid {
                     status!(
-                        "\n⚠ Interrupted by signal. Remote process still running.\n  PID: {}",
+                        "⚠ Interrupted by signal. Remote process still running.\n  PID: {}",
                         p
                     );
                 }
@@ -1479,6 +2088,7 @@ async fn run_command(
                             match frame.frame_type {
                                 FrameType::Stdout => {
                                     use std::io::Write;
+                                    summary.stdout_bytes += frame.data.len() as u64;
                                     let stdout = std::io::stdout();
                                     let mut lock = stdout.lock();
                                     lock.write_all(&frame.data)?;
@@ -1486,25 +2096,56 @@ async fn run_command(
                                 }
                                 FrameType::Stderr => {
                                     use std::io::Write;
+                                    summary.stderr_bytes += frame.data.len() as u64;
+                                    note_stderr_write(&frame.data);
+                                    // Interactive stderr gets the remote's error
+                                    // output in red; piped/agent use stays
+                                    // byte-pure (no escape sequences).
                                     let stderr = std::io::stderr();
                                     let mut lock = stderr.lock();
-                                    lock.write_all(&frame.data)?;
+                                    if diagnostics::stderr_is_tty() {
+                                        lock.write_all(
+                                            diagnostics::red(&String::from_utf8_lossy(&frame.data))
+                                                .as_bytes(),
+                                        )?;
+                                    } else {
+                                        lock.write_all(&frame.data)?;
+                                    }
                                     lock.flush()?;
                                 }
                                 FrameType::Started => {
                                     pid = frame.as_pid();
                                     if let Some(p) = pid {
-                                        status!("Remote PID: {}", p);
+                                        summary.pid = Some(p);
+                                        trace.add(format!("worker: started (pid {p})"));
+                                        progress!("Remote PID: {}", p);
                                     }
                                 }
                                 FrameType::Exited => {
                                     use std::io::Write;
                                     std::io::stdout().flush()?;
                                     let code = frame.as_exit_code().unwrap_or(-1);
+                                    summary.exit_code = Some(code);
+                                    trace.add(format!("exit: remote code {code}"));
                                     if code == 0 {
-                                        status!("\n✓ Remote process exited");
+                                        // Success is silent by default; only -v
+                                        // reports it.
+                                        progress!("✓ Remote process exited");
                                     } else {
-                                        status!("\n✗ Remote process exited with code {}", code);
+                                        // A warning, not progress: it prints in
+                                        // every mode. The exit code and where
+                                        // the full log lives are exactly what
+                                        // the caller needs, and staying silent
+                                        // here would hide a failed run.
+                                        let log = match pid {
+                                            Some(p) => remote_log_hint(&remote_env, p),
+                                            None => "~/.rexec/logs/<pid>.log".to_string(),
+                                        };
+                                        ensure_stderr_line_start();
+                                        eprintln!("⚠ remote exit {} (log: {})", code, log);
+                                        // Propagate as rexec's own status (ssh
+                                        // semantics); the boundary reads it.
+                                        REMOTE_EXIT.store(code, Ordering::Relaxed);
                                     }
                                     return Ok(());
                                 }
@@ -1513,21 +2154,41 @@ async fn run_command(
                         }
                     }
                     Some(ChannelMsg::ExitStatus { .. }) => {}
+                    Some(ChannelMsg::ExtendedData { ref data, ext }) => {
+                        // The worker's OWN stderr (SSH extended data, ext 1).
+                        // Startup failures ("worker requires a command over
+                        // stdin") only ever arrive here — dropping them is why
+                        // a worker that died before the Started frame used to
+                        // fail with a bare "connection lost".
+                        if ext == 1 {
+                            use std::io::Write;
+                            let stderr = std::io::stderr();
+                            let mut lock = stderr.lock();
+                            lock.write_all(data)?;
+                            lock.flush()?;
+                            summary.stderr_bytes += data.len() as u64;
+                            note_stderr_write(data);
+                            worker_stderr.extend_from_slice(data);
+                            if worker_stderr.len() > WORKER_STDERR_KEEP {
+                                let excess = worker_stderr.len() - WORKER_STDERR_KEEP;
+                                worker_stderr.drain(..excess);
+                            }
+                        }
+                    }
                     Some(ChannelMsg::Eof) | None => {
                         // Channel closed — try to reconnect
                         let pid_val = match pid {
                             Some(p) => p,
-                            None => {
-                                return Err(anyhow!(
-                                    "connection lost before worker started"
-                                ));
-                            }
+                            None => return Err(worker_start_failure(&worker_stderr, &worker_cmd, host)),
                         };
 
-                        status!(
-                            "\n⚠ Connection lost. Remote process still running.\n  PID: {}",
+                        progress!(
+                            "⚠ Connection lost. Remote process still running.\n  PID: {}",
                             pid_val
                         );
+                        trace.add(format!(
+                            "reconnect: connection lost at offset {offset} (pid {pid_val})"
+                        ));
 
                         // Reconnect with exponential backoff
                         let mut backoff = Duration::from_secs(1);
@@ -1536,7 +2197,7 @@ async fn run_command(
                         let mut reconnected = false;
 
                         for retry in 1..=max_retries {
-                            status!(
+                            progress!(
                                 "  Retry {}/{} in {:?}...",
                                 retry, max_retries, backoff
                             );
@@ -1554,7 +2215,7 @@ async fn run_command(
                                     }
                                     if let Some(p) = pid {
                                         status!(
-                                            "\n⚠ Interrupted by signal. Remote process still running.\n  PID: {}",
+                                            "⚠ Interrupted by signal. Remote process still running.\n  PID: {}",
                                             p
                                         );
                                     }
@@ -1563,7 +2224,11 @@ async fn run_command(
                             }
                             backoff = (backoff * 2).min(max_backoff);
 
-                            match ssh::connect(remote).await {
+                            // TODO(trace): done — same swap as the initial
+                            // connect; on a branch without `connect_traced`
+                            // this is `ssh::connect(remote).await` plus a
+                            // local trace line.
+                            match ssh::connect_traced(remote, trace).await {
                                 Ok(new_session) => {
                                     let attach_cmd =
                                         remote_env.attach_command(pid_val, offset);
@@ -1576,18 +2241,21 @@ async fn run_command(
                                                     // Preserve total offset across FrameReader reset
                                                     base_offset = offset;
                                                     frame_reader = FrameReader::new();
-                                                    status!("✓ Reconnected. Resuming...");
+                                                    progress!("✓ Reconnected. Resuming...");
+                                                    trace.add(format!(
+                                                        "reconnect: resumed at offset {offset}"
+                                                    ));
                                                     reconnected = true;
                                                     break;
                                                 }
                                                 Err(e) => {
-                                                    status!("  Failed to exec attach: {}", e);
+                                                    progress!("  Failed to exec attach: {}", e);
                                                     continue;
                                                 }
                                             }
                                         }
                                         Err(e) => {
-                                            status!("  Failed to open channel: {}", e);
+                                            progress!("  Failed to open channel: {}", e);
                                             continue;
                                         }
                                     }
@@ -1600,8 +2268,14 @@ async fn run_command(
 
                         if !reconnected {
                             return Err(anyhow!(
-                                "connection lost after {} retries. Remote PID: {}",
-                                max_retries, pid_val
+                                "connection lost after {} retries. Remote PID: {}. The remote process \
+                                 may still be running — re-attach with `ssh {} \"~/.rexec/rexec attach \
+                                 --pid {} --offset {}\"`",
+                                max_retries,
+                                pid_val,
+                                host,
+                                pid_val,
+                                offset
                             ));
                         }
                         // Continue reading from the new (attach) channel
@@ -1657,6 +2331,8 @@ async fn run_script(
     sync_to: Option<&str>,
     args: &[String],
     env_vars: &[(String, String)],
+    trace: &mut diagnostics::Trace,
+    summary: &mut diagnostics::RunSummary,
 ) -> Result<()> {
     let basename = script
         .file_name()
@@ -1674,11 +2350,17 @@ async fn run_script(
     // runner command avoids relying on shell tilde expansion, which quoting
     // would disable (python3 '$HOME/...' does not expand).
     let remote_script = {
-        let mut session = ssh::connect(remote).await?;
+        // TODO(trace): done — same swap as `run_command`: the connect and the
+        // deploy each record their decisions in the trace.
+        let mut session = ssh::connect_traced(remote, trace).await?;
         // `script` requires rsync (do_sync below) and a POSIX remote path
         // model — reject Windows remotes up front instead of wasting a full
         // SFTP worker deploy and then failing in the rsync step.
-        let env = ssh::ensure_remote_binary(&mut session, host).await?;
+        // The deploy decision flows from `RemoteEnv.deployed` (`|=`: this
+        // call may deploy, and the later one in run_command then sees an
+        // up-to-date worker).
+        let env = ssh::ensure_remote_binary_traced(&mut session, host, trace).await?;
+        summary.deployed |= env.deployed;
         if env.is_windows {
             return Err(anyhow!(
                 "`script` requires a Linux/macOS remote (rsync + POSIX paths); this host is Windows"
@@ -1719,25 +2401,213 @@ async fn run_script(
         parts.push(shell_quote(a)?);
     }
     let command = parts.join(" ");
-    run_command(remote, host, &command, env_vars).await?;
+    trace.add(format!(
+        "script: synced {} → {remote_script}",
+        script.display()
+    ));
+    run_command(remote, host, &command, env_vars, trace, summary).await?;
+    Ok(())
+}
+
+/// Release assets rexec ships, e.g. `linux-amd64` — display only, mirroring
+/// `ssh::local_asset` (private there). Used by `plan` to say whether a run
+/// would upload itself or download a prebuilt worker; it never decides a real
+/// deploy, which always stays in `ssh.rs`.
+fn local_release_asset() -> String {
+    let arch = if std::env::consts::ARCH == "x86_64" {
+        "amd64"
+    } else {
+        "arm64"
+    };
+    format!("{}-{arch}", std::env::consts::OS)
+}
+
+/// Release-asset suffix for a remote platform probe ("Linux x86_64" →
+/// "linux-amd64", "Windows_NT AMD64" → "windows-amd64").
+///
+/// Display only, for `plan`: mirrors `ssh::uname_asset` (private there). An
+/// unmapped probe returns `None`, which the plan reports as "platform
+/// unrecognized" instead of guessing.
+fn plan_remote_asset(probe: &str) -> Option<String> {
+    let tokens: Vec<&str> = probe.split_whitespace().collect();
+    if tokens.contains(&"Windows_NT") {
+        return if tokens.contains(&"AMD64") {
+            Some("windows-amd64".to_string())
+        } else if tokens.contains(&"ARM64") {
+            Some("windows-arm64".to_string())
+        } else {
+            None
+        };
+    }
+    match (tokens.first(), tokens.get(1)) {
+        (Some(&"Linux"), Some(&"x86_64")) => Some("linux-amd64".to_string()),
+        (Some(&"Linux"), Some(&"aarch64")) => Some("linux-arm64".to_string()),
+        (Some(&"Darwin"), Some(&"x86_64")) => Some("macos-amd64".to_string()),
+        (Some(&"Darwin"), Some(&"arm64")) => Some("macos-arm64".to_string()),
+        _ => None,
+    }
+}
+
+/// GitHub repo hosting prebuilt workers — keep in sync with `ssh::GITHUB_REPO`
+/// (private there); used only to render the `plan` download URL.
+const WORKER_RELEASE_REPO: &str = "NolanHo/rexec";
+
+/// Release URL a cross-platform deploy would download — display only, mirroring
+/// the URL built by `ssh::download_worker`.
+fn worker_release_url(asset: &str) -> String {
+    format!(
+        "https://github.com/{}/releases/download/v{}/rexec-{}",
+        WORKER_RELEASE_REPO,
+        env!("CARGO_PKG_VERSION"),
+        asset
+    )
+}
+
+/// Read-only platform probe for `plan` ("Linux x86_64"). Mirrors the probe
+/// commands of `ssh::detect_remote_asset`, which is private and deploys when it
+/// runs; this one only ever reads, so a plan cannot mutate the remote.
+async fn probe_remote_platform(
+    session: &russh::client::Handle<ssh::ClientHandler>,
+) -> (String, Option<String>) {
+    let uname = ssh::exec_remote(session, "uname -sm")
+        .await
+        .unwrap_or_default();
+    if let Some(asset) = plan_remote_asset(&uname) {
+        return (uname.trim().to_string(), Some(asset));
+    }
+    // No usable `uname` (Windows remote, or Git-Bash's `MINGW64_NT...`):
+    // ask cmd.exe, exactly as ssh.rs does.
+    let windows = ssh::exec_remote(
+        session,
+        r#"cmd /c "echo Windows_NT %PROCESSOR_ARCHITECTURE%""#,
+    )
+    .await
+    .unwrap_or_default();
+    let asset = plan_remote_asset(&windows);
+    let raw = if windows.trim().is_empty() {
+        uname.trim().to_string()
+    } else {
+        windows.trim().to_string()
+    };
+    (raw, asset)
+}
+
+/// Absolute Windows home, for the launch-command display (cmd.exe cannot
+/// expand `~`). Mirrors `ssh::remote_home_windows` (private there).
+async fn probe_windows_home(session: &russh::client::Handle<ssh::ClientHandler>) -> String {
+    ssh::exec_remote(session, r#"cmd /c "echo %USERPROFILE%""#)
+        .await
+        .unwrap_or_default()
+        .trim()
+        .to_string()
+}
+
+/// `rexec <host> plan -- <cmd>`: everything up to (but not including) the
+/// worker launch.
+///
+/// Connects, resolves, probes the remote platform and the installed worker,
+/// prints what a run WOULD do, and exits 0 — without executing the command and
+/// without deploying anything. The deploy decision is recomputed from
+/// read-only probes because `ssh::ensure_remote_binary_traced` has no dry-run
+/// mode and its helpers are private; nothing here can mutate the remote.
+async fn plan_command(
+    remote: &RemoteHost,
+    host: &str,
+    command: &str,
+    trace: &mut diagnostics::Trace,
+    summary: &mut diagnostics::RunSummary,
+) -> Result<()> {
+    summary.resolved = resolved_label(remote);
+
+    // TODO(trace): done — same swap as `run_command`.
+    let session = ssh::connect_traced(remote, trace).await?;
+
+    let (platform, asset) = probe_remote_platform(&session).await;
+    let remote_version = probe_remote_worker_version(&session).await;
+    let local_version = local_worker_version();
+
+    // Reuse ssh.rs's launch-command shapes through the public `RemoteEnv`
+    // fields — the display cannot drift from the real command, and building it
+    // deploys nothing.
+    let is_windows = asset.as_deref().is_some_and(|a| a.starts_with("windows-"));
+    let home = if is_windows {
+        probe_windows_home(&session).await
+    } else {
+        String::new()
+    };
+    let launch = ssh::RemoteEnv {
+        is_windows,
+        home,
+        deployed: false,
+    }
+    .worker_command();
+
+    let remote_label = remote_version
+        .clone()
+        .unwrap_or_else(|| "not installed (or no readable version)".to_string());
+    let deploy = match (&remote_version, &asset) {
+        (Some(v), _) if *v == local_version => {
+            format!("nothing — remote worker {v} is up-to-date")
+        }
+        (_, Some(a)) if *a == local_release_asset() => {
+            format!("upload self — the local {local_version} binary (remote asset {a})")
+        }
+        (_, Some(a)) => format!("download {a} from {}", worker_release_url(a)),
+        (_, None) => format!(
+            "worker would be (re)installed — the remote platform is unrecognized, so the source \
+             depends on the platform match (local asset {})",
+            local_release_asset()
+        ),
+    };
+
+    let platform_label = match &asset {
+        Some(a) => format!("{platform} (asset {a})"),
+        None => format!("{platform} (unrecognized)"),
+    };
+
+    // The plan body IS the command's purpose (like `list`'s table), so it goes
+    // to stdout in every mode; the same decisions are recorded in the trace.
+    println!("plan: {host} ({})", resolved_label(remote));
+    println!("  platform: {platform_label}");
+    println!("  worker:   remote {remote_label}; local {local_version}");
+    println!("  deploy:   {deploy}");
+    println!("  launch:   {launch}");
+    println!(
+        "  command:  {}",
+        if command.is_empty() {
+            "(none given)"
+        } else {
+            command
+        }
+    );
+    println!(
+        "  indirection: the command travels to the worker over stdin (never in any process's \
+         argv/ps);"
+    );
+    println!(
+        "               the worker writes it to a private script file and runs `sh <script>` \
+         (`cmd /C` on Windows),"
+    );
+    println!(
+        "               deleted on exit — to run a local file, sync it with `rexec {host} script \
+         <file>`."
+    );
+    println!("  note: plan only — connected and probed; nothing was executed or deployed.");
+
+    trace.add(format!("plan: platform {platform_label}"));
+    trace.add(format!(
+        "plan: worker remote {remote_label} vs local {local_version}"
+    ));
+    trace.add(format!("plan: deploy would be {deploy}"));
+    trace.add(format!("plan: launch `{launch}` (not executed)"));
     Ok(())
 }
 
 /// List SSH hosts from ~/.ssh/config (the `list` subcommand).
 fn list_hosts(alias: Option<&str>) -> Result<()> {
-    let path = dirs::home_dir()
-        .context("cannot determine home directory")?
-        .join(".ssh/config");
-    if !path.exists() {
-        return Err(anyhow!("~/.ssh/config not found at {}", path.display()));
-    }
-    let config_str = load_ssh_config_text(&path)?;
-    let mut reader = BufReader::new(config_str.as_bytes());
-    let config = SshConfig::default()
-        .parse(&mut reader, ParseRule::ALLOW_UNKNOWN_FIELDS)
-        .context("parsing ssh config (after Include expansion)")?;
+    let (_path, config) = load_user_ssh_config()?;
 
-    let default_user = std::env::var("USER").unwrap_or_else(|_| "root".to_string());
+    let default_user = default_user();
 
     if let Some(a) = alias {
         let p = config.query(a);
@@ -1780,101 +2650,295 @@ fn list_hosts(alias: Option<&str>) -> Result<()> {
     Ok(())
 }
 
+/// Serialize [`diagnostics::RunSummary`] as ONE line of JSON, by hand.
+///
+/// `serde` (derive) is a direct dependency but the formatter (`serde_json`) is
+/// not, and `Cargo.toml` is owned by another workstream — so the fields are
+/// written in declaration order with a minimal escaper. The order is stable
+/// (unit-tested), `error` is omitted when absent (matching the struct's
+/// `skip_serializing_if`), and the result is a single JSON object with no
+/// trailing newline.
+fn summary_json_line(summary: &diagnostics::RunSummary) -> String {
+    let mut out = String::with_capacity(192);
+    out.push_str("{\"host\":");
+    out.push_str(&json_string(&summary.host));
+    out.push_str(",\"resolved\":");
+    out.push_str(&json_string(&summary.resolved));
+    out.push_str(",\"pid\":");
+    out.push_str(&json_number(summary.pid));
+    out.push_str(",\"exit_code\":");
+    out.push_str(&json_number(summary.exit_code));
+    out.push_str(",\"duration_ms\":");
+    out.push_str(&json_number(summary.duration_ms));
+    out.push_str(",\"deployed\":");
+    out.push_str(if summary.deployed { "true" } else { "false" });
+    out.push_str(",\"stdout_bytes\":");
+    out.push_str(&summary.stdout_bytes.to_string());
+    out.push_str(",\"stderr_bytes\":");
+    out.push_str(&summary.stderr_bytes.to_string());
+    out.push_str(",\"log_path\":");
+    out.push_str(&json_string_opt(summary.log_path.as_deref()));
+    if let Some(error) = &summary.error {
+        out.push_str(",\"error\":");
+        out.push_str(&json_string(error));
+    }
+    out.push('}');
+    out
+}
+
+/// JSON number for an optional numeric field (`null` when absent).
+fn json_number<T: std::fmt::Display>(value: Option<T>) -> String {
+    match value {
+        Some(v) => v.to_string(),
+        None => "null".to_string(),
+    }
+}
+
+/// JSON string for an optional string field (`null` when absent).
+fn json_string_opt(value: Option<&str>) -> String {
+    match value {
+        Some(v) => json_string(v),
+        None => "null".to_string(),
+    }
+}
+
+/// A JSON string in quotes. `"`, `\` and the control characters are escaped —
+/// everything a JSON string may not carry literally (`\n`, `\r`, `\t`, `\b`,
+/// `\f` short forms; other C0 controls and DEL as `\u00XX`).
+fn json_string(value: &str) -> String {
+    let mut out = String::with_capacity(value.len() + 2);
+    out.push('"');
+    for c in value.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            '\u{08}' => out.push_str("\\b"),
+            '\u{0c}' => out.push_str("\\f"),
+            c if (c as u32) < 0x20 || c == '\u{7f}' => {
+                out.push_str(&format!("\\u{:04x}", c as u32))
+            }
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// Append the decision trace to a failure, so an error arrives with its full
+/// context in one shot (the transparency contract). Failures from before any
+/// decision was recorded keep their original message.
+fn attach_trace(err: anyhow::Error, trace: &diagnostics::Trace) -> anyhow::Error {
+    let rendered = trace.render();
+    if rendered.is_empty() {
+        return err;
+    }
+    // `{:#}` renders anyhow's whole context chain; the runtime would print only
+    // the outermost message.
+    let mut msg = format!("{err:#}");
+    if !msg.ends_with('\n') {
+        msg.push('\n');
+    }
+    msg.push_str(rendered.trim_end());
+    anyhow!(msg)
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
     QUIET.store(cli.quiet, Ordering::Relaxed);
+    JSON_SUMMARY.store(cli.json, Ordering::Relaxed);
     diagnostics::OUTPUT_MODE.store(
         diagnostics::OutputMode::from_flags(cli.quiet, cli.verbose).as_u8(),
         Ordering::Relaxed,
     );
 
-    match (cli.host, cli.action, cli.port) {
-        // ── Local operations ──
-        (Some(host), Action::Init, port) => {
-            let remote = resolve_host(&host, port)?;
-            let mut session = ssh::connect(&remote).await?;
-            ssh::check_and_install_deps(&mut session).await?;
-        }
-        (
-            Some(host),
-            Action::Run {
-                sync,
-                env,
-                env_file,
-                command,
-            },
-            port,
-        ) => {
-            if command.is_empty() {
+    // The JSON summary describes an execution run; `list` (and the internal
+    // worker/attach commands) have no such summary to report.
+    let json = cli.json
+        && !matches!(
+            cli.action,
+            Action::List { .. } | Action::Worker | Action::Attach { .. }
+        );
+    let started = Instant::now();
+    let mut trace = diagnostics::Trace::default();
+    // Filled in progressively: a failure mid-run still reports what was
+    // attempted and what was measured before it.
+    let mut summary = diagnostics::RunSummary {
+        host: cli.host.clone().unwrap_or_default(),
+        resolved: String::new(),
+        pid: None,
+        exit_code: None,
+        duration_ms: None,
+        deployed: false,
+        stdout_bytes: 0,
+        stderr_bytes: 0,
+        log_path: None,
+        error: None,
+    };
+
+    let result: Result<()> = async {
+        match (cli.host, cli.action, cli.port) {
+            // ── Local operations ──
+            (Some(host), Action::Init, port) => {
+                let remote = resolve_host(&host, port, &mut trace)?;
+                let mut session = ssh::connect_traced(&remote, &mut trace).await?;
+                ssh::check_and_install_deps(&mut session).await?;
+            }
+            (
+                Some(host),
+                Action::Run {
+                    sync,
+                    env,
+                    env_file,
+                    command,
+                },
+                port,
+            ) => {
+                if command.is_empty() {
+                    return Err(anyhow!(
+                        "no command provided. Usage: rexec <host> run [--sync LOCAL:REMOTE] [--env KEY=VALUE]... -- <command...>"
+                    ));
+                }
+                let remote = resolve_host(&host, port, &mut trace)?;
+                if let Some(sync_arg) = &sync {
+                    let (local, remote_path) = parse_sync_arg(sync_arg)?;
+                    do_sync(&local, &remote_path, &remote).await?;
+                }
+                let env_vars = collect_env(&env, &env_file)?;
+                let command = command.join(" ");
+                run_command(
+                    &remote,
+                    &host,
+                    &command,
+                    &env_vars,
+                    &mut trace,
+                    &mut summary,
+                )
+                .await?;
+            }
+            (
+                Some(host),
+                Action::Script {
+                    script,
+                    interpreter,
+                    sync_to,
+                    env,
+                    env_file,
+                    args,
+                },
+                port,
+            ) => {
+                let remote = resolve_host(&host, port, &mut trace)?;
+                let env_vars = collect_env(&env, &env_file)?;
+                run_script(
+                    &remote,
+                    &host,
+                    &script,
+                    interpreter.as_deref(),
+                    sync_to.as_deref(),
+                    &args,
+                    &env_vars,
+                    &mut trace,
+                    &mut summary,
+                )
+                .await?;
+            }
+            (Some(host), Action::Plan { command }, port) => {
+                let remote = resolve_host(&host, port, &mut trace)?;
+                let command = command.join(" ");
+                plan_command(&remote, &host, &command, &mut trace, &mut summary).await?;
+            }
+
+            // ── Host listing (no host needed) ──
+            (_, Action::List { alias }, _) => {
+                list_hosts(alias.as_deref())?;
+            }
+
+            // ── Remote operations (internal, invoked via SSH exec) ──
+            (None, Action::Worker, _) => {
+                remote::worker().await?;
+            }
+            (None, Action::Attach { pid, offset }, _) => {
+                remote::attach(pid, offset).await?;
+            }
+
+            // ── Mismatches ──
+            (Some(_), Action::Worker, _) | (Some(_), Action::Attach { .. }, _) => {
                 return Err(anyhow!(
-                    "no command provided. Usage: rexec <host> run [--sync LOCAL:REMOTE] [--env KEY=VALUE]... -- <command...>"
+                    "worker/attach are internal commands, not used with a host"
                 ));
             }
-            let remote = resolve_host(&host, port)?;
-            if let Some(sync_arg) = &sync {
-                let (local, remote_path) = parse_sync_arg(sync_arg)?;
-                do_sync(&local, &remote_path, &remote).await?;
+            (None, Action::Init, _) => {
+                return Err(anyhow!("init requires a host"));
             }
-            let env_vars = collect_env(&env, &env_file)?;
-            let command = command.join(" ");
-            run_command(&remote, &host, &command, &env_vars).await?;
-        }
-        (
-            Some(host),
-            Action::Script {
-                script,
-                interpreter,
-                sync_to,
-                env,
-                env_file,
-                args,
-            },
-            port,
-        ) => {
-            let remote = resolve_host(&host, port)?;
-            let env_vars = collect_env(&env, &env_file)?;
-            run_script(
-                &remote,
-                &host,
-                &script,
-                interpreter.as_deref(),
-                sync_to.as_deref(),
-                &args,
-                &env_vars,
-            )
-            .await?;
+            (None, Action::Run { .. }, _) => {
+                return Err(anyhow!("run requires a host"));
+            }
+            (None, Action::Plan { .. }, _) => {
+                return Err(anyhow!("plan requires a host"));
+            }
+            (None, Action::Script { .. }, _) => {
+                return Err(anyhow!("script requires a host"));
+            }
         }
 
-        // ── Host listing (no host needed) ──
-        (_, Action::List { alias }, _) => {
-            list_hosts(alias.as_deref())?;
-        }
+        Ok(())
+    }
+    .await;
 
-        // ── Remote operations (internal, invoked via SSH exec) ──
-        (None, Action::Worker, _) => {
-            remote::worker().await?;
-        }
-        (None, Action::Attach { pid, offset }, _) => {
-            remote::attach(pid, offset).await?;
-        }
-
-        // ── Mismatches ──
-        (Some(_), Action::Worker, _) | (Some(_), Action::Attach { .. }, _) => {
-            return Err(anyhow!(
-                "worker/attach are internal commands, not used with a host"
-            ));
-        }
-        (None, Action::Init, _) => {
-            return Err(anyhow!("init requires a host"));
-        }
-        (None, Action::Run { .. }, _) => {
-            return Err(anyhow!("run requires a host"));
-        }
-        (None, Action::Script { .. }, _) => {
-            return Err(anyhow!("script requires a host"));
-        }
+    summary.duration_ms = Some(started.elapsed().as_millis() as u64);
+    // A timing line only makes sense once a decision was recorded; a pure
+    // argument error must not grow a "decision trace" it never had.
+    if !trace.lines().is_empty() {
+        trace.add(format!(
+            "timing: {} ms, stdout {} B, stderr {} B",
+            summary.duration_ms.unwrap_or(0),
+            summary.stdout_bytes,
+            summary.stderr_bytes
+        ));
     }
 
-    Ok(())
+    match result {
+        Ok(()) => {
+            // Success is silent in normal mode: stdout/stderr carry the
+            // command's own output and nothing else. `-v` adds the trace.
+            if diagnostics::mode().trace_on_success() {
+                let rendered = trace.render();
+                if !rendered.is_empty() {
+                    ensure_stderr_line_start();
+                    eprint!("{rendered}");
+                }
+            }
+            if json {
+                // stderr, and last: stdout stays pure command output.
+                ensure_stderr_line_start();
+                eprintln!("{}", summary_json_line(&summary));
+            }
+            // A remote command that exited non-zero already printed its
+            // warning line; rexec mirrors that status (ssh semantics) so
+            // scripts and agents see the failure in `$?`.
+            let remote = REMOTE_EXIT.load(Ordering::Relaxed);
+            if remote != 0 {
+                std::process::exit(remote_exit_status(remote));
+            }
+            Ok(())
+        }
+        Err(err) => {
+            summary.error = Some(format!("{err:#}"));
+            // Printed here rather than returned so the JSON line can stay the
+            // LAST line on stderr. The format matches what the runtime prints
+            // for a returned `Err` (std's `Termination` uses `Error: {err:?}`),
+            // so failure output is unchanged for non-JSON users.
+            ensure_stderr_line_start();
+            eprintln!("Error: {:?}", attach_trace(err, &trace));
+            if json {
+                ensure_stderr_line_start();
+                eprintln!("{}", summary_json_line(&summary));
+            }
+            std::process::exit(1);
+        }
+    }
 }

@@ -12,6 +12,7 @@ use russh_sftp::client::SftpSession;
 use tokio::io::AsyncWriteExt;
 
 use crate::RemoteHost;
+use crate::diagnostics;
 
 /// Public GitHub repository hosting prebuilt worker releases. When the remote
 /// platform differs from the local one, the worker binary for the remote is
@@ -60,30 +61,62 @@ fn load_private_key(path: &Path) -> Result<PrivateKey> {
 }
 
 /// Try to authenticate using SSH agent first, then fall back to identity files.
+///
+/// Every attempt is recorded in `trace`. The auth ORDER and the control flow are
+/// untouched — the trace lines are the only addition (the errors themselves are
+/// still returned/propagated exactly as before).
 async fn authenticate(
     session: &mut client::Handle<ClientHandler>,
     remote: &RemoteHost,
+    trace: &mut diagnostics::Trace,
 ) -> Result<()> {
     let user = remote
         .user
         .clone()
         .unwrap_or_else(|| std::env::var("USER").unwrap_or_else(|_| "root".to_string()));
+    trace.add(format!("auth: user {user}"));
 
     // 1. Try SSH agent
-    if try_agent_auth(session, &user).await.is_ok() {
+    if try_agent_auth(session, &user, trace).await.is_ok() {
         return Ok(());
     }
 
     // 2. Try identity file from ssh config
-    if let Some(id_file) = &remote.identity_file
-        && let Ok(key) = load_private_key(id_file)
-    {
-        // RSA: None would map to legacy ssh-rsa (SHA-1), which modern OpenSSH
-        // rejects; explicitly use rsa-sha2-256.
-        let key_with_hash = PrivateKeyWithHashAlg::new(Arc::new(key), Some(HashAlg::Sha256));
-        let result = session.authenticate_publickey(&user, key_with_hash).await?;
-        if matches!(result, AuthResult::Success) {
-            return Ok(());
+    if let Some(id_file) = &remote.identity_file {
+        match load_private_key(id_file) {
+            Ok(key) => {
+                // RSA: None would map to legacy ssh-rsa (SHA-1), which modern OpenSSH
+                // rejects; explicitly use rsa-sha2-256.
+                let key_with_hash =
+                    PrivateKeyWithHashAlg::new(Arc::new(key), Some(HashAlg::Sha256));
+                let result = match session.authenticate_publickey(&user, key_with_hash).await {
+                    Ok(result) => result,
+                    Err(e) => {
+                        trace.add(format!(
+                            "auth: identity file {} → failed: {e:#}",
+                            id_file.display()
+                        ));
+                        return Err(e.into());
+                    }
+                };
+                if matches!(result, AuthResult::Success) {
+                    trace.add(format!(
+                        "auth: identity file {} → success",
+                        id_file.display()
+                    ));
+                    return Ok(());
+                }
+                trace.add(format!(
+                    "auth: identity file {} → rejected",
+                    id_file.display()
+                ));
+            }
+            // An unreadable identity file used to fall through silently; the
+            // trace records it so the failure context is complete in one shot.
+            Err(e) => trace.add(format!(
+                "auth: identity file {} → failed: {e:#}",
+                id_file.display()
+            )),
         }
     }
 
@@ -91,15 +124,39 @@ async fn authenticate(
     let home = dirs::home_dir().context("cannot determine home directory")?;
     for name in &["id_rsa", "id_ed25519", "id_ecdsa"] {
         let path = home.join(".ssh").join(name);
-        if path.exists()
-            && let Ok(key) = load_private_key(&path)
-        {
-            let key_with_hash = PrivateKeyWithHashAlg::new(Arc::new(key), Some(HashAlg::Sha256));
-            let result = session.authenticate_publickey(&user, key_with_hash).await?;
-            if matches!(result, AuthResult::Success) {
-                return Ok(());
-            }
+        if !path.exists() {
+            trace.add(format!(
+                "auth: default keys {} → not present",
+                path.display()
+            ));
+            continue;
         }
+        let key = match load_private_key(&path) {
+            Ok(key) => key,
+            Err(e) => {
+                trace.add(format!(
+                    "auth: default keys {} → failed: {e:#}",
+                    path.display()
+                ));
+                continue;
+            }
+        };
+        let key_with_hash = PrivateKeyWithHashAlg::new(Arc::new(key), Some(HashAlg::Sha256));
+        let result = match session.authenticate_publickey(&user, key_with_hash).await {
+            Ok(result) => result,
+            Err(e) => {
+                trace.add(format!(
+                    "auth: default keys {} → failed: {e:#}",
+                    path.display()
+                ));
+                return Err(e.into());
+            }
+        };
+        if matches!(result, AuthResult::Success) {
+            trace.add(format!("auth: default keys {} → success", path.display()));
+            return Ok(());
+        }
+        trace.add(format!("auth: default keys {} → rejected", path.display()));
     }
 
     Err(anyhow!(
@@ -112,37 +169,73 @@ async fn authenticate(
 /// protocol (connect_env is unix-only); the named-pipe Windows agent is not
 /// supported — fall through to identity-file auth with a clear error.
 #[cfg(unix)]
-async fn try_agent_auth(session: &mut client::Handle<ClientHandler>, user: &str) -> Result<()> {
-    let mut agent = russh::keys::agent::client::AgentClient::connect_env()
-        .await
-        .context("connecting to SSH agent")?;
-    let identities = agent.request_identities().await?;
+async fn try_agent_auth(
+    session: &mut client::Handle<ClientHandler>,
+    user: &str,
+    trace: &mut diagnostics::Trace,
+) -> Result<()> {
+    let mut agent = match russh::keys::agent::client::AgentClient::connect_env().await {
+        Ok(agent) => agent,
+        Err(e) => {
+            let e = anyhow::Error::new(e).context("connecting to SSH agent");
+            trace.add(format!("auth: agent → failed: {e:#}"));
+            return Err(e);
+        }
+    };
+    let identities = match agent.request_identities().await {
+        Ok(identities) => identities,
+        Err(e) => {
+            let e = anyhow::Error::new(e);
+            trace.add(format!("auth: agent → failed: {e:#}"));
+            return Err(e);
+        }
+    };
+    let count = identities.len();
 
     for identity in identities {
         let result = session
             .authenticate_publickey_with(user, identity, None, &mut agent)
             .await
-            .map_err(|e| anyhow!("agent signing error: {:?}", e))?;
+            .map_err(|e| anyhow!("agent signing error: {:?}", e));
+        let result = match result {
+            Ok(result) => result,
+            Err(e) => {
+                trace.add(format!("auth: agent (identities: {count}) → failed: {e:#}"));
+                return Err(e);
+            }
+        };
         if matches!(result, AuthResult::Success) {
+            trace.add(format!("auth: agent (identities: {count}) → success"));
             return Ok(());
         }
     }
 
-    Err(anyhow!("no agent identity was accepted"))
+    let err = anyhow!("no agent identity was accepted");
+    trace.add(format!(
+        "auth: agent (identities: {count}) → rejected: {err:#}"
+    ));
+    Err(err)
 }
 
 #[cfg(windows)]
-async fn try_agent_auth(_session: &mut client::Handle<ClientHandler>, _user: &str) -> Result<()> {
-    // NOTE: this error is currently SWALLOWED by the caller's `.is_ok()`
-    // probe — the user sees the generic "all authentication methods failed",
-    // not this message. Kept as an Err so agent auth is explicitly skipped
-    // on Windows locals (identity-file auth follows). russh 0.51's agent
-    // client only speaks the Unix domain-socket protocol (`connect_env` is
-    // unix-only); wiring the Windows named-pipe agent (Pageant/OpenSSH agent
-    // via `connect_pageant`) is a possible follow-up.
-    Err(anyhow!(
+async fn try_agent_auth(
+    _session: &mut client::Handle<ClientHandler>,
+    _user: &str,
+    trace: &mut diagnostics::Trace,
+) -> Result<()> {
+    // NOTE: this error used to be SWALLOWED by the caller's `.is_ok()` probe —
+    // the user saw the generic "all authentication methods failed", not this
+    // message. It is now recorded in the trace (the Err is still returned so
+    // agent auth is explicitly skipped on Windows locals; identity-file auth
+    // follows). russh 0.51's agent client only speaks the Unix domain-socket
+    // protocol (`connect_env` is unix-only); wiring the Windows named-pipe
+    // agent (Pageant/OpenSSH agent via `connect_pageant`) is a possible
+    // follow-up.
+    let err = anyhow!(
         "SSH agent auth is not supported on Windows (unix socket only) — use an identity file"
-    ))
+    );
+    trace.add(format!("auth: agent → failed: {err:#}"));
+    Err(err)
 }
 
 /// SSH client handler with known_hosts verification (accept-new semantics).
@@ -150,6 +243,20 @@ async fn try_agent_auth(_session: &mut client::Handle<ClientHandler>, _user: &st
 pub struct ClientHandler {
     host: String,
     port: u16,
+    /// known_hosts decisions seen during the handshake. The handler is moved
+    /// into the connection future, so it cannot borrow the caller's `Trace`;
+    /// the lines are parked here and drained into the trace by `connect_traced`
+    /// once the handshake returns (success or failure).
+    notes: Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+impl ClientHandler {
+    /// Park a trace line produced during the handshake (see `notes`).
+    fn note(&self, msg: impl Into<String>) {
+        if let Ok(mut notes) = self.notes.lock() {
+            notes.push(msg.into());
+        }
+    }
 }
 
 impl russh::client::Handler for ClientHandler {
@@ -161,7 +268,10 @@ impl russh::client::Handler for ClientHandler {
     ) -> Result<bool, Self::Error> {
         let home = match dirs::home_dir() {
             Some(h) => h,
-            None => return Ok(true), // can't verify without home dir
+            None => {
+                self.note("known_hosts: no home directory — host key accepted unverified");
+                return Ok(true); // can't verify without home dir
+            }
         };
         let known_hosts_path = home.join(".ssh/known_hosts");
 
@@ -175,7 +285,10 @@ impl russh::client::Handler for ClientHandler {
             server_public_key,
             &known_hosts_path,
         ) {
-            Ok(true) => Ok(true),
+            Ok(true) => {
+                self.note("known_hosts: existing host key accepted");
+                Ok(true)
+            }
             Ok(false) => {
                 // Host not in known_hosts — accept and persist
                 crate::status!(
@@ -183,6 +296,7 @@ impl russh::client::Handler for ClientHandler {
                     self.host,
                     self.port
                 );
+                self.note("known_hosts: new host accepted");
                 // Best-effort: write key to known_hosts for future verification
                 let _ = russh::keys::known_hosts::learn_known_hosts_path(
                     &self.host,
@@ -192,16 +306,40 @@ impl russh::client::Handler for ClientHandler {
                 );
                 Ok(true)
             }
-            Err(_) => Ok(false), // Key changed — reject (potential MITM)
+            Err(_) => {
+                self.note(format!(
+                    "known_hosts: host key CHANGED for {}:{} — rejected (possible MITM)",
+                    self.host, self.port
+                ));
+                Ok(false) // Key changed — reject (potential MITM)
+            }
         }
     }
 }
 
 /// Establish SSH connection and authenticate.
 /// Both TCP connect and authentication are guarded by timeouts to prevent hangs.
+///
+/// Thin wrapper over [`connect_traced`] for callers that do not collect a
+/// decision trace. Kept as the pre-trace API: every in-crate caller now uses
+/// the traced variant, so the wrapper would otherwise be flagged as unused.
+#[allow(dead_code)]
 pub async fn connect(remote: &RemoteHost) -> Result<client::Handle<ClientHandler>> {
+    connect_traced(remote, &mut diagnostics::Trace::default()).await
+}
+
+/// [`connect`] with a decision trace.
+///
+/// Records the target, the TCP/handshake outcome (only failures are
+/// interesting), the known_hosts decision, and every authentication attempt,
+/// so a failure can print its full context in one shot.
+pub async fn connect_traced(
+    remote: &RemoteHost,
+    trace: &mut diagnostics::Trace,
+) -> Result<client::Handle<ClientHandler>> {
     let port = remote.port.unwrap_or(22);
     let addr = format!("{}:{}", remote.hostname, port);
+    trace.add(format!("connect: target {addr}"));
 
     // Parse the hostname for TCP connect (strip any bracket notation)
     let tcp_host = remote
@@ -210,33 +348,75 @@ pub async fn connect(remote: &RemoteHost) -> Result<client::Handle<ClientHandler
         .trim_end_matches(']');
 
     // 1. TCP connect with 15s timeout
-    let tcp_stream = tokio::time::timeout(
+    let started = std::time::Instant::now();
+    let tcp = tokio::time::timeout(
         Duration::from_secs(15),
         tokio::net::TcpStream::connect((tcp_host, port)),
     )
     .await
-    .with_context(|| format!("TCP connect timed out (15s) to {}", addr))?
-    .with_context(|| format!("TCP connecting to {}", addr))?;
+    .with_context(|| format!("TCP connect timed out (15s) to {}", addr))
+    .and_then(|r| r.with_context(|| format!("TCP connecting to {}", addr)));
+    let tcp_stream = match tcp {
+        Ok(stream) => stream,
+        Err(e) => {
+            trace.add(format!("connect: TCP connect to {addr} failed: {e:#}"));
+            return Err(e);
+        }
+    };
 
     // 2. SSH handshake with 15s timeout
     let config = Arc::new(client::Config::default());
     let handler = ClientHandler {
         host: tcp_host.to_string(),
         port,
+        notes: Arc::new(std::sync::Mutex::new(Vec::new())),
     };
-    let mut session = tokio::time::timeout(
+    let notes = Arc::clone(&handler.notes);
+    let handshake = tokio::time::timeout(
         Duration::from_secs(15),
         russh::client::connect_stream(config, tcp_stream, handler),
     )
     .await
-    .with_context(|| format!("SSH handshake timed out (15s) with {}", addr))?
-    .with_context(|| format!("SSH handshake with {}", addr))?;
+    .with_context(|| format!("SSH handshake timed out (15s) with {}", addr))
+    .and_then(|r| r.with_context(|| format!("SSH handshake with {}", addr)));
+
+    // The handler — which owns the known_hosts notes — is consumed by the
+    // handshake future and is not reachable through the returned session, so
+    // drain them here. Also on failure: a rejected host key is exactly the case
+    // that needs the context.
+    if let Ok(mut pending) = notes.lock() {
+        for line in pending.drain(..) {
+            trace.add(line);
+        }
+    }
+
+    let mut session = match handshake {
+        Ok(session) => session,
+        Err(e) => {
+            trace.add(format!("connect: SSH handshake with {addr} failed: {e:#}"));
+            return Err(e);
+        }
+    };
+    trace.add(format!(
+        "connect: connected to {addr} in {}ms",
+        started.elapsed().as_millis()
+    ));
 
     // 3. Authenticate with 15s timeout
-    tokio::time::timeout(Duration::from_secs(15), authenticate(&mut session, remote))
-        .await
-        .with_context(|| format!("Authentication timed out (15s) for {}", addr))?
-        .with_context(|| format!("Authenticating to {}", addr))?;
+    let auth = tokio::time::timeout(
+        Duration::from_secs(15),
+        authenticate(&mut session, remote, &mut *trace),
+    )
+    .await
+    .with_context(|| format!("Authentication timed out (15s) for {}", addr))
+    .and_then(|r| r.with_context(|| format!("Authenticating to {}", addr)));
+    match auth {
+        Ok(()) => {}
+        Err(e) => {
+            trace.add(format!("connect: authentication to {addr} failed: {e:#}"));
+            return Err(e);
+        }
+    }
 
     Ok(session)
 }
@@ -250,13 +430,17 @@ pub async fn connect(remote: &RemoteHost) -> Result<client::Handle<ClientHandler
 /// when printf resolves from Git's usr/bin), which would poison the SFTP
 /// target. Any answer that is not a drive-letter path is rejected so the
 /// caller fails loudly instead of uploading to an impossible path.
-async fn remote_home_windows(session: &client::Handle<ClientHandler>) -> Result<String> {
+async fn remote_home_windows(
+    session: &client::Handle<ClientHandler>,
+    trace: &mut diagnostics::Trace,
+) -> Result<String> {
     let profile = exec_remote(session, "cmd /c \"echo %USERPROFILE%\"").await?;
     let profile = profile.trim().trim_matches('"');
     let is_drive_path = profile
         .get(0..2)
         .is_some_and(|p| p.as_bytes()[0].is_ascii_alphabetic() && p.as_bytes()[1] == b':');
     if is_drive_path {
+        trace.add(format!("worker: remote home {profile} (%USERPROFILE%)"));
         return Ok(profile.to_string());
     }
 
@@ -267,9 +451,12 @@ async fn remote_home_windows(session: &client::Handle<ClientHandler>) -> Result<
         .get(0..2)
         .is_some_and(|p| p.as_bytes()[0].is_ascii_alphabetic() && p.as_bytes()[1] == b':');
     if is_drive_path {
+        trace.add(format!("worker: remote home {home} ($HOME fallback)"));
         return Ok(home.to_string());
     }
 
+    trace
+        .add("worker: remote home undetected (%USERPROFILE% and $HOME are not drive-letter paths)");
     Err(anyhow!(
         "could not determine a native Windows home directory on the remote \
          (%USERPROFILE% and $HOME are both non-drive-letter paths)"
@@ -290,6 +477,7 @@ pub async fn upload_binary(
     session: &mut client::Handle<ClientHandler>,
     host: &str,
     src_path: &Path,
+    trace: &mut diagnostics::Trace,
 ) -> Result<()> {
     // Ensure the remote dir exists and learn the remote home's absolute path so
     // rsync can target it without relying on `~` expansion.
@@ -299,6 +487,7 @@ pub async fn upload_binary(
         return Err(anyhow!("could not determine remote HOME for worker upload"));
     }
     let remote_target = format!("{}:{}/.rexec/rexec", host, home.trim_end_matches('/'));
+    trace.add(format!("worker: remote home {home} (~)"));
 
     let ssh_opts = "-o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new -o ServerAliveInterval=5 -o ServerAliveCountMax=3";
     let ssh_e = format!("ssh {}", ssh_opts);
@@ -345,6 +534,7 @@ pub async fn upload_binary(
     // Belt-and-suspenders: ensure the executable bit survives any umask quirk.
     exec_remote(session, "chmod +x ~/.rexec/rexec").await?;
 
+    trace.add(format!("worker: uploaded to {remote_target}"));
     Ok(())
 }
 
@@ -357,6 +547,7 @@ async fn upload_binary_sftp(
     session: &client::Handle<ClientHandler>,
     src_path: &Path,
     home: &str,
+    trace: &mut diagnostics::Trace,
 ) -> Result<()> {
     // Remote paths are plain strings, so build them with Windows separators for
     // the Windows remote; `Path::join` would use the *local* separator instead.
@@ -435,6 +626,10 @@ async fn upload_binary_sftp(
     // not mask it.
     let _ = sftp.close().await;
 
+    trace.add(format!(
+        "worker: uploaded to {exe_path} ({} bytes, sftp)",
+        data.len()
+    ));
     Ok(())
 }
 
@@ -446,6 +641,10 @@ pub struct RemoteEnv {
     /// Absolute home path for Windows remotes (`C:\Users\...`); empty for
     /// POSIX remotes, whose launch commands use `~` literally.
     pub home: String,
+    /// True when THIS call actually deployed (uploaded/downloaded) the
+    /// worker — false when the remote was already up to date. Lets callers
+    /// report the deploy fact without re-probing.
+    pub deployed: bool,
 }
 
 impl RemoteEnv {
@@ -494,9 +693,26 @@ impl RemoteEnv {
 ///
 /// Returns the remote's platform environment so the caller can launch the
 /// worker with a platform-correct command.
+///
+/// Thin wrapper over [`ensure_remote_binary_traced`] for callers that do not
+/// collect a decision trace. Kept as the pre-trace API: every in-crate caller
+/// now uses the traced variant, so the wrapper would otherwise be flagged as
+/// unused.
+#[allow(dead_code)]
 pub async fn ensure_remote_binary(
     session: &mut client::Handle<ClientHandler>,
     host: &str,
+) -> Result<RemoteEnv> {
+    ensure_remote_binary_traced(session, host, &mut diagnostics::Trace::default()).await
+}
+
+/// [`ensure_remote_binary`] with a decision trace: records the detected remote
+/// platform, the remote home probe, the version comparison, the worker-source
+/// decision, and the upload outcome.
+pub async fn ensure_remote_binary_traced(
+    session: &mut client::Handle<ClientHandler>,
+    host: &str,
+    trace: &mut diagnostics::Trace,
 ) -> Result<RemoteEnv> {
     let local_version = env!("CARGO_PKG_VERSION");
     let expected = format!("rexec {}", local_version);
@@ -505,11 +721,11 @@ pub async fn ensure_remote_binary(
     // Windows remote — `2>/dev/null` is not a cmd/PowerShell redirect (cmd
     // would create a stray `<drive>:\dev\null` when `<drive>:\dev` exists),
     // and the round trip is wasted there anyway.
-    let remote_asset = detect_remote_asset(session).await?;
+    let remote_asset = detect_remote_asset(session, trace).await?;
     let is_windows = remote_asset.starts_with("windows-");
 
     if is_windows {
-        let home = remote_home_windows(session).await?;
+        let home = remote_home_windows(session, trace).await?;
         // Probe via explicit `cmd /c`: a bare quoted path is a parse error
         // under a PowerShell default shell (it would need the & call
         // operator), which would make this probe ALWAYS look failed and
@@ -518,21 +734,35 @@ pub async fn ensure_remote_binary(
             "cmd /c \"\"{}\\.rexec\\rexec.exe\" --version\"",
             home.trim_end_matches('\\')
         );
-        let up_to_date = exec_remote(session, &probe).await?.trim() == expected;
+        let remote_output = exec_remote(session, &probe).await?;
+        let up_to_date = remote_output.trim() == expected;
+        trace.add(format!(
+            "worker: local {local_version} vs remote {} → {}",
+            remote_version_label(&remote_output),
+            if up_to_date { "up to date" } else { "upload" }
+        ));
         if up_to_date {
             return Ok(RemoteEnv {
                 is_windows: true,
                 home,
+                deployed: false,
             });
         }
     } else {
         // Check remote version. This probe needs a POSIX shell and `~`
         // expansion — guaranteed on the Linux/macOS remotes detected above.
         let remote_output = exec_remote(session, "~/.rexec/rexec --version 2>/dev/null").await?;
-        if remote_output.trim() == expected {
+        let up_to_date = remote_output.trim() == expected;
+        trace.add(format!(
+            "worker: local {local_version} vs remote {} → {}",
+            remote_version_label(&remote_output),
+            if up_to_date { "up to date" } else { "upload" }
+        ));
+        if up_to_date {
             return Ok(RemoteEnv {
                 is_windows: false,
                 home: String::new(),
+                deployed: false,
             }); // Already up to date
         }
     }
@@ -541,32 +771,53 @@ pub async fn ensure_remote_binary(
         // Same platform: deploy the running binary. Canonicalize so a
         // symlinked install (e.g. `cargo install`) isn't copied as a link by
         // `rsync -a`.
-        std::env::current_exe()
+        let exe = std::env::current_exe()
             .context("resolving current executable")?
             .canonicalize()
-            .context("canonicalizing executable path")?
+            .context("canonicalizing executable path")?;
+        trace.add(format!("worker: source local binary {}", exe.display()));
+        exe
     } else {
-        download_worker(&remote_asset).await?
+        download_worker(&remote_asset, trace).await?
     };
 
     // Upload binary: Windows has no rsync, so it takes the SFTP path with the
     // `.exe` worker name.
     let env = if is_windows {
-        let home = remote_home_windows(session).await?;
-        upload_binary_sftp(session, &src_path, &home).await?;
+        let home = remote_home_windows(session, trace).await?;
+        upload_binary_sftp(session, &src_path, &home, trace).await?;
         RemoteEnv {
             is_windows: true,
             home,
+            deployed: true,
         }
     } else {
-        upload_binary(session, host, &src_path).await?;
+        upload_binary(session, host, &src_path, trace).await?;
         RemoteEnv {
             is_windows: false,
             home: String::new(),
+            deployed: true,
         }
     };
-    crate::status!("✓ Deployed rexec v{} to remote", local_version);
+    // Success is silent by default; deploy notices are verbose-only (the
+    // trace already records the decision for error contexts).
+    crate::progress!("✓ Deployed rexec v{} to remote", local_version);
     Ok(env)
+}
+
+/// Remote worker version for a trace line: the probe prints `rexec <version>`,
+/// so the prefix is dropped to sit next to the local version. Anything else
+/// (missing binary, a shell error on stdout) is kept verbatim — whitespace is
+/// flattened so a trace entry stays one line, and that text is what explains
+/// the re-upload decision.
+fn remote_version_label(probe: &str) -> String {
+    let flat = probe.split_whitespace().collect::<Vec<_>>().join(" ");
+    if flat.is_empty() {
+        return "absent".to_string();
+    }
+    flat.strip_prefix("rexec ")
+        .map(str::to_string)
+        .unwrap_or(flat)
 }
 
 /// Release-asset suffix for the platform rexec is running on,
@@ -628,7 +879,10 @@ fn unsupported_platform(probe: &str) -> anyhow::Error {
 /// is invoked explicitly because the remote's default SSH shell may be
 /// PowerShell, where `%PROCESSOR_ARCHITECTURE%` is not expanded by the shell
 /// itself but a nested `cmd /c` does expand it.
-async fn detect_remote_asset(session: &client::Handle<ClientHandler>) -> Result<String> {
+async fn detect_remote_asset(
+    session: &client::Handle<ClientHandler>,
+    trace: &mut diagnostics::Trace,
+) -> Result<String> {
     // `exec_remote` discards the exit status, so a missing `uname` surfaces as
     // empty stdout rather than an error. A Git-for-Windows remote (default
     // shell = Git Bash) HAS a uname that prints e.g. "MINGW64_NT-10.0 ...",
@@ -638,6 +892,7 @@ async fn detect_remote_asset(session: &client::Handle<ClientHandler>) -> Result<
     if !uname.trim().is_empty()
         && let Ok(asset) = uname_asset(&uname)
     {
+        trace.add(format!("platform: {asset} (uname {:?})", uname.trim()));
         return Ok(asset);
     }
 
@@ -646,11 +901,25 @@ async fn detect_remote_asset(session: &client::Handle<ClientHandler>) -> Result<
         r#"cmd /c "echo Windows_NT %PROCESSOR_ARCHITECTURE%""#,
     )
     .await?;
-    uname_asset(&windows).map_err(|e| {
-        anyhow!(
-            "remote platform could not be detected (uname: {uname:?}, cmd probe: {windows:?}): {e}"
-        )
-    })
+    match uname_asset(&windows) {
+        Ok(asset) => {
+            trace.add(format!(
+                "platform: {asset} (windows probe {:?})",
+                windows.trim()
+            ));
+            Ok(asset)
+        }
+        Err(e) => {
+            trace.add(format!(
+                "platform: undetected (uname {:?}, windows probe {:?})",
+                uname.trim(),
+                windows.trim()
+            ));
+            Err(anyhow!(
+                "remote platform could not be detected (uname: {uname:?}, cmd probe: {windows:?}): {e}"
+            ))
+        }
+    }
 }
 
 /// Download the prebuilt worker for `asset` (e.g. "linux-amd64") from GitHub
@@ -660,7 +929,7 @@ async fn detect_remote_asset(session: &client::Handle<ClientHandler>) -> Result<
 /// check compares against `CARGO_PKG_VERSION`, so falling back to "latest"
 /// would re-deploy on every run. Requires a release tagged `v{version}` to
 /// exist (created by the release workflow on tag push).
-async fn download_worker(asset: &str) -> Result<PathBuf> {
+async fn download_worker(asset: &str, trace: &mut diagnostics::Trace) -> Result<PathBuf> {
     let version = env!("CARGO_PKG_VERSION");
     let home = dirs::home_dir().context("cannot determine home directory")?;
     let cache_dir = home.join(".rexec").join("cache");
@@ -668,15 +937,21 @@ async fn download_worker(asset: &str) -> Result<PathBuf> {
         .with_context(|| format!("creating {}", cache_dir.display()))?;
     let cache_path = cache_dir.join(format!("rexec-v{version}-{asset}"));
 
-    if cache_path.exists() {
-        return Ok(cache_path);
-    }
-
     let url = format!(
         "https://github.com/{}/releases/download/v{version}/rexec-{asset}",
         GITHUB_REPO
     );
-    crate::status!("⬇ Downloading worker (rexec-{asset}) from GitHub Releases");
+
+    if cache_path.exists() {
+        trace.add(format!(
+            "worker: download rexec-{asset} from {url} (cached)"
+        ));
+        return Ok(cache_path);
+    }
+    trace.add(format!(
+        "worker: download rexec-{asset} from {url} (cache miss)"
+    ));
+    crate::progress!("⬇ Downloading worker (rexec-{asset}) from GitHub Releases");
 
     // Download to a .part file and rename into place afterwards, so an
     // interrupted download can never be mistaken for a complete worker.
@@ -741,7 +1016,10 @@ pub async fn check_and_install_deps(session: &mut client::Handle<ClientHandler>)
 
     // Platform gate. A failed probe falls through to the POSIX checks, so an
     // unusual remote keeps the previous behaviour instead of failing here.
-    if let Ok(asset) = detect_remote_asset(session).await
+    // This function prints its findings directly, so the probe's trace lines go
+    // to a throwaway trace.
+    let mut probe_trace = diagnostics::Trace::default();
+    if let Ok(asset) = detect_remote_asset(session, &mut probe_trace).await
         && asset.starts_with("windows-")
     {
         return check_windows_deps(session).await;
@@ -926,6 +1204,25 @@ mod tests {
                 "windows-arm64",
             ]
             .contains(&asset.as_str())
+        );
+    }
+
+    #[test]
+    fn test_remote_version_label() {
+        // The worker's `--version` prints "rexec <version>"; the prefix is
+        // dropped so the trace can show local vs remote side by side.
+        assert_eq!(remote_version_label("rexec 0.3.0\n"), "0.3.0");
+        assert_eq!(remote_version_label("rexec 0.3.1"), "0.3.1");
+        // Nothing came back (missing worker, swallowed stderr) → "absent".
+        assert_eq!(remote_version_label(""), "absent");
+        assert_eq!(remote_version_label("  \r\n\t"), "absent");
+        // Unmappable output is kept verbatim (and flattened) — that text is
+        // what explains why the worker is being re-uploaded.
+        assert_eq!(
+            remote_version_label(
+                "'C:\\Users\\x\\.rexec\\rexec.exe' is not recognized\nas an internal or external command"
+            ),
+            "'C:\\Users\\x\\.rexec\\rexec.exe' is not recognized as an internal or external command"
         );
     }
 }
