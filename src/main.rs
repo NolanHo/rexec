@@ -719,10 +719,54 @@ fn load_user_ssh_config() -> Result<(PathBuf, SshConfig)> {
     }
     let config_str = load_ssh_config_text(&path)?;
     let mut reader = BufReader::new(config_str.as_bytes());
+    // ALLOW_UNSUPPORTED_FIELDS is what keeps `ProxyJump`/`ProxyCommand` visible:
+    // the crate eats `UnsupportedField` errors silently unless this rule is set
+    // (parser.rs), and those two directives decide which socket ssh would open.
     let config = SshConfig::default()
-        .parse(&mut reader, ParseRule::ALLOW_UNKNOWN_FIELDS)
+        .parse(
+            &mut reader,
+            ParseRule::ALLOW_UNKNOWN_FIELDS | ParseRule::ALLOW_UNSUPPORTED_FIELDS,
+        )
         .context("parsing ssh config (after Include expansion)")?;
     Ok((path, config))
+}
+
+/// ssh-config directives that would change *which socket* ssh opens, but that
+/// this client does not implement.
+///
+/// `ssh2_config` records them in `HostParams::unsupported_fields` and then drops
+/// them. Without surfacing that, a host reachable only through `ProxyJump`
+/// silently becomes a direct connection to an address that is unreachable by
+/// design, and the user sees a bare connect timeout with no hint of the cause.
+///
+/// Returned as sorted `directive=value` strings for a stable trace/warning.
+fn unimplemented_routing(params: &ssh2_config::HostParams) -> Vec<String> {
+    const ROUTING: [&str; 2] = ["proxyjump", "proxycommand"];
+    let mut hits: Vec<String> = params
+        .unsupported_fields
+        .iter()
+        .filter(|(k, _)| ROUTING.contains(&k.to_ascii_lowercase().as_str()))
+        .map(|(k, v)| format!("{k}={}", v.join(" ")))
+        .collect();
+    hits.sort();
+    hits
+}
+
+/// Warn (trace + stderr) about every unimplemented routing directive, naming the
+/// address we are about to connect to instead. Warnings are not suppressed by
+/// `-q`: a wrong destination is not a progress detail.
+fn warn_unimplemented_routing(
+    params: &ssh2_config::HostParams,
+    shown_host: &str,
+    target: &str,
+    trace: &mut diagnostics::Trace,
+) {
+    for hit in unimplemented_routing(params) {
+        trace.add(format!("resolve: {hit} not implemented → direct connect"));
+        eprintln!(
+            "⚠ ssh config: {hit} for {shown_host} is not implemented; connecting directly to {target}"
+        );
+    }
 }
 
 /// Local user name, used the way `ssh` and `list` do when no `User` is
@@ -890,6 +934,7 @@ fn resolve_host(
                 .identity_file
                 .as_ref()
                 .and_then(|v| v.first().cloned());
+            warn_unimplemented_routing(&params, &parsed.hostname, &resolved_label(&parsed), trace);
         }
         trace.add(format!("resolve: literal {}", resolved_label(&parsed)));
         parsed
@@ -920,6 +965,7 @@ fn resolve_host(
             .as_ref()
             .map(|p| format!(" (key {})", p.display()))
             .unwrap_or_default();
+        warn_unimplemented_routing(&host_config, host, &resolved_label(&resolved), trace);
         trace.add(format!(
             "resolve: alias {} → {}{}",
             host,
@@ -1335,6 +1381,68 @@ mod tests {
         assert_eq!(config.query("alias-a").host_name.unwrap(), "5.6.7.8");
 
         std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    /// The parse rule used by `load_user_ssh_config` must keep `ProxyJump`
+    /// visible: with only ALLOW_UNKNOWN_FIELDS the crate eats the field, so no
+    /// warning is possible and the run silently connects to the wrong address.
+    #[test]
+    fn test_unimplemented_routing_sees_proxyjump() {
+        let text = "Host behind-jump\n  HostName 10.30.40.4\n  ProxyJump js4\n";
+
+        let mut reader = std::io::BufReader::new(text.as_bytes());
+        let config = SshConfig::default()
+            .parse(
+                &mut reader,
+                ParseRule::ALLOW_UNKNOWN_FIELDS | ParseRule::ALLOW_UNSUPPORTED_FIELDS,
+            )
+            .unwrap();
+        assert_eq!(
+            unimplemented_routing(&config.query("behind-jump")),
+            vec!["proxyjump=js4".to_string()]
+        );
+
+        let mut reader = std::io::BufReader::new(text.as_bytes());
+        let config = SshConfig::default()
+            .parse(&mut reader, ParseRule::ALLOW_UNKNOWN_FIELDS)
+            .unwrap();
+        assert!(
+            unimplemented_routing(&config.query("behind-jump")).is_empty(),
+            "documents why ALLOW_UNSUPPORTED_FIELDS is required"
+        );
+    }
+
+    #[test]
+    fn test_unimplemented_routing_reports_proxycommand() {
+        let text = "Host tunnelled\n  ProxyCommand nc -X connect -x 127.0.0.1:7890 %h %p\n";
+        let mut reader = std::io::BufReader::new(text.as_bytes());
+        let config = SshConfig::default()
+            .parse(
+                &mut reader,
+                ParseRule::ALLOW_UNKNOWN_FIELDS | ParseRule::ALLOW_UNSUPPORTED_FIELDS,
+            )
+            .unwrap();
+        assert_eq!(
+            unimplemented_routing(&config.query("tunnelled")),
+            vec!["proxycommand=nc -X connect -x 127.0.0.1:7890 %h %p".to_string()]
+        );
+    }
+
+    /// Unsupported fields that do not redirect the socket must stay silent:
+    /// `StrictHostKeyChecking` and `SendEnv` are recorded by the crate too, and
+    /// warning about them would make every ordinary config noisy.
+    #[test]
+    fn test_unimplemented_routing_ignores_benign_fields() {
+        let text =
+            "Host plain\n  HostName 10.0.0.5\n  StrictHostKeyChecking accept-new\n  SendEnv LANG\n";
+        let mut reader = std::io::BufReader::new(text.as_bytes());
+        let config = SshConfig::default()
+            .parse(
+                &mut reader,
+                ParseRule::ALLOW_UNKNOWN_FIELDS | ParseRule::ALLOW_UNSUPPORTED_FIELDS,
+            )
+            .unwrap();
+        assert!(unimplemented_routing(&config.query("plain")).is_empty());
     }
 
     #[test]
