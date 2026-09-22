@@ -15,7 +15,7 @@ A CLI to sync local files/folders and run commands on remote hosts over SSH, des
 - **SSH config**: resolves host aliases from `~/.ssh/config` (Include-expanded); `user@host:port` literals work everywhere (run **and** sync). An unknown alias is an error with near-miss suggestions — it is never silently treated as a raw hostname (use `user@host` for literal hosts)
 - **Silent on success, full context on failure**: a successful run prints only the command's own stdout/stderr; `-v` adds the decision trace (resolution, auth, deploy, reconnect). Failures always print the error plus that trace in one shot, and a non-zero remote exit prints a one-line warning with the remote log path
 - **Dry run**: `plan` shows resolution, platform, deploy decision and launch command without executing or deploying
-- **Execution history**: every `run`/`script` is recorded locally (`~/.rexec/history`) — command and env verbatim, output capped at 1 MiB per stream (head+tail), exit code/timing/decision trace — and queried with `rexec history list|show|grep|stats|fetch|prune`; `--no-history` or `REXEC_HISTORY=0` turns recording off
+- **Execution history**: every `run`/`script` that reaches the remote is recorded locally (`~/.rexec/history`) — command and env verbatim, output capped at 1 MiB per stream (head+tail), exit code/timing/decision trace — and queried with `rexec history list|show|grep|stats|fetch|prune`; `--no-history` or `REXEC_HISTORY=0` turns recording off. Failures before the worker is contacted (unknown alias, bad `--sync` path, malformed `-e`) are not recorded
 - **Machine-readable**: `--json` emits one JSON summary line on stderr (stdout stays pure command output)
 - **Quiet mode**: `-q` suppresses the remaining warning/progress lines (errors are never suppressed)
 
@@ -85,9 +85,9 @@ rexec -q my-server run -- "echo only-this"
 
 ### Output contract
 
-- **Success is silent.** In normal mode stdout/stderr carry the command's own output and nothing else. `-v/--verbose` adds the decision trace (resolved target, auth attempts, platform/deploy decision, remote PID, reconnect events, timings).
-- **Errors and warnings carry their full context in one shot.** A failure prints the error plus the decision trace — no need to re-run with `-v`. An unknown host alias fails with the 2–3 closest configured aliases and the hint to use `user@host` for a literal host. If the worker dies before it starts, the error includes the worker's own stderr and the launch command that was attempted.
-- **A non-zero remote exit prints one warning line** to stderr: `⚠ remote exit <code> (log: ~/.rexec/logs/<pid>.log)`. Exit code 0 prints nothing. (rexec's own exit status is 1 only when rexec itself fails.)
+- **Success is silent.** In normal mode stdout/stderr carry the command's own output and nothing else — the one exception is the first-connect known-hosts notice (`⚠ Accepting new host key for …`, the same warning `ssh` prints) and the non-zero-exit warning below. `-v/--verbose` adds the decision trace (resolved target, auth attempts, platform/deploy decision, remote PID, reconnect events, timings).
+- **Errors and warnings carry their full context in one shot.** A failure prints the error plus the decision trace — no need to re-run with `-v`. An unknown host alias fails with near-miss suggestions from the configured aliases (prefix/substring matches) and the hint to use `user@host` for a literal host. If the worker dies before it starts, the error includes the worker's own stderr and the launch command that was attempted.
+- **A non-zero remote exit prints one warning line** to stderr: `⚠ remote exit <code> (log: ~/.rexec/logs/<pid>.log)`. Exit code 0 prints nothing. **rexec's own exit status mirrors the remote code** (like `ssh`), so `rexec … && next` and scripts checking `$?` see the failure; a signal-killed remote process (no real code, reported as `-1`) exits `255`. Caveat: when stdout is piped into a reader that exits early (`| head`), the process ends on SIGPIPE (141) before the remote code can be propagated.
 - **`--json` emits exactly one JSON line on stderr, last** (after the trace/warning), with stable field order: `host`, `resolved`, `pid`, `exit_code`, `duration_ms`, `deployed`, `stdout_bytes`, `stderr_bytes`, `log_path` (always `null` for now — the warning line carries the remote log path), and `error` only on failure. stdout is never polluted.
 
 ### `plan` — dry run
@@ -115,7 +115,7 @@ On Windows the local side of `--sync` must be an MSYS2/WSL-style path (`/c/proj`
 |--------|-------------|
 | `-p PORT` / `--port PORT` | SSH port (overrides `host:port` and ssh-config `Port`) |
 | `-v` / `--verbose` | Print the decision trace (resolution, auth, deploy, reconnect, timings) even on success. Errors always carry it |
-| `--json` | Emit one machine-readable result summary line on stderr (see Output contract) |
+| `--json` | Emit one machine-readable result summary line on stderr (see Output contract). Applies to `run`/`script`/`plan`/`init`; the local-only subcommands (`list`, `history …`) ignore it |
 | `--no-history` | Do not record this run in the local execution history (same as `REXEC_HISTORY=0`); reading `rexec history …` still works |
 | `-q` / `--quiet` | Suppress the remaining warning/progress lines. Errors are never suppressed |
 
@@ -159,8 +159,8 @@ Every `run` and `script` execution is recorded locally — nothing is sent anywh
 | `rexec history grep <pattern> [-n N] [--host H] [--failed] [--output]` | case-insensitive plain substring (no regex) over command + env values, one line per match prefixed by run id; `--output` also searches the captured stdout/stderr |
 | `rexec history stats [--host H]` | runs, failures, per-host counts, duration p50/p95, captured bytes, on-disk tree size |
 | `rexec history path` | print the history root |
-| `rexec history prune [--keep-days N] [--max-mb N]` | delete runs started more than N days ago (default 30), then the oldest runs until the tree fits the size cap; the newest run is never evicted |
-| `rexec history fetch <id> [--out P]` | pull the FULL remote worker log (`~/.rexec/logs/<pid>.log`) over SSH — read-only (one `cat`, no deploy, no writes on the remote) |
+| `rexec history prune [--keep-days N] [--max-mb N]` | delete run directories older than N days (default 30, by directory mtime), then the oldest runs until the tree fits the size cap; the newest run is never evicted by either phase |
+| `rexec history fetch <id> [--out P]` | pull the FULL remote worker log (`~/.rexec/logs/<pid>.log`) over SSH — read-only (one `cat` after a read-only platform probe, no deploy, no writes on the remote) |
 
 ```bash
 rexec history list -n 5 --failed          # the last 5 failures

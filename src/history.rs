@@ -15,8 +15,10 @@
 //! ```
 //!
 //! The JSONL index is the query surface (grep/jq/duckdb); the per-run dir is
-//! the artifact store. Appends are the only write to the index, so a crashed
-//! run costs at most its own line.
+//! the artifact store. Recording only ever APPENDS to the index (one line per
+//! run, written after that run's artifacts), so a crashed run costs at most its
+//! own line; `prune` is the one operation that rewrites the file, and it does so
+//! atomically (tmp + rename, survivors copied verbatim).
 //!
 //! Secrecy posture (deliberate): commands and env VALUES are stored verbatim.
 //! The files are created 0600 inside a 0700 tree, and capture can be disabled
@@ -496,7 +498,18 @@ fn prune_in(root: &Path, keep_days: u64, max_bytes: u64) -> anyhow::Result<(usiz
     }
 
     let doomed: HashSet<&str> = evicted.iter().map(String::as_str).collect();
-    let mut removed_ids: HashSet<&str> = HashSet::new();
+    // Rewrite the index FIRST. If that fails, nothing has been deleted yet, so
+    // the index still describes the tree exactly — whereas the reverse order
+    // (delete, then rewrite) leaves `history list` showing runs whose files are
+    // already gone whenever the rewrite fails (a directory in the way, ENOSPC,
+    // a crash between the phases).
+    let idx = root.join("index.jsonl");
+    if idx.exists() {
+        let raw = std::fs::read(&idx).with_context(|| format!("reading {}", idx.display()))?;
+        let kept = keep_index_lines(&raw, &doomed);
+        rewrite_index(&idx, &kept)?;
+    }
+
     let mut removed = 0usize;
     let mut freed = 0u64;
     for entry in &entries {
@@ -511,28 +524,23 @@ fn prune_in(root: &Path, keep_days: u64, max_bytes: u64) -> anyhow::Result<(usiz
                 // Freed counts the removed run dirs; the index shrinks by a few
                 // bytes more on the rewrite, which is noise.
                 freed += entry.size;
-                removed_ids.insert(entry.id.as_str());
             }
-            // A dir that vanished or cannot be removed keeps its index line:
-            // the index must never claim a run is gone while its files remain.
+            // A dir that cannot be removed stays on disk as an orphan: the
+            // index no longer lists it, and a later prune still sees it (it is
+            // collected from the filesystem, not from the index), so nothing
+            // is lost and nothing dangles.
             Err(_) => continue,
         }
     }
 
-    let idx = root.join("index.jsonl");
-    if !removed_ids.is_empty() && idx.exists() {
-        let raw = std::fs::read(&idx).with_context(|| format!("reading {}", idx.display()))?;
-        let kept = keep_index_lines(&raw, &removed_ids);
-        rewrite_index(&idx, &kept)?;
-    }
     Ok((removed, freed))
 }
 
 /// Pure eviction policy: which run ids `prune` drops, oldest first.
 ///
 /// Two phases, in order: (1) everything older than the `keep_days` cutoff goes;
-/// (2) while the tree is still over `max_bytes`, the oldest survivors go, but
-/// the newest run is never touched — history exists to explain the run you just
+/// (2) while the tree is still over `max_bytes`, the oldest survivors go. The
+/// newest run is never evicted by either phase — history exists to explain the run you just
 /// did, and a `max_bytes` smaller than a single run would otherwise wipe the
 /// whole tree on every prune. `tree_bytes` is the current total tree size, so
 /// the size phase reflects bytes actually on disk. Split out from `prune_in` so
@@ -560,7 +568,16 @@ fn select_evictions(
     let mut evicted = Vec::new();
     let mut remaining = tree_bytes;
     let mut survivors: Vec<&RunEntry> = Vec::new();
+    // The newest run is never evicted — not even by the age phase. History
+    // exists to explain the run you just did; on a rarely used machine that run
+    // may be the only record, and an age cutoff must not silently empty the
+    // tree. (A run can still be removed explicitly by deleting its dir.)
+    let newest = ordered.last().map(|e| e.id.clone());
     for entry in ordered {
+        if Some(&entry.id) == newest.as_ref() {
+            survivors.push(entry);
+            continue;
+        }
         if entry.mtime_secs < cutoff {
             remaining = remaining.saturating_sub(entry.size);
             evicted.push(entry.id.clone());
@@ -1223,6 +1240,86 @@ mod tests {
         assert!(new.exists());
         let survivors = std::fs::read_to_string(&idx).unwrap();
         assert!(!survivors.contains("20260101T000000Z-1"));
+        assert!(survivors.contains("20260102T000000Z-2"));
+    }
+
+    #[test]
+    fn test_prune_age_phase_keeps_the_only_old_run() {
+        use std::fs::FileTimes;
+        use std::time::Duration;
+
+        // A lone run older than the cutoff is the only history there is; the
+        // age phase must not silently empty the tree (disaster recovery: this
+        // is the run you would want to inspect).
+        let root = TempRoot::new("prune-age-even-oldest");
+        let only = fake_run(root.path(), "20260101T000000Z-1", b"old");
+        let idx = root.path().join("index.jsonl");
+        let mut raw = record_to_json(&sample_record("20260101T000000Z-1"));
+        raw.push('\n');
+        std::fs::write(&idx, raw.as_bytes()).unwrap();
+
+        let when = SystemTime::now() - Duration::from_secs(40 * SECS_PER_DAY);
+        std::fs::File::open(&only)
+            .unwrap()
+            .set_times(FileTimes::new().set_modified(when))
+            .unwrap();
+
+        let (removed, freed) = prune_in(root.path(), 30, u64::MAX).unwrap();
+        assert_eq!(
+            removed, 0,
+            "the newest (only) run must survive the age phase"
+        );
+        assert_eq!(freed, 0);
+        assert!(only.exists(), "run dir must still exist");
+        assert!(
+            std::fs::read_to_string(&idx)
+                .unwrap()
+                .contains("20260101T000000Z-1")
+        );
+    }
+
+    #[test]
+    fn test_prune_index_rewrite_failure_deletes_nothing() {
+        use std::fs::FileTimes;
+        use std::time::Duration;
+
+        // The index is rewritten BEFORE any directory is deleted: a failure
+        // there must leave the tree exactly as it was, never an index pointing
+        // at runs whose files are already gone.
+        let root = TempRoot::new("prune-rewrite-fail");
+        let old = fake_run(root.path(), "20260101T000000Z-1", b"old");
+        let new = fake_run(root.path(), "20260102T000000Z-2", b"new");
+        let idx = root.path().join("index.jsonl");
+        let mut raw = record_to_json(&sample_record("20260101T000000Z-1"));
+        raw.push('\n');
+        raw.push_str(&record_to_json(&sample_record("20260102T000000Z-2")));
+        raw.push('\n');
+        std::fs::write(&idx, raw.as_bytes()).unwrap();
+
+        // Age only the OLDER run: the newest is protected, so the age phase
+        // evicts exactly one run and therefore has to rewrite the index.
+        let when = SystemTime::now() - Duration::from_secs(40 * SECS_PER_DAY);
+        std::fs::File::open(&old)
+            .unwrap()
+            .set_times(FileTimes::new().set_modified(when))
+            .unwrap();
+
+        // Block the atomic rewrite: `index.jsonl.tmp` cannot be created as a
+        // file while a directory sits there.
+        std::fs::create_dir_all(root.path().join("index.jsonl.tmp")).unwrap();
+
+        let err = prune_in(root.path(), 30, u64::MAX);
+        assert!(err.is_err(), "the blocked rewrite must surface as an error");
+        assert!(
+            old.exists(),
+            "nothing may be deleted when the rewrite fails"
+        );
+        assert!(new.exists());
+        let survivors = std::fs::read_to_string(&idx).unwrap();
+        assert!(
+            survivors.contains("20260101T000000Z-1"),
+            "the index must still describe every surviving run"
+        );
         assert!(survivors.contains("20260102T000000Z-2"));
     }
 

@@ -59,9 +59,9 @@ rexec -q <host> run -- "echo hi"
 
 ### Output contract
 
-- **Success is silent**: stdout/stderr carry the command's own output and nothing else. `-v/--verbose` adds the decision trace (resolved target, auth attempts, platform/deploy decision, remote PID, reconnects, timings).
-- **Errors/warnings carry full context in one shot** — no re-run with `-v` needed. An unknown host alias fails listing the 2–3 closest configured aliases plus the hint to use `user@host` for a literal host (an alias is never silently treated as a raw hostname). A worker that dies before starting reports its own stderr and the launch command.
-- **Non-zero remote exit** prints exactly one warning line to stderr: `⚠ remote exit <code> (log: ~/.rexec/logs/<pid>.log)`; exit code 0 prints nothing. rexec's own exit status is 1 only when rexec itself fails.
+- **Success is silent**: stdout/stderr carry the command's own output and nothing else — except the first-connect known-hosts notice (`⚠ Accepting new host key for …`, as `ssh` prints) and the non-zero-exit warning. `-v/--verbose` adds the decision trace (resolved target, auth attempts, platform/deploy decision, remote PID, reconnects, timings).
+- **Errors/warnings carry full context in one shot** — no re-run with `-v` needed. An unknown host alias fails listing near-miss suggestions from the configured aliases (prefix/substring matches) plus the hint to use `user@host` for a literal host (an alias is never silently treated as a raw hostname). A worker that dies before starting reports its own stderr and the launch command.
+- **Non-zero remote exit** prints exactly one warning line to stderr: `⚠ remote exit <code> (log: ~/.rexec/logs/<pid>.log)`; exit code 0 prints nothing. rexec's own exit status **mirrors the remote code** (ssh semantics) — a signal-killed remote process (reported as `-1`) exits `255`; piping stdout into an early-exiting reader (`| head`) ends the process on SIGPIPE (141) instead.
 - **`--json`** writes one JSON line to stderr, last (after the trace/warning): `host`, `resolved`, `pid`, `exit_code`, `duration_ms`, `deployed`, `stdout_bytes`, `stderr_bytes`, `log_path` (`null` for now — the warning line carries the remote log path), `error` (failure only), always in that order. stdout is never polluted.
 
 ### `run` options
@@ -79,7 +79,7 @@ rexec -q <host> run -- "echo hi"
 |--------|-------------|
 | `-p PORT` / `--port PORT` | SSH port (overrides `host:port` and ssh-config `Port`) |
 | `-v` / `--verbose` | Print the decision trace (resolution, auth, deploy, reconnect) even on success; errors always carry it |
-| `--json` | Emit one machine-readable result summary line on stderr |
+| `--json` | Emit one machine-readable result summary line on stderr (`run`/`script`/`plan`/`init`; local-only subcommands like `list`/`history` ignore it) |
 | `--no-history` | Do not record this run in the local execution history (same as `REXEC_HISTORY=0`) |
 | `-q` / `--quiet` | Suppress remaining warning/progress lines (errors are never suppressed) |
 

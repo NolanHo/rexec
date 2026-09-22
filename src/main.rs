@@ -784,20 +784,33 @@ fn resolve_host(
     port_override: Option<u16>,
     trace: &mut diagnostics::Trace,
 ) -> Result<RemoteHost> {
-    let literal = is_literal_host(host);
+    // A bare IPv6 literal (`fe80::1`) must be parsed by the std parser: the
+    // generic `host:port` split would read `fe80:` + port 1.
+    let bare_v6 = (!host.contains('@') && !host.contains('['))
+        .then(|| host.parse::<std::net::Ipv6Addr>().ok())
+        .flatten();
+    let literal = bare_v6.is_some() || is_literal_host(host);
     let mut remote = if literal {
-        let mut parsed = parse_user_host_port(host)?;
-        // A literal name can still match a config block (`Host *.example.com`,
-        // `Host prod.example.com`): those params fill in what the CLI did not
-        // spell out, exactly as `ssh` applies them — dropping them would
-        // silently lose the User/Port/IdentityFile such blocks provide. A
-        // literal that matches no concrete block is untouched (global `Host *`
-        // defaults are not inherited here: raw targets never inherited them
-        // before, and this change does not alter that). Config problems are
-        // ignored on this path for the same reason: a literal target keeps
-        // working with no ~/.ssh/config at all.
-        if let Ok((_, config)) = load_user_ssh_config()
-            && is_defined_alias(&config, &parsed.hostname)
+        let mut parsed = match bare_v6 {
+            Some(v6) => RemoteHost {
+                hostname: v6.to_string(),
+                port: None,
+                user: None,
+                identity_file: None,
+            },
+            None => parse_user_host_port(host)?,
+        };
+        // A literal target still inherits config params — the global `Host *`
+        // block (Port/User/IdentityFile) and any block matching the literal
+        // (`Host *.example.com`, `Host prod.example.com`). This is what `ssh`
+        // does and what the pre-transparency resolution did for every bare
+        // name; dropping it silently changed which port/user/key a raw target
+        // used. Inline parts of the input (an explicit `user@host`, a
+        // `host:port` port) win over config, and `user@host` never consulted
+        // config before, so it still does not. Config problems are ignored on
+        // this path: a literal target must keep working without one.
+        if !host.contains('@')
+            && let Ok((_, config)) = load_user_ssh_config()
         {
             let params = config.query(&parsed.hostname);
             parsed.hostname = params
@@ -2429,9 +2442,9 @@ fn remote_log_hint(remote_env: &ssh::RemoteEnv, pid: u32) -> String {
 /// record ("why did that fail?" is exactly what history is for).
 ///
 /// Kept out of `diagnostics::RunSummary` on purpose: that struct is the
-/// `--json` contract (field order unit-tested) and `diagnostics.rs` belongs to
-/// another workstream, so the record's extra inputs — command, env, captures —
-/// are threaded separately instead of extending it.
+/// `--json` contract (field order unit-tested), while the history record's
+/// extra inputs — command, env, raw captures — are history-only and threaded
+/// separately rather than widening the machine-readable summary.
 struct RunCapture {
     id: String,
     ts_start: String,
@@ -2530,17 +2543,13 @@ async fn run_command(
         *capture = Some(RunCapture::new(command, env));
     }
 
-    // TODO(trace): done — the traced variant is on this branch, so it is
-    // called here (it records the target, handshake and every auth attempt).
-    // On a branch without it, this is the one line to swap back to
-    // `ssh::connect(remote).await` (losing the auth detail in the trace).
     let mut session = ssh::connect_traced(remote, trace).await?;
 
-    // TODO(trace): done — `ensure_remote_binary_traced` records the platform
-    // probe, the version comparison and the upload outcome, and returns the
-    // deploy decision as `RemoteEnv.deployed`.
     let remote_env = ssh::ensure_remote_binary_traced(&mut session, host, trace).await?;
-    summary.deployed = remote_env.deployed;
+    // `|=`: `script` runs may already have deployed during their pre-flight
+    // check, and this call then sees an up-to-date worker (false) — the run
+    // still deployed, and the record/JSON must say so.
+    summary.deployed |= remote_env.deployed;
 
     // Start worker on remote. The command itself is NOT passed on argv (so
     // `pkill -f`/`pgrep -f` cannot match the worker by command content); it is
@@ -2797,10 +2806,6 @@ async fn run_command(
                             }
                             backoff = (backoff * 2).min(max_backoff);
 
-                            // TODO(trace): done — same swap as the initial
-                            // connect; on a branch without `connect_traced`
-                            // this is `ssh::connect(remote).await` plus a
-                            // local trace line.
                             match ssh::connect_traced(remote, trace).await {
                                 Ok(new_session) => {
                                     let attach_cmd =
@@ -2930,8 +2935,6 @@ async fn run_script(
     // runner command avoids relying on shell tilde expansion, which quoting
     // would disable (python3 '$HOME/...' does not expand).
     let remote_script = {
-        // TODO(trace): done — same swap as `run_command`: the connect and the
-        // deploy each record their decisions in the trace.
         let mut session = ssh::connect_traced(remote, trace).await?;
         // `script` requires rsync (do_sync below) and a POSIX remote path
         // model — reject Windows remotes up front instead of wasting a full
@@ -3099,7 +3102,6 @@ async fn plan_command(
 ) -> Result<()> {
     summary.resolved = resolved_label(remote);
 
-    // TODO(trace): done — same swap as `run_command`.
     let session = ssh::connect_traced(remote, trace).await?;
 
     let (platform, asset) = probe_remote_platform(&session).await;
@@ -3970,12 +3972,11 @@ async fn run_history(
 }
 
 /// Serialize [`diagnostics::RunSummary`] as ONE line of JSON, by hand.
-/// `serde` (derive) is a direct dependency but the formatter (`serde_json`) is
-/// not, and `Cargo.toml` is owned by another workstream — so the fields are
-/// written in declaration order with a minimal escaper. The order is stable
-/// (unit-tested), `error` is omitted when absent (matching the struct's
-/// `skip_serializing_if`), and the result is a single JSON object with no
-/// trailing newline.
+///
+/// The output is a byte-for-byte contract (unit-tested): declaration order,
+/// `error` omitted when absent, `log_path` as `null`. The hand-written writer
+/// exists to keep that contract explicit; `serde_json` is available but not
+/// used here so a dependency upgrade cannot silently change the wire format.
 fn summary_json_line(summary: &diagnostics::RunSummary) -> String {
     let mut out = String::with_capacity(192);
     out.push_str("{\"host\":");
