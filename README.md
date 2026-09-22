@@ -232,10 +232,10 @@ cargo build --release
 
 ### Releasing
 
-Push a tag to trigger both release workflows: `.github/workflows/release.yml` builds native binaries for linux/macos/windows × amd64/arm64 and attaches them to a GitHub Release, while `.github/workflows/publish.yml` publishes the crate to [crates.io](https://crates.io/crates/remote-exec) via trusted publishing (OIDC token exchange, no API token stored as a secret). A tag can also be published manually: `gh workflow run publish.yml -f tag=v0.3.1`.
+Push a tag to trigger both release workflows: `.github/workflows/release.yml` builds native binaries for linux/macos/windows × amd64/arm64 and attaches them to a GitHub Release, while `.github/workflows/publish.yml` publishes the crate to [crates.io](https://crates.io/crates/remote-exec) via trusted publishing (OIDC token exchange, no API token stored as a secret). A tag can also be published manually: `gh workflow run publish.yml -f tag=v0.4.0`.
 
 ```bash
-git tag v0.3.1 && git push origin v0.3.1
+git tag v0.4.0 && git push origin v0.4.0
 ```
 
 Cross-platform deploys (e.g. macOS local → Linux remote) download these release assets pinned to the running version, so a version must be released before it can deploy a mismatched remote platform.
