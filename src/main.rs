@@ -33,6 +33,29 @@ pub(crate) static JSON_SUMMARY: AtomicBool = AtomicBool::new(false);
 /// 0 = nothing to propagate; negative (signal-killed child) → 255.
 pub(crate) static REMOTE_EXIT: AtomicI32 = AtomicI32::new(0);
 
+/// `--reveal-secrets` was requested. Secret VALUES (env vars) are recorded
+/// verbatim in the owner-only history tree, but every OUTPUT surface masks them
+/// by default so a key cannot land in terminal scrollback, CI logs or an agent
+/// transcript just because rexec ran.
+pub(crate) static REVEAL_SECRETS: AtomicBool = AtomicBool::new(false);
+
+/// True when the user opted into seeing secret values in output.
+pub(crate) fn reveal_secrets() -> bool {
+    REVEAL_SECRETS.load(Ordering::Relaxed)
+}
+
+/// An env value as it may appear in OUTPUT (never in the stored record).
+///
+/// Masked unless the user asked with `--reveal-secrets`; an empty value carries
+/// no secret and stays empty so `KEY=` still reads as "set but empty".
+fn mask_env_value(value: &str, reveal: bool) -> String {
+    if reveal || value.is_empty() {
+        value.to_string()
+    } else {
+        "***".to_string()
+    }
+}
+
 /// Map a remote exit code onto a local process exit status: negatives (the
 /// worker could not obtain a real code, e.g. the child died of a signal)
 /// become 255, like ssh's own error status.
@@ -124,6 +147,11 @@ struct Cli {
     /// REXEC_HISTORY=0; reading `rexec history …` still works)
     #[arg(long = "no-history", global = true)]
     no_history: bool,
+
+    /// Show secret values (env vars) in output. They are recorded locally
+    /// either way; without this flag every printed surface masks them
+    #[arg(long = "reveal-secrets", global = true)]
+    reveal_secrets: bool,
 
     #[command(subcommand)]
     action: Action,
@@ -360,7 +388,17 @@ fn parse_env_file(path: &Path) -> Result<Vec<(String, String)>> {
         }
         let line = line.strip_prefix("export ").unwrap_or(line);
         let Some((k, mut v)) = line.split_once('=') else {
-            eprintln!("⚠ env file: skipping malformed line (no '='): {:?}", line);
+            // Never echo the line: a malformed env-file line is exactly where a
+            // stray secret lives (a key pasted without its name, a wrapped
+            // line), and this warning would otherwise put it on stderr.
+            if reveal_secrets() {
+                eprintln!("⚠ env file: skipping malformed line (no '='): {:?}", line);
+            } else {
+                eprintln!(
+                    "⚠ env file: skipping malformed line (no '=', {} bytes) — --reveal-secrets prints it",
+                    line.len()
+                );
+            }
             continue;
         };
         let k = k.trim();
@@ -1627,6 +1665,36 @@ mod tests {
             "no Include lines may survive: {text}"
         );
         std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn test_mask_env_value() {
+        // Values are the secret: masked unless explicitly revealed; an empty
+        // value stays empty (nothing to hide, and `KEY=` should read as unset).
+        assert_eq!(mask_env_value("sk-live-abcdef", false), "***");
+        assert_eq!(mask_env_value("sk-live-abcdef", true), "sk-live-abcdef");
+        assert_eq!(mask_env_value("", false), "");
+        assert_eq!(mask_env_value("", true), "");
+    }
+
+    #[test]
+    fn test_mask_index_line_env_keeps_the_rest_of_the_record() {
+        let line =
+            r#"{"id":"x","env":[["API_KEY","sk-live"],["EMPTY",""]],"note":"keep","future":7}"#;
+        let masked = mask_index_line_env(line);
+        let v: serde_json::Value = serde_json::from_str(&masked).unwrap();
+        assert_eq!(v["env"][0][0], "API_KEY", "the key name is not a secret");
+        assert_eq!(v["env"][0][1], "***", "the value is masked");
+        assert_eq!(v["env"][1][1], "", "an empty value stays empty");
+        // Everything else — including keys this build does not know — survives,
+        // which is why the JSON object is edited instead of re-typed.
+        assert_eq!(v["id"], "x");
+        assert_eq!(v["note"], "keep");
+        assert_eq!(v["future"], 7);
+
+        // A line that is not valid JSON is returned untouched (callers only
+        // pass lines they just parsed for the id).
+        assert_eq!(mask_index_line_env("not json"), "not json");
     }
 
     #[test]
@@ -2949,11 +3017,24 @@ async fn run_command(
 fn collect_env(env: &[String], env_file: &[PathBuf]) -> Result<Vec<(String, String)>> {
     let mut env_vars: Vec<(String, String)> = Vec::new();
     for e in env {
-        let (k, v) = e
-            .split_once('=')
-            .ok_or_else(|| anyhow!("--env expects KEY=VALUE, got '{}'", e))?;
+        let Some((k, v)) = e.split_once('=') else {
+            // The argument IS the secret in this case (a value pasted without
+            // its KEY= prefix), so it is never echoed.
+            return Err(if reveal_secrets() {
+                anyhow!("--env expects KEY=VALUE, got '{}'", e)
+            } else {
+                anyhow!(
+                    "--env expects KEY=VALUE ({} bytes, not shown — --reveal-secrets prints it)",
+                    e.len()
+                )
+            });
+        };
         if k.is_empty() {
-            return Err(anyhow!("--env key is empty in '{}'", e));
+            return Err(if reveal_secrets() {
+                anyhow!("--env key is empty in '{}'", e)
+            } else {
+                anyhow!("--env key is empty (value not shown — --reveal-secrets prints it)")
+            });
         }
         env_vars.push((k.to_string(), v.to_string()));
     }
@@ -3540,10 +3621,38 @@ fn raw_index_line(id: &str) -> Result<String> {
         std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
     for line in text.lines() {
         if json_string_field(line, "id").as_deref() == Some(id) {
-            return Ok(line.to_string());
+            // The stored line is the raw record — which holds env values
+            // verbatim. Only `--reveal-secrets` prints it byte-for-byte;
+            // by default the values are masked in place (unknown keys from a
+            // newer rexec survive, because the JSON object is edited, not
+            // re-typed from the struct).
+            return Ok(if reveal_secrets() {
+                line.to_string()
+            } else {
+                mask_index_line_env(line)
+            });
         }
     }
     Err(anyhow!("no such run: {id}"))
+}
+
+/// Replace every env value in a stored index line with `***`, leaving the rest
+/// of the JSON (including keys this build does not know) untouched.
+fn mask_index_line_env(line: &str) -> String {
+    let Ok(mut value) = serde_json::from_str::<serde_json::Value>(line) else {
+        return line.to_string(); // unreachable for a line the caller could parse
+    };
+    if let Some(env) = value.get_mut("env").and_then(|e| e.as_array_mut()) {
+        for pair in env {
+            if let Some(arr) = pair.as_array_mut()
+                && arr.len() == 2
+                && !arr[1].as_str().is_some_and(|v| v.is_empty())
+            {
+                arr[1] = serde_json::Value::String("***".to_string());
+            }
+        }
+    }
+    serde_json::to_string(&value).unwrap_or_else(|_| line.to_string())
 }
 
 /// Index records, with "no history yet" expressed as an empty list.
@@ -3716,7 +3825,12 @@ fn history_show(id: &str, stdout: bool, stderr: bool, trace: bool, meta: bool) -
         println!("env:       (none)");
     } else {
         for (k, v) in &rec.env {
-            println!("env:       {}={}", single_line(k, 60), single_line(v, 200));
+            let shown = mask_env_value(v, reveal_secrets());
+            println!(
+                "env:       {}={}",
+                single_line(k, 60),
+                single_line(&shown, 200)
+            );
         }
     }
     if let Some(err) = &rec.error {
@@ -3766,7 +3880,14 @@ fn history_grep(
             lines.push(format!("cmd: {fragment}"));
         }
         for (k, v) in &rec.env {
-            if let Some(fragment) = match_context(v, &needle, 40, 40) {
+            if match_context(v, &needle, 40, 40).is_some() {
+                // The match itself is the signal; the value is the secret, so
+                // only `--reveal-secrets` prints the matching fragment.
+                let fragment = if reveal_secrets() {
+                    match_context(v, &needle, 40, 40).unwrap_or_default()
+                } else {
+                    "***".to_string()
+                };
                 lines.push(format!("env {k}={fragment}"));
             }
         }
@@ -4163,6 +4284,7 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     QUIET.store(cli.quiet, Ordering::Relaxed);
     JSON_SUMMARY.store(cli.json, Ordering::Relaxed);
+    REVEAL_SECRETS.store(cli.reveal_secrets, Ordering::Relaxed);
     // `--no-history` and `REXEC_HISTORY=0` both disable recording; the combined
     // rule is pure and unit-tested (`history::enabled()` is the runtime view).
     history::set_enabled(history_enabled(

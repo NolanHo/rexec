@@ -81,6 +81,7 @@ rexec -q <host> run -- "echo hi"
 | `-v` / `--verbose` | Print the decision trace (resolution, auth, deploy, reconnect) even on success; errors always carry it |
 | `--json` | Emit one machine-readable result summary line on stderr (`run`/`script`/`plan`/`init`; local-only subcommands like `list`/`history` ignore it) |
 | `--no-history` | Do not record this run in the local execution history (same as `REXEC_HISTORY=0`) |
+| `--reveal-secrets` | Print secret values (env vars) instead of `***`; they are recorded locally either way |
 | `-q` / `--quiet` | Suppress remaining warning/progress lines (errors are never suppressed) |
 
 ### `plan` — dry run (no execution, no deploy)
@@ -109,6 +110,8 @@ rexec list [alias]
 Reads `~/.ssh/config` and prints each host's alias/hostname/port/user (pure-wildcard entries skipped). Pass an alias for single-host details.
 
 ### `history` — recorded runs
+
+**Secrets**: env values are stored verbatim in the owner-only history tree but masked (`***`) in every printed surface — `history show`/`--meta`/`grep` match lines and the `-e`/env-file parse warnings. `--reveal-secrets` prints them. Command text is shown as-is, so pass secrets via `-e`/`--env-file` (which never appear in `ps`), not inline.
 
 Every `run`/`script` is recorded locally (nothing leaves the machine):
 

@@ -117,9 +117,10 @@ On Windows the local side of `--sync` must be an MSYS2/WSL-style path (`/c/proj`
 | `-v` / `--verbose` | Print the decision trace (resolution, auth, deploy, reconnect, timings) even on success. Errors always carry it |
 | `--json` | Emit one machine-readable result summary line on stderr (see Output contract). Applies to `run`/`script`/`plan`/`init`; the local-only subcommands (`list`, `history …`) ignore it |
 | `--no-history` | Do not record this run in the local execution history (same as `REXEC_HISTORY=0`); reading `rexec history …` still works |
+| `--reveal-secrets` | Print secret values (env vars) instead of `***` in output. Values are **recorded** locally either way; without this flag every printed surface masks them |
 | `-q` / `--quiet` | Suppress the remaining warning/progress lines. Errors are never suppressed |
 
-Run/plan/sync/script usage is unchanged otherwise: `rexec [-p PORT] [-v] [--json] [--no-history] <alias|user@host:port> <subcommand> ...`.
+Run/plan/sync/script usage is unchanged otherwise: `rexec [-p PORT] [-v] [--json] [--no-history] [--reveal-secrets] <alias|user@host:port> <subcommand> ...`.
 
 ### `script` — sync and run a local script
 
@@ -173,7 +174,7 @@ rexec history prune --keep-days 7 --max-mb 500
 
 - **Capture cap**: each stream is capped at 1 MiB — the head and the tail are kept and the middle is replaced by a `… [N bytes omitted] …` marker, so one chatty run cannot fill the disk while its start and its failure stay readable. `stdout_bytes`/`stderr_bytes` in the record are the true byte totals even when the capture was capped: `show` marks a truncated stream and `stats` sums the true totals.
 - **Switches**: `--no-history` disables recording for one invocation; `REXEC_HISTORY=0` disables it for the whole environment. Both leave reading (`rexec history …`) and pruning fully working.
-- **Commands and env values are stored VERBATIM — no redaction, by explicit product decision.** Anything passed via `-e/--env`/`--env-file` (API keys included) and the command text land in `index.jsonl` in clear text. The tree is owner-only (`~/.rexec/history` and every run dir 0700, files 0600) and never leaves the machine — use `--no-history` / `REXEC_HISTORY=0` for a run whose arguments must not be persisted.
+- **Secrets: recorded locally, never printed by default.** Env values (from `-e/--env`/`--env-file`) and the command text are stored VERBATIM in the owner-only history tree (`~/.rexec/history` 0700, files 0600, nothing leaves the machine) — that is deliberate, so a past run can be analyzed. Every surface rexec PRINTS masks env values as `***` (the `history` views, `--meta`, `history grep` match lines, and the `-e`/env-file parse warnings, which would otherwise echo the value that failed to parse) so a key cannot reach terminal scrollback, CI logs or an agent transcript just because rexec ran; `--reveal-secrets` opts into the plaintext. Caveats: the command TEXT is shown as-is (put secrets in `-e`/`--env-file` rather than inline), and a captured stream (`history show --stdout/--stderr`) is the remote command's own output — rexec cannot know which bytes of it are secret. Use `--no-history` / `REXEC_HISTORY=0` for a run whose arguments or output must not be persisted at all.
 - **`fetch` prints the worker's raw binary frame stream** (the same bytes the CLI decodes live) — it is not decoded output; `show --stdout/--stderr` is the decoded capture. A missing pid (the worker never started) or a Windows remote fails with a clear message instead of guessing a path.
 
 ## How it works
