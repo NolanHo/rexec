@@ -317,29 +317,138 @@ impl russh::client::Handler for ClientHandler {
     }
 }
 
-/// Establish SSH connection and authenticate.
+/// A live SSH session plus the jump-host sessions that carry it.
+///
+/// Callers keep using it as `&client::Handle<ClientHandler>` (it derefs), so a
+/// `ProxyJump` chain changes nothing at the call sites. The jump handles are
+/// parked here because they own the reply channel of the sessions the tunnel
+/// runs over: keeping them alive for as long as the session is the honest
+/// lifetime, whatever russh's driver does internally.
+pub struct SshSession {
+    handle: client::Handle<ClientHandler>,
+    _jumps: Vec<client::Handle<ClientHandler>>,
+}
+
+impl std::ops::Deref for SshSession {
+    type Target = client::Handle<ClientHandler>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.handle
+    }
+}
+
+impl std::ops::DerefMut for SshSession {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.handle
+    }
+}
+
+/// A bidirectional byte stream usable as an SSH transport.
+///
+/// Rust trait objects may carry only one non-auto trait, so `AsyncRead +
+/// AsyncWrite` needs a local supertrait instead of a bare `dyn` object.
+trait ByteStream: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send {}
+impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send> ByteStream for T {}
+
+/// An SSH transport: a TCP socket, or a `direct-tcpip` channel tunnelled
+/// through one or more jump hosts.
+type TunnelStream = std::pin::Pin<Box<dyn ByteStream + Send>>;
+
+/// Establish SSH connection and authenticate, honouring a `ProxyJump` chain.
 /// Both TCP connect and authentication are guarded by timeouts to prevent hangs.
 ///
 /// Thin wrapper over [`connect_traced`] for callers that do not collect a
 /// decision trace. Kept as the pre-trace API: every in-crate caller now uses
 /// the traced variant, so the wrapper would otherwise be flagged as unused.
 #[allow(dead_code)]
-pub async fn connect(remote: &RemoteHost) -> Result<client::Handle<ClientHandler>> {
+pub async fn connect(remote: &RemoteHost) -> Result<SshSession> {
     connect_traced(remote, &mut diagnostics::Trace::default()).await
 }
 
 /// [`connect`] with a decision trace.
 ///
-/// Records the target, the TCP/handshake outcome (only failures are
-/// interesting), the known_hosts decision, and every authentication attempt,
-/// so a failure can print its full context in one shot.
+/// Records the route (direct or jump chain), the TCP/handshake outcome (only
+/// failures are interesting), the known_hosts decision, and every authentication
+/// attempt, so a failure can print its full context in one shot.
 pub async fn connect_traced(
     remote: &RemoteHost,
     trace: &mut diagnostics::Trace,
-) -> Result<client::Handle<ClientHandler>> {
+) -> Result<SshSession> {
+    trace.add(format!(
+        "connect: route {}",
+        crate::jump_chain_label(remote)
+    ));
+
+    if remote.jump.is_empty() {
+        let tcp = tcp_connect(remote, trace, "target").await?;
+        let handle = handshake_and_auth(tcp, remote, trace, "target", target_config()).await?;
+        return Ok(SshSession {
+            handle,
+            _jumps: Vec::new(),
+        });
+    }
+
+    // Jump chain: the outermost hop is reached over plain TCP, every following
+    // hop (and finally the target) through a `direct-tcpip` channel opened on
+    // the session before it — the same thing `ssh -J` does.
+    let total = remote.jump.len();
+    let mut jumps: Vec<client::Handle<ClientHandler>> = Vec::new();
+
+    let first = &remote.jump[0];
+    let tcp = tcp_connect(first, trace, &format!("jump 1/{total}")).await?;
+    let mut current =
+        handshake_and_auth(tcp, first, trace, &format!("jump 1/{total}"), hop_config()).await?;
+
+    for (i, hop) in remote.jump.iter().enumerate().skip(1) {
+        let tunnel = open_tunnel(&current, hop, trace).await?;
+        jumps.push(current);
+        current = handshake_and_auth(
+            tunnel,
+            hop,
+            trace,
+            &format!("jump {}/{total}", i + 1),
+            hop_config(),
+        )
+        .await?;
+    }
+
+    let tunnel = open_tunnel(&current, remote, trace).await?;
+    jumps.push(current);
+    let handle = handshake_and_auth(tunnel, remote, trace, "target", target_config()).await?;
+    Ok(SshSession {
+        handle,
+        _jumps: jumps,
+    })
+}
+
+/// Client config for the target session: today's defaults.
+fn target_config() -> Arc<client::Config> {
+    Arc::new(client::Config::default())
+}
+
+/// Client config for a jump session.
+///
+/// The tunnel carries the *target's* bytes, so a quiet target (an attached
+/// worker waiting for output) means a quiet jump connection — and
+/// `Config::default()` sends no keepalives, so a NAT/firewall idle reap would
+/// kill the tunnel with no error until the next write. The target session keeps
+/// the defaults so direct connections behave exactly as before.
+fn hop_config() -> Arc<client::Config> {
+    Arc::new(client::Config {
+        keepalive_interval: Some(Duration::from_secs(30)),
+        ..client::Config::default()
+    })
+}
+
+/// TCP connect to a hop, with the 15s guard and a trace line on failure.
+async fn tcp_connect(
+    remote: &RemoteHost,
+    trace: &mut diagnostics::Trace,
+    role: &str,
+) -> Result<tokio::net::TcpStream> {
     let port = remote.port.unwrap_or(22);
     let addr = format!("{}:{}", remote.hostname, port);
-    trace.add(format!("connect: target {addr}"));
+    trace.add(format!("connect: {role} {addr}"));
 
     // Parse the hostname for TCP connect (strip any bracket notation)
     let tcp_host = remote
@@ -347,8 +456,6 @@ pub async fn connect_traced(
         .trim_start_matches('[')
         .trim_end_matches(']');
 
-    // 1. TCP connect with 15s timeout
-    let started = std::time::Instant::now();
     let tcp = tokio::time::timeout(
         Duration::from_secs(15),
         tokio::net::TcpStream::connect((tcp_host, port)),
@@ -356,25 +463,81 @@ pub async fn connect_traced(
     .await
     .with_context(|| format!("TCP connect timed out (15s) to {}", addr))
     .and_then(|r| r.with_context(|| format!("TCP connecting to {}", addr)));
-    let tcp_stream = match tcp {
-        Ok(stream) => stream,
+    match tcp {
+        Ok(stream) => Ok(stream),
         Err(e) => {
             trace.add(format!("connect: TCP connect to {addr} failed: {e:#}"));
-            return Err(e);
+            Err(e)
         }
-    };
+    }
+}
+
+/// Open a `direct-tcpip` channel to `to` through `from`, as a stream usable as
+/// the next hop's SSH transport.
+///
+/// The originator address/port are advisory (the server logs them); `127.0.0.1:0`
+/// is what several clients send when they do not bind a local socket.
+async fn open_tunnel(
+    from: &client::Handle<ClientHandler>,
+    to: &RemoteHost,
+    trace: &mut diagnostics::Trace,
+) -> Result<TunnelStream> {
+    let host = to
+        .hostname
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .to_string();
+    let port = to.port.unwrap_or(22);
+    let addr = format!("{host}:{port}");
+    trace.add(format!(
+        "connect: opening direct-tcpip tunnel to {addr} through the previous hop"
+    ));
+    let channel = tokio::time::timeout(
+        Duration::from_secs(15),
+        from.channel_open_direct_tcpip(host, port as u32, "127.0.0.1", 0),
+    )
+    .await
+    .with_context(|| format!("Tunnel to {addr} timed out (15s)"))
+    .and_then(|r| r.with_context(|| format!("Opening a tunnel to {addr} through the jump host")))?;
+    crate::progress!("↣ tunnel to {addr}");
+    Ok(Box::pin(channel.into_stream()))
+}
+
+/// SSH handshake + authentication over an already-open transport.
+///
+/// `role` names the hop in trace output (`target`, `jump 1/2`, …): with a jump
+/// chain in play, "connected to 10.30.40.4:22" is ambiguous, and knowing which
+/// hop failed is exactly what the trace is for. `config` is per-role because a
+/// jump session needs keepalives the target session does not (see `hop_config`).
+async fn handshake_and_auth<R>(
+    stream: R,
+    remote: &RemoteHost,
+    trace: &mut diagnostics::Trace,
+    role: &str,
+    config: Arc<client::Config>,
+) -> Result<client::Handle<ClientHandler>>
+where
+    R: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    let port = remote.port.unwrap_or(22);
+    let addr = format!("{}:{}", remote.hostname, port);
+    let tcp_host = remote
+        .hostname
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .to_string();
 
     // 2. SSH handshake with 15s timeout
-    let config = Arc::new(client::Config::default());
+    let started = std::time::Instant::now();
     let handler = ClientHandler {
-        host: tcp_host.to_string(),
+        host: tcp_host,
         port,
         notes: Arc::new(std::sync::Mutex::new(Vec::new())),
     };
     let notes = Arc::clone(&handler.notes);
     let handshake = tokio::time::timeout(
         Duration::from_secs(15),
-        russh::client::connect_stream(config, tcp_stream, handler),
+        russh::client::connect_stream(config, stream, handler),
     )
     .await
     .with_context(|| format!("SSH handshake timed out (15s) with {}", addr))
@@ -393,12 +556,14 @@ pub async fn connect_traced(
     let mut session = match handshake {
         Ok(session) => session,
         Err(e) => {
-            trace.add(format!("connect: SSH handshake with {addr} failed: {e:#}"));
+            trace.add(format!(
+                "connect: {role} SSH handshake with {addr} failed: {e:#}"
+            ));
             return Err(e);
         }
     };
     trace.add(format!(
-        "connect: connected to {addr} in {}ms",
+        "connect: {role} {addr} connected in {}ms",
         started.elapsed().as_millis()
     ));
 
@@ -413,7 +578,9 @@ pub async fn connect_traced(
     match auth {
         Ok(()) => {}
         Err(e) => {
-            trace.add(format!("connect: authentication to {addr} failed: {e:#}"));
+            trace.add(format!(
+                "connect: {role} authentication to {addr} failed: {e:#}"
+            ));
             return Err(e);
         }
     }

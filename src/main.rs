@@ -355,12 +355,33 @@ enum HistoryCmd {
     },
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct RemoteHost {
     pub hostname: String,
     pub port: Option<u16>,
     pub user: Option<String>,
     pub identity_file: Option<PathBuf>,
+    /// Resolved `ProxyJump` chain: the hosts to tunnel through, outermost hop
+    /// first, so `jump.last()` is the hop that opens the connection to us.
+    ///
+    /// Empty means a direct TCP connection. Chains are flattened during
+    /// resolution (`ProxyJump a,b` and a jump host that itself jumps both come
+    /// out in connection order), so each hop's own `jump` is empty.
+    pub jump: Vec<RemoteHost>,
+    /// The original `ProxyJump` spec strings, in the same order as `jump`.
+    ///
+    /// Kept for tools that resolve hosts themselves — `rsync` spawns a real
+    /// `ssh`, and `-J js4` lets that ssh apply the hop's config block, while
+    /// `-J zengqixin@192.168.4.70:42200` would match no block and pick up the
+    /// wrong identity from `Host *`.
+    pub jump_specs: Vec<String>,
+    /// The ssh-config alias this target was resolved from, when it was one.
+    ///
+    /// `rsync` gets the alias rather than the resolved address so the ssh it
+    /// spawns applies that host's own config block (IdentityFile list, Port,
+    /// ProxyJump) — a resolved `user@host` matches `Host *` instead and can end
+    /// up offering a key that host does not accept.
+    pub alias: Option<String>,
 }
 
 /// True when `s` starts with a Windows drive prefix (`^[A-Za-z]:`), e.g. `C:\proj`.
@@ -735,13 +756,13 @@ fn load_user_ssh_config() -> Result<(PathBuf, SshConfig)> {
 /// this client does not implement.
 ///
 /// `ssh2_config` records them in `HostParams::unsupported_fields` and then drops
-/// them. Without surfacing that, a host reachable only through `ProxyJump`
-/// silently becomes a direct connection to an address that is unreachable by
-/// design, and the user sees a bare connect timeout with no hint of the cause.
+/// them. `ProxyJump` is now implemented (see `resolve_jump_chain`); what remains
+/// here is `ProxyCommand` — a shell command we cannot honestly emulate, so the
+/// run must at least say that it is connecting directly instead.
 ///
 /// Returned as sorted `directive=value` strings for a stable trace/warning.
 fn unimplemented_routing(params: &ssh2_config::HostParams) -> Vec<String> {
-    const ROUTING: [&str; 2] = ["proxyjump", "proxycommand"];
+    const ROUTING: [&str; 1] = ["proxycommand"];
     let mut hits: Vec<String> = params
         .unsupported_fields
         .iter()
@@ -755,18 +776,161 @@ fn unimplemented_routing(params: &ssh2_config::HostParams) -> Vec<String> {
 /// Warn (trace + stderr) about every unimplemented routing directive, naming the
 /// address we are about to connect to instead. Warnings are not suppressed by
 /// `-q`: a wrong destination is not a progress detail.
+///
+/// `route` is `directly` or the `ProxyJump` label, so the warning never claims a
+/// direct connection while a jump chain is actually in use.
 fn warn_unimplemented_routing(
     params: &ssh2_config::HostParams,
     shown_host: &str,
     target: &str,
+    route: &str,
     trace: &mut diagnostics::Trace,
 ) {
     for hit in unimplemented_routing(params) {
-        trace.add(format!("resolve: {hit} not implemented → direct connect"));
+        trace.add(format!("resolve: {hit} not implemented → via {route}"));
         eprintln!(
-            "⚠ ssh config: {hit} for {shown_host} is not implemented; connecting directly to {target}"
+            "⚠ ssh config: {hit} for {shown_host} is not implemented; connecting {route} to {target}"
         );
     }
+}
+
+/// `directly` for a direct connection, otherwise the jump chain label — the
+/// phrase used in routing warnings.
+fn route_phrase(remote: &RemoteHost) -> String {
+    if remote.jump.is_empty() {
+        "directly".to_string()
+    } else {
+        jump_chain_label(remote)
+    }
+}
+
+/// How deep a `ProxyJump` chain may nest before we call it a cycle.
+const MAX_JUMP_DEPTH: usize = 16;
+
+/// The `ProxyJump` chain a host asks for, in connection order.
+///
+/// OpenSSH takes one value that may itself be a comma-separated chain, each
+/// element a bare alias/host, `user@host`, `host:port` or `[v6]:port`. The
+/// literal `none` (case-insensitive) disables jumping, including a jump
+/// inherited from an earlier matching block.
+fn proxy_jump_specs(params: &ssh2_config::HostParams) -> Vec<String> {
+    let value = params
+        .unsupported_fields
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("proxyjump"))
+        .map(|(_, v)| v.join(" "))
+        .unwrap_or_default();
+    let mut out = Vec::new();
+    for part in value.split(',') {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        if part.eq_ignore_ascii_case("none") {
+            return Vec::new();
+        }
+        out.push(part.to_string());
+    }
+    out
+}
+
+/// Resolve a `ProxyJump` chain into concrete hops, outermost first (the order
+/// they must be connected in), together with the **original spec strings** in the
+/// same order.
+///
+/// A jump host that is a config alias is resolved through the config — including
+/// its own `ProxyJump`, hence the recursion — while anything else is taken as a
+/// literal `[user@]host[:port]`, which is what `ssh -J` does with a name that
+/// has no config entry. The depth cap turns a config cycle (`A` jumps to `B`,
+/// `B` jumps back to `A`) into an error instead of a hang.
+///
+/// The specs are kept because `rsync` shells out to a real `ssh`: handing it the
+/// alias lets that ssh apply the hop's own config block (User/Port/IdentityFile),
+/// which a resolved `user@host:port` would not match.
+fn resolve_jump_chain(
+    params: &ssh2_config::HostParams,
+    config: &SshConfig,
+    depth: usize,
+) -> Result<(Vec<RemoteHost>, Vec<String>)> {
+    let specs = proxy_jump_specs(params);
+    if specs.is_empty() {
+        return Ok((Vec::new(), Vec::new()));
+    }
+    if depth >= MAX_JUMP_DEPTH {
+        return Err(anyhow!(
+            "ssh config ProxyJump chain is deeper than {MAX_JUMP_DEPTH} hops (cycle?)"
+        ));
+    }
+    let mut chain = Vec::new();
+    let mut chain_specs = Vec::new();
+    for spec in specs {
+        let hop_params = is_defined_alias(config, &spec).then(|| config.query(&spec));
+        let hop = match &hop_params {
+            Some(p) => RemoteHost {
+                hostname: p.host_name.clone().unwrap_or_else(|| spec.clone()),
+                port: p.port,
+                user: p.user.clone(),
+                identity_file: p.identity_file.as_ref().and_then(|v| v.first().cloned()),
+                jump: Vec::new(),
+                jump_specs: Vec::new(),
+                alias: Some(spec.clone()),
+            },
+            None => parse_user_host_port(&spec)?,
+        };
+        if let Some(p) = &hop_params {
+            let (nested, nested_specs) = resolve_jump_chain(p, config, depth + 1)?;
+            chain.extend(nested);
+            chain_specs.extend(nested_specs);
+        }
+        chain.push(hop);
+        chain_specs.push(spec);
+    }
+    Ok((chain, chain_specs))
+}
+
+/// The `-J` argument for a real `ssh`: the original jump specs, in order.
+///
+/// Falls back to the resolved hops when no specs were recorded (a `RemoteHost`
+/// built by hand, as tests do), so the argument is never silently dropped.
+fn jump_j_arg(remote: &RemoteHost) -> Option<String> {
+    if remote.jump.is_empty() {
+        return None;
+    }
+    let specs: Vec<String> = if remote.jump_specs.len() == remote.jump.len() {
+        remote.jump_specs.clone()
+    } else {
+        remote
+            .jump
+            .iter()
+            .map(|h| {
+                let addr = match h.port {
+                    Some(p) => format!("{}:{p}", h.hostname),
+                    None => h.hostname.clone(),
+                };
+                match &h.user {
+                    Some(u) => format!("{u}@{addr}"),
+                    None => addr,
+                }
+            })
+            .collect()
+    };
+    Some(specs.join(","))
+}
+
+/// `a → b → c` label for a jump chain, or `direct` when there is none.
+fn jump_chain_label(remote: &RemoteHost) -> String {
+    if remote.jump.is_empty() {
+        return "direct".to_string();
+    }
+    let hops: Vec<String> = remote
+        .jump
+        .iter()
+        .map(|h| {
+            let port = h.port.unwrap_or(22);
+            format!("{}:{port}", h.hostname)
+        })
+        .collect();
+    format!("via {}", hops.join(" → "))
 }
 
 /// Local user name, used the way `ssh` and `list` do when no `User` is
@@ -903,6 +1067,9 @@ fn resolve_host(
                 port: None,
                 user: None,
                 identity_file: None,
+                jump: Vec::new(),
+                jump_specs: Vec::new(),
+                alias: None,
             },
             None => parse_user_host_port(host)?,
         };
@@ -934,7 +1101,20 @@ fn resolve_host(
                 .identity_file
                 .as_ref()
                 .and_then(|v| v.first().cloned());
-            warn_unimplemented_routing(&params, &parsed.hostname, &resolved_label(&parsed), trace);
+            // A literal target inherits `ProxyJump` from a matching block the
+            // same way `ssh 10.0.0.5` does (e.g. `Host *.example.com` with a
+            // jump host). A config problem must not break the literal path.
+            if let Ok((jump, jump_specs)) = resolve_jump_chain(&params, &config, 0) {
+                parsed.jump = jump;
+                parsed.jump_specs = jump_specs;
+            }
+            warn_unimplemented_routing(
+                &params,
+                &parsed.hostname,
+                &resolved_label(&parsed),
+                &route_phrase(&parsed),
+                trace,
+            );
         }
         trace.add(format!("resolve: literal {}", resolved_label(&parsed)));
         parsed
@@ -948,6 +1128,7 @@ fn resolve_host(
             return Err(alias_miss_error(host, &defined_aliases(&config), &path));
         }
         let host_config = config.query(host);
+        let (jump, jump_specs) = resolve_jump_chain(&host_config, &config, 0)?;
         let resolved = RemoteHost {
             hostname: host_config
                 .host_name
@@ -959,13 +1140,22 @@ fn resolve_host(
                 .identity_file
                 .as_ref()
                 .and_then(|v| v.first().cloned()),
+            jump,
+            jump_specs,
+            alias: Some(host.to_string()),
         };
         let key = resolved
             .identity_file
             .as_ref()
             .map(|p| format!(" (key {})", p.display()))
             .unwrap_or_default();
-        warn_unimplemented_routing(&host_config, host, &resolved_label(&resolved), trace);
+        warn_unimplemented_routing(
+            &host_config,
+            host,
+            &resolved_label(&resolved),
+            &route_phrase(&resolved),
+            trace,
+        );
         trace.add(format!(
             "resolve: alias {} → {}{}",
             host,
@@ -1030,6 +1220,9 @@ fn parse_user_host_port(s: &str) -> Result<RemoteHost> {
         port,
         user,
         identity_file: None,
+        jump: Vec::new(),
+        jump_specs: Vec::new(),
+        alias: None,
     })
 }
 
@@ -1050,17 +1243,37 @@ fn rsync_spawn_error(e: std::io::Error) -> anyhow::Error {
     anyhow::Error::new(e).context("failed to spawn rsync")
 }
 
+/// What `rsync` is told about the destination: `(host argument, extra ssh flags)`.
+///
+/// rsync spawns a real `ssh`, and that ssh must apply the *host's* config — its
+/// IdentityFile list, Port and ProxyJump. So a config alias is handed over
+/// as-is; only a literal target needs the resolved address plus an explicit `-J`
+/// chain. (A resolved `user@host` matches `Host *` instead: it would not jump,
+/// and it can offer a key that host does not accept — `IdentitiesOnly yes` plus
+/// a first-wins `Host *` IdentityFile is enough to break it.)
+fn rsync_endpoint(remote: &RemoteHost) -> (String, String) {
+    match &remote.alias {
+        Some(alias) => (alias.clone(), String::new()),
+        None => {
+            let host = match &remote.user {
+                Some(u) => format!("{}@{}", u, remote.hostname),
+                None => remote.hostname.clone(),
+            };
+            let jump = match jump_j_arg(remote) {
+                Some(specs) => format!(" -J {specs}"),
+                None => String::new(),
+            };
+            (host, jump)
+        }
+    }
+}
+
 async fn do_sync(local: &Path, remote_path: &str, remote: &RemoteHost) -> Result<()> {
     let ssh_opts = "-o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new -o ServerAliveInterval=5 -o ServerAliveCountMax=3";
+    let (rsync_host, jump_arg) = rsync_endpoint(remote);
     let ssh_e = match remote.port {
-        Some(p) => format!("ssh -p {} {}", p, ssh_opts),
-        None => format!("ssh {}", ssh_opts),
-    };
-    // rsync target host must NOT contain ":port" (rsync would treat it as a
-    // path); use user@hostname and pass the port via `ssh -p`.
-    let rsync_host = match &remote.user {
-        Some(u) => format!("{}@{}", u, remote.hostname),
-        None => remote.hostname.clone(),
+        Some(p) => format!("ssh -p {} {}{}", p, ssh_opts, jump_arg),
+        None => format!("ssh {}{}", ssh_opts, jump_arg),
     };
 
     // Single file: rsync the file directly (no --delete, no trailing-slash
@@ -1383,11 +1596,11 @@ mod tests {
         std::fs::remove_dir_all(&base).unwrap();
     }
 
-    /// The parse rule used by `load_user_ssh_config` must keep `ProxyJump`
-    /// visible: with only ALLOW_UNKNOWN_FIELDS the crate eats the field, so no
-    /// warning is possible and the run silently connects to the wrong address.
+    /// `ProxyJump` is implemented now, so it must NOT be reported as an
+    /// unimplemented routing directive — but it must still be visible through
+    /// `proxy_jump_specs`, which relies on the same crate field.
     #[test]
-    fn test_unimplemented_routing_sees_proxyjump() {
+    fn test_proxy_jump_is_parsed_not_warned() {
         let text = "Host behind-jump\n  HostName 10.30.40.4\n  ProxyJump js4\n";
 
         let mut reader = std::io::BufReader::new(text.as_bytes());
@@ -1397,18 +1610,235 @@ mod tests {
                 ParseRule::ALLOW_UNKNOWN_FIELDS | ParseRule::ALLOW_UNSUPPORTED_FIELDS,
             )
             .unwrap();
-        assert_eq!(
-            unimplemented_routing(&config.query("behind-jump")),
-            vec!["proxyjump=js4".to_string()]
+        let params = config.query("behind-jump");
+        assert_eq!(proxy_jump_specs(&params), vec!["js4".to_string()]);
+        assert!(
+            unimplemented_routing(&params).is_empty(),
+            "ProxyJump is implemented; only ProxyCommand still warns"
         );
 
+        // Without ALLOW_UNSUPPORTED_FIELDS the directive disappears entirely —
+        // this is the silent-ignore trap both helpers exist to avoid.
         let mut reader = std::io::BufReader::new(text.as_bytes());
         let config = SshConfig::default()
             .parse(&mut reader, ParseRule::ALLOW_UNKNOWN_FIELDS)
             .unwrap();
+        assert!(proxy_jump_specs(&config.query("behind-jump")).is_empty());
+    }
+
+    #[test]
+    fn test_proxy_jump_specs_forms() {
+        let parse = |text: &str, alias: &str| {
+            let mut reader = std::io::BufReader::new(text.as_bytes());
+            let config = SshConfig::default()
+                .parse(
+                    &mut reader,
+                    ParseRule::ALLOW_UNKNOWN_FIELDS | ParseRule::ALLOW_UNSUPPORTED_FIELDS,
+                )
+                .unwrap();
+            proxy_jump_specs(&config.query(alias))
+        };
+        // Comma chain, and each element keeps its own shape.
+        assert_eq!(
+            parse("Host a\n  ProxyJump one,two\n", "a"),
+            vec!["one".to_string(), "two".to_string()]
+        );
+        assert_eq!(
+            parse("Host a\n  ProxyJump root@jump.example:2222\n", "a"),
+            vec!["root@jump.example:2222".to_string()]
+        );
+        // `none` disables jumping, including one set by an earlier matching block.
+        assert!(parse("Host a\n  ProxyJump none\n", "a").is_empty());
+        assert!(parse("Host a\n  ProxyJump NONE\n", "a").is_empty());
+        assert!(parse("Host a\n  HostName 1.2.3.4\n", "a").is_empty());
+    }
+
+    /// A jump chain flattens into connection order, and a jump host that itself
+    /// jumps contributes its own chain first (nebula99 → lyg2004 → js4 shape).
+    #[test]
+    fn test_resolve_jump_chain_flattens_recursively() {
+        let text = "\
+Host nebula99\n  HostName 154.57.56.2\n  Port 8122\n  ProxyJump lyg2004\n\
+Host lyg2004\n  HostName 10.30.40.4\n  ProxyJump js4\n\
+Host js4\n  HostName 192.168.4.70\n  Port 42200\n  User zengqixin\n";
+        let mut reader = std::io::BufReader::new(text.as_bytes());
+        let config = SshConfig::default()
+            .parse(
+                &mut reader,
+                ParseRule::ALLOW_UNKNOWN_FIELDS | ParseRule::ALLOW_UNSUPPORTED_FIELDS,
+            )
+            .unwrap();
+
+        let (chain, specs) = resolve_jump_chain(&config.query("nebula99"), &config, 0).unwrap();
+        let hops: Vec<(String, u16, Option<String>)> = chain
+            .iter()
+            .map(|h| (h.hostname.clone(), h.port.unwrap_or(22), h.user.clone()))
+            .collect();
+        assert_eq!(
+            hops,
+            vec![
+                (
+                    "192.168.4.70".to_string(),
+                    42200,
+                    Some("zengqixin".to_string())
+                ),
+                ("10.30.40.4".to_string(), 22, None),
+            ],
+            "outermost hop first: js4, then lyg2004"
+        );
+        assert!(chain.iter().all(|h| h.jump.is_empty()), "chains are flat");
+        // The raw specs are what `rsync -e ssh -J …` must receive: aliases, so
+        // that ssh applies each hop's own config block.
+        assert_eq!(specs, vec!["js4".to_string(), "lyg2004".to_string()]);
+
+        // A literal jump target needs no config entry (`ssh -J user@host:port`).
+        let text = "Host a\n  ProxyJump ops@jump.example:2222\n";
+        let mut reader = std::io::BufReader::new(text.as_bytes());
+        let config = SshConfig::default()
+            .parse(
+                &mut reader,
+                ParseRule::ALLOW_UNKNOWN_FIELDS | ParseRule::ALLOW_UNSUPPORTED_FIELDS,
+            )
+            .unwrap();
+        let (chain, specs) = resolve_jump_chain(&config.query("a"), &config, 0).unwrap();
+        assert_eq!(chain.len(), 1);
+        assert_eq!(chain[0].hostname, "jump.example");
+        assert_eq!(chain[0].port, Some(2222));
+        assert_eq!(chain[0].user.as_deref(), Some("ops"));
+        assert_eq!(specs, vec!["ops@jump.example:2222".to_string()]);
+
+        // `-J` argument: specs when recorded, resolved hops otherwise.
+        let mut target = RemoteHost {
+            hostname: "154.57.56.2".to_string(),
+            port: Some(8122),
+            user: None,
+            identity_file: None,
+            jump: chain.clone(),
+            jump_specs: specs,
+            alias: None,
+        };
+        assert_eq!(
+            jump_j_arg(&target).as_deref(),
+            Some("ops@jump.example:2222")
+        );
+        target.jump_specs.clear();
+        assert_eq!(
+            jump_j_arg(&target).as_deref(),
+            Some("ops@jump.example:2222")
+        );
+        assert_eq!(
+            jump_j_arg(&RemoteHost {
+                jump: Vec::new(),
+                ..target.clone()
+            }),
+            None,
+            "a direct host has no -J argument"
+        );
+    }
+
+    /// The rsync hand-off must give the ssh rsync spawns everything it needs:
+    /// the alias for a config host (so that host's own block applies — keys,
+    /// port and ProxyJump), and the resolved address plus `-J` only for a
+    /// literal target.
+    #[test]
+    fn test_rsync_endpoint_hands_over_alias_or_j_chain() {
+        let js4 = RemoteHost {
+            hostname: "192.168.4.70".to_string(),
+            port: Some(42200),
+            user: Some("zengqixin".to_string()),
+            identity_file: None,
+            jump: Vec::new(),
+            jump_specs: Vec::new(),
+            alias: Some("js4".to_string()),
+        };
+        let alias_target = RemoteHost {
+            hostname: "10.30.40.4".to_string(),
+            port: Some(22),
+            user: Some("zengqixin".to_string()),
+            identity_file: None,
+            jump: vec![js4],
+            jump_specs: vec!["js4".to_string()],
+            alias: Some("lyg2004".to_string()),
+        };
+        assert_eq!(
+            rsync_endpoint(&alias_target),
+            ("lyg2004".to_string(), String::new()),
+            "an alias goes to rsync as-is; ssh applies its config and ProxyJump"
+        );
+
+        let literal = RemoteHost {
+            alias: None,
+            ..alias_target.clone()
+        };
+        assert_eq!(
+            rsync_endpoint(&literal),
+            ("zengqixin@10.30.40.4".to_string(), " -J js4".to_string())
+        );
+
+        let direct = RemoteHost {
+            jump: Vec::new(),
+            jump_specs: Vec::new(),
+            ..literal.clone()
+        };
+        assert_eq!(
+            rsync_endpoint(&direct),
+            ("zengqixin@10.30.40.4".to_string(), String::new())
+        );
+    }
+
+    /// A config cycle must fail loudly instead of recursing forever.
+    #[test]
+    fn test_resolve_jump_chain_depth_limit() {
+        let text = "Host a\n  ProxyJump b\nHost b\n  ProxyJump a\n";
+        let mut reader = std::io::BufReader::new(text.as_bytes());
+        let config = SshConfig::default()
+            .parse(
+                &mut reader,
+                ParseRule::ALLOW_UNKNOWN_FIELDS | ParseRule::ALLOW_UNSUPPORTED_FIELDS,
+            )
+            .unwrap();
+        let err = resolve_jump_chain(&config.query("a"), &config, 0).unwrap_err();
         assert!(
-            unimplemented_routing(&config.query("behind-jump")).is_empty(),
-            "documents why ALLOW_UNSUPPORTED_FIELDS is required"
+            err.to_string().contains("ProxyJump chain"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_jump_chain_label() {
+        let mut target = RemoteHost {
+            hostname: "154.57.56.2".to_string(),
+            port: Some(8122),
+            user: None,
+            identity_file: None,
+            jump: Vec::new(),
+            jump_specs: Vec::new(),
+            alias: None,
+        };
+        assert_eq!(jump_chain_label(&target), "direct");
+        target.jump = vec![
+            RemoteHost {
+                hostname: "192.168.4.70".to_string(),
+                port: Some(42200),
+                user: None,
+                identity_file: None,
+                jump: Vec::new(),
+                jump_specs: Vec::new(),
+                alias: None,
+            },
+            RemoteHost {
+                hostname: "10.30.40.4".to_string(),
+                port: None,
+                user: None,
+                identity_file: None,
+                jump: Vec::new(),
+                jump_specs: Vec::new(),
+                alias: None,
+            },
+        ];
+        assert_eq!(
+            jump_chain_label(&target),
+            "via 192.168.4.70:42200 → 10.30.40.4:22"
         );
     }
 
@@ -3568,6 +3998,9 @@ async fn plan_command(
     // The plan body IS the command's purpose (like `list`'s table), so it goes
     // to stdout in every mode; the same decisions are recorded in the trace.
     println!("plan: {host} ({})", resolved_label(remote));
+    if !remote.jump.is_empty() {
+        println!("  route:    {}", jump_chain_label(remote));
+    }
     println!("  platform: {platform_label}");
     println!("  worker:   remote {remote_label}; local {local_version}");
     println!("  deploy:   {deploy}");
@@ -3594,6 +4027,7 @@ async fn plan_command(
     );
     println!("  note: plan only — connected and probed; nothing was executed or deployed.");
 
+    trace.add(format!("plan: route {}", jump_chain_label(remote)));
     trace.add(format!("plan: platform {platform_label}"));
     trace.add(format!(
         "plan: worker remote {remote_label} vs local {local_version}"
