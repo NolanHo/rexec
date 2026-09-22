@@ -831,6 +831,36 @@ mod tests {
         dir
     }
 
+    /// Set a *directory's* mtime to `when`.
+    ///
+    /// `prune` reads run-dir mtimes from the filesystem, so the tests have to
+    /// age a directory. On Unix any open handle can `futimens` (the test owns
+    /// the tree), so a read-only `File::open` works. On Windows a read-only
+    /// handle cannot set file times (ERROR_ACCESS_DENIED — the reason the
+    /// Windows CI job failed), and opening a directory at all needs
+    /// FILE_FLAG_BACKUP_SEMANTICS plus FILE_WRITE_ATTRIBUTES.
+    #[cfg(unix)]
+    fn set_dir_mtime(path: &Path, when: SystemTime) {
+        std::fs::File::open(path)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(when))
+            .unwrap();
+    }
+
+    #[cfg(windows)]
+    fn set_dir_mtime(path: &Path, when: SystemTime) {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+        const FILE_WRITE_ATTRIBUTES: u32 = 0x0100;
+        std::fs::OpenOptions::new()
+            .access_mode(FILE_WRITE_ATTRIBUTES)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+            .open(path)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(when))
+            .unwrap();
+    }
+
     fn entry(id: &str, mtime_secs: u64, size: u64) -> RunEntry {
         RunEntry {
             id: id.to_string(),
@@ -1243,7 +1273,6 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn test_prune_age_phase_removes_only_old_runs() {
-        use std::fs::FileTimes;
         use std::time::Duration;
 
         let root = TempRoot::new("prune-age");
@@ -1259,10 +1288,7 @@ mod tests {
         // Age the older run by 10 days; keep_days = 7 must then drop it while
         // the fresh run survives well under the (unlimited) size budget.
         let when = SystemTime::now() - Duration::from_secs(10 * SECS_PER_DAY);
-        std::fs::File::open(&old)
-            .unwrap()
-            .set_times(FileTimes::new().set_modified(when))
-            .unwrap();
+        set_dir_mtime(&old, when);
 
         let (removed, freed) = prune_in(root.path(), 7, u64::MAX).unwrap();
         assert_eq!(removed, 1);
@@ -1276,7 +1302,6 @@ mod tests {
 
     #[test]
     fn test_prune_age_phase_keeps_the_only_old_run() {
-        use std::fs::FileTimes;
         use std::time::Duration;
 
         // A lone run older than the cutoff is the only history there is; the
@@ -1290,10 +1315,7 @@ mod tests {
         std::fs::write(&idx, raw.as_bytes()).unwrap();
 
         let when = SystemTime::now() - Duration::from_secs(40 * SECS_PER_DAY);
-        std::fs::File::open(&only)
-            .unwrap()
-            .set_times(FileTimes::new().set_modified(when))
-            .unwrap();
+        set_dir_mtime(&only, when);
 
         let (removed, freed) = prune_in(root.path(), 30, u64::MAX).unwrap();
         assert_eq!(
@@ -1311,7 +1333,6 @@ mod tests {
 
     #[test]
     fn test_prune_index_rewrite_failure_deletes_nothing() {
-        use std::fs::FileTimes;
         use std::time::Duration;
 
         // The index is rewritten BEFORE any directory is deleted: a failure
@@ -1330,10 +1351,7 @@ mod tests {
         // Age only the OLDER run: the newest is protected, so the age phase
         // evicts exactly one run and therefore has to rewrite the index.
         let when = SystemTime::now() - Duration::from_secs(40 * SECS_PER_DAY);
-        std::fs::File::open(&old)
-            .unwrap()
-            .set_times(FileTimes::new().set_modified(when))
-            .unwrap();
+        set_dir_mtime(&old, when);
 
         // Block the atomic rewrite: `index.jsonl.tmp` cannot be created as a
         // file while a directory sits there.
