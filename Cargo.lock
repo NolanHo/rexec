@@ -1613,6 +1613,7 @@ dependencies = [
  "russh",
  "russh-keys",
  "russh-sftp",
+ "serde",
  "ssh2-config",
  "tokio",
 ]

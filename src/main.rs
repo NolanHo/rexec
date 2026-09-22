@@ -8,6 +8,7 @@ use clap::{Parser, Subcommand};
 use russh::ChannelMsg;
 use ssh2_config::{ParseRule, SshConfig};
 
+mod diagnostics;
 mod protocol;
 mod remote;
 mod ssh;
@@ -46,6 +47,15 @@ struct Cli {
     /// Suppress progress/status output (Remote PID, exit, sync, reconnect)
     #[arg(short = 'q', long = "quiet", global = true)]
     quiet: bool,
+
+    /// Print the decision trace (resolution, auth, deploy) even on success;
+    /// errors always carry it
+    #[arg(short = 'v', long = "verbose", global = true)]
+    verbose: bool,
+
+    /// Emit a single-line machine-readable result summary on stderr
+    #[arg(long = "json", global = true)]
+    json: bool,
 
     #[command(subcommand)]
     action: Action,
@@ -1774,6 +1784,10 @@ fn list_hosts(alias: Option<&str>) -> Result<()> {
 async fn main() -> Result<()> {
     let cli = Cli::parse();
     QUIET.store(cli.quiet, Ordering::Relaxed);
+    diagnostics::OUTPUT_MODE.store(
+        diagnostics::OutputMode::from_flags(cli.quiet, cli.verbose).as_u8(),
+        Ordering::Relaxed,
+    );
 
     match (cli.host, cli.action, cli.port) {
         // ── Local operations ──
