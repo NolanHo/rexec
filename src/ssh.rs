@@ -16,8 +16,10 @@ use crate::RemoteHost;
 /// Public GitHub repository hosting prebuilt worker releases. When the remote
 /// platform differs from the local one, the worker binary for the remote is
 /// downloaded from this repository's Releases instead of deploying the local
-/// (incompatible) binary.
-const GITHUB_REPO: &str = "Menghuan1918/rexec";
+/// (incompatible) binary. This fork builds its own release assets (upstream
+/// does not carry this fork's versions) — keep in sync with wherever releases
+/// are actually published.
+const GITHUB_REPO: &str = "NolanHo/rexec";
 
 /// Attempt to load a private key from a path.
 ///
