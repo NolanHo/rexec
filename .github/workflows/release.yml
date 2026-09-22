@@ -9,7 +9,10 @@
 # linked against musl so the worker runs on any distro regardless of its
 # glibc version (e.g. servers on glibc 2.35 can't run ubuntu-24.04-built
 # binaries). macos-amd64 is cross-compiled on an arm64 runner (the intel
-# macos-13 runners are retired).
+# macos-13 runners are retired). windows-amd64 builds the MSVC target; `bin`
+# names the built binary because Windows produces remote-exec.exe while the
+# release asset itself stays extension-less (rexec-windows-amd64), matching
+# the `rexec-<os>-<arch>` convention the downloader expects.
 #
 # workflow_dispatch lets you rebuild the assets for an already-released tag.
 on:
@@ -18,7 +21,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Tag to rebuild assets for (e.g. v0.2.0)"
+        description: "Tag to rebuild assets for (e.g. v0.3.0)"
         required: true
 
 permissions:
@@ -35,15 +38,30 @@ jobs:
           - runs_on: ubuntu-latest
             asset: rexec-linux-amd64
             target: x86_64-unknown-linux-musl
+            bin: remote-exec
           - runs_on: ubuntu-24.04-arm
             asset: rexec-linux-arm64
             target: aarch64-unknown-linux-musl
+            bin: remote-exec
           - runs_on: macos-latest
             asset: rexec-macos-amd64
             target: x86_64-apple-darwin
+            bin: remote-exec
           - runs_on: macos-latest
             asset: rexec-macos-arm64
             target: aarch64-apple-darwin
+            bin: remote-exec
+          - runs_on: windows-latest
+            asset: rexec-windows-amd64
+            target: x86_64-pc-windows-msvc
+            bin: remote-exec.exe
+          # Cross-compiled on the x64 runner (MSVC supports arm64 targets);
+          # fail-fast: false keeps the other assets safe if this toolchain
+          # component is ever missing on the runner.
+          - runs_on: windows-latest
+            asset: rexec-windows-arm64
+            target: aarch64-pc-windows-msvc
+            bin: remote-exec.exe
     steps:
       - uses: actions/checkout@v4
         with:
@@ -60,7 +78,10 @@ jobs:
       - run: cargo build --release --locked --target ${{ matrix.target }}
 
       - name: Rename binary to asset name
-        run: cp target/${{ matrix.target }}/release/remote-exec ${{ matrix.asset }}
+        # bash exists on every GH runner (incl. windows-latest), so the same
+        # `cp` works everywhere — pwsh has no `cp` and would need Copy-Item.
+        shell: bash
+        run: cp target/${{ matrix.target }}/release/${{ matrix.bin }} ${{ matrix.asset }}
 
       - uses: softprops/action-gh-release@v2
         with:

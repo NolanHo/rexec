@@ -8,6 +8,8 @@ use russh::keys::HashAlg;
 use russh::keys::PrivateKey;
 use russh::keys::PrivateKeyWithHashAlg;
 use russh::{ChannelMsg, client::AuthResult};
+use russh_sftp::client::SftpSession;
+use tokio::io::AsyncWriteExt;
 
 use crate::RemoteHost;
 
@@ -104,6 +106,10 @@ async fn authenticate(
 }
 
 /// Try to authenticate via SSH agent.
+/// Windows: russh 0.51's agent client only speaks the Unix domain-socket
+/// protocol (connect_env is unix-only); the named-pipe Windows agent is not
+/// supported — fall through to identity-file auth with a clear error.
+#[cfg(unix)]
 async fn try_agent_auth(session: &mut client::Handle<ClientHandler>, user: &str) -> Result<()> {
     let mut agent = russh::keys::agent::client::AgentClient::connect_env()
         .await
@@ -121,6 +127,20 @@ async fn try_agent_auth(session: &mut client::Handle<ClientHandler>, user: &str)
     }
 
     Err(anyhow!("no agent identity was accepted"))
+}
+
+#[cfg(windows)]
+async fn try_agent_auth(_session: &mut client::Handle<ClientHandler>, _user: &str) -> Result<()> {
+    // NOTE: this error is currently SWALLOWED by the caller's `.is_ok()`
+    // probe — the user sees the generic "all authentication methods failed",
+    // not this message. Kept as an Err so agent auth is explicitly skipped
+    // on Windows locals (identity-file auth follows). russh 0.51's agent
+    // client only speaks the Unix domain-socket protocol (`connect_env` is
+    // unix-only); wiring the Windows named-pipe agent (Pageant/OpenSSH agent
+    // via `connect_pageant`) is a possible follow-up.
+    Err(anyhow!(
+        "SSH agent auth is not supported on Windows (unix socket only) — use an identity file"
+    ))
 }
 
 /// SSH client handler with known_hosts verification (accept-new semantics).
@@ -219,7 +239,42 @@ pub async fn connect(remote: &RemoteHost) -> Result<client::Handle<ClientHandler
     Ok(session)
 }
 
-/// Upload a worker binary to ~/.rexec/rexec on the remote host.
+/// Home directory of a WINDOWS remote, as a native `C:\Users\...` path.
+///
+/// `%USERPROFILE%` is probed FIRST (via explicit `cmd /c`, so a PowerShell
+/// default shell still expands it) because this commit's Windows deploy paths
+/// need backslash-absolute Windows paths: a Git-Bash default shell would
+/// answer `$HOME` with an MSYS-style `/c/Users/...` (or the literal `$HOME`
+/// when printf resolves from Git's usr/bin), which would poison the SFTP
+/// target. Any answer that is not a drive-letter path is rejected so the
+/// caller fails loudly instead of uploading to an impossible path.
+async fn remote_home_windows(session: &client::Handle<ClientHandler>) -> Result<String> {
+    let profile = exec_remote(session, "cmd /c \"echo %USERPROFILE%\"").await?;
+    let profile = profile.trim().trim_matches('"');
+    let is_drive_path = profile
+        .get(0..2)
+        .is_some_and(|p| p.as_bytes()[0].is_ascii_alphabetic() && p.as_bytes()[1] == b':');
+    if is_drive_path {
+        return Ok(profile.to_string());
+    }
+
+    // Fall back to $HOME in case someone replaced cmd; same drive-path check.
+    let home = exec_remote(session, "printf %s \"$HOME\"").await?;
+    let home = home.trim();
+    let is_drive_path = home
+        .get(0..2)
+        .is_some_and(|p| p.as_bytes()[0].is_ascii_alphabetic() && p.as_bytes()[1] == b':');
+    if is_drive_path {
+        return Ok(home.to_string());
+    }
+
+    Err(anyhow!(
+        "could not determine a native Windows home directory on the remote \
+         (%USERPROFILE% and $HOME are both non-drive-letter paths)"
+    ))
+}
+
+/// Upload a worker binary to ~/.rexec/rexec on a Linux/macOS remote host.
 ///
 /// `src_path` is either the locally running binary (same platform as the
 /// remote) or a prebuilt release artifact downloaded for the remote platform.
@@ -228,6 +283,7 @@ pub async fn connect(remote: &RemoteHost) -> Result<client::Handle<ClientHandler
 /// binary through a russh channel. Streaming a multi-MB payload via
 /// `channel.data()` deadlocks on channel flow control once the send window is
 /// exhausted, leaving a truncated remote binary that segfaults on launch.
+/// Windows remotes have no rsync — see `upload_binary_sftp`.
 pub async fn upload_binary(
     session: &mut client::Handle<ClientHandler>,
     host: &str,
@@ -258,7 +314,18 @@ pub async fn upload_binary(
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::piped())
         .spawn()
-        .context("failed to spawn rsync for worker upload")?;
+        .map_err(|e| {
+            // A Windows-local → Linux-remote deploy runs rsync from the local
+            // CLI; without MSYS2/WSL there is no rsync to spawn.
+            if e.kind() == std::io::ErrorKind::NotFound && cfg!(windows) {
+                anyhow::Error::new(e).context(
+                    "rsync not found — install it via MSYS2 (pacman -S rsync) or use WSL; \
+                     worker deploy to Linux/macOS remotes needs it",
+                )
+            } else {
+                anyhow::Error::new(e).context("failed to spawn rsync for worker upload")
+            }
+        })?;
 
     let output = tokio::time::timeout(Duration::from_secs(300), child.wait_with_output())
         .await
@@ -279,28 +346,195 @@ pub async fn upload_binary(
     Ok(())
 }
 
+/// Upload the worker binary to `<home>\.rexec\rexec.exe` over SFTP.
+///
+/// Windows remotes have neither rsync nor `chmod`, so the binary is written
+/// through the SFTP subsystem instead. `home` is the remote profile directory
+/// already resolved by `remote_home_windows`.
+async fn upload_binary_sftp(
+    session: &client::Handle<ClientHandler>,
+    src_path: &Path,
+    home: &str,
+) -> Result<()> {
+    // Remote paths are plain strings, so build them with Windows separators for
+    // the Windows remote; `Path::join` would use the *local* separator instead.
+    let home = home.trim_end_matches('\\');
+    let dir = format!("{home}\\.rexec");
+    let logs_dir = format!("{dir}\\logs");
+    let exe_path = format!("{dir}\\rexec.exe");
+    let tmp_path = format!("{exe_path}.tmp");
+    let old_path = format!("{exe_path}.old");
+
+    let data = std::fs::read(src_path)
+        .with_context(|| format!("reading worker binary {}", src_path.display()))?;
+
+    // The SFTP subsystem needs a channel of its own: an `exec` channel cannot be
+    // turned into a subsystem afterwards.
+    let channel = session
+        .channel_open_session()
+        .await
+        .context("opening SFTP channel")?;
+    channel
+        .request_subsystem(true, "sftp")
+        .await
+        .context("requesting the sftp subsystem (is it enabled in the remote sshd config?)")?;
+    let sftp = SftpSession::new(channel.into_stream())
+        .await
+        .context("starting SFTP session")?;
+
+    // `create_dir` fails when the directory already exists, which is the normal
+    // case on redeploys; a genuinely missing parent is reported by the file
+    // creation below, so these results are deliberately ignored.
+    let _ = sftp.create_dir(dir.as_str()).await;
+    let _ = sftp.create_dir(logs_dir.as_str()).await;
+
+    // Upload to a temp name, then swap into place. Windows locks a RUNNING
+    // executable against write/delete, but renaming it away is allowed — so
+    // in-place truncate-open (`create`) would fail with a sharing violation
+    // whenever a worker from a previous run is still alive. The swap is:
+    //   write <exe>.tmp → rename <exe> to <exe>.old → rename <exe>.tmp to <exe>
+    // A crash mid-way leaves at most a stale .tmp/.old, which the next deploy
+    // overwrites — never a truncated <exe>.
+    let mut file = sftp
+        .create(tmp_path.as_str())
+        .await
+        .with_context(|| format!("creating {tmp_path} over SFTP"))?;
+    file.write_all(&data)
+        .await
+        .with_context(|| format!("writing {tmp_path} over SFTP"))?;
+    // `shutdown` closes the remote file handle; skipping it can drop the last
+    // write requests when the session is dropped. `flush` only does work when
+    // the server advertises the fsync extension, but costs nothing.
+    file.flush().await.context("flushing uploaded worker")?;
+    file.shutdown().await.context("closing uploaded worker")?;
+
+    let _ = sftp.remove_file(old_path.as_str()).await; // stale swap target from an earlier deploy
+    let _ = sftp.rename(exe_path.as_str(), old_path.as_str()).await; // allowed even while running
+    sftp.rename(tmp_path.as_str(), exe_path.as_str())
+        .await
+        .with_context(|| format!("swapping {tmp_path} into {exe_path}"))?;
+
+    // Verify the remote size: a truncated worker only fails later, at launch
+    // time (see the flow-control note on `upload_binary`).
+    if let Some(remote_len) = sftp
+        .metadata(exe_path.as_str())
+        .await
+        .with_context(|| format!("verifying {exe_path} after upload"))?
+        .size
+        && remote_len != data.len() as u64
+    {
+        return Err(anyhow!(
+            "worker upload to {exe_path} is incomplete: {remote_len} of {} bytes",
+            data.len()
+        ));
+    }
+
+    // Best effort: the upload is complete at this point, so a failed close must
+    // not mask it.
+    let _ = sftp.close().await;
+
+    Ok(())
+}
+
+/// What `ensure_remote_binary` learned about the remote — callers need it to
+/// build platform-correct launch commands (POSIX `~` does not expand under
+/// cmd.exe/PowerShell, and Windows paths need quoting).
+pub struct RemoteEnv {
+    pub is_windows: bool,
+    /// Absolute home path for Windows remotes (`C:\Users\...`); empty for
+    /// POSIX remotes, whose launch commands use `~` literally.
+    pub home: String,
+}
+
+impl RemoteEnv {
+    /// The `channel.exec` command that starts the worker on this remote.
+    pub fn worker_command(&self) -> String {
+        if self.is_windows {
+            // Explicit `cmd /c` (a bare quoted path is a parse error under a
+            // PowerShell default shell). Verified shape for cmd.exe — the
+            // OpenSSH-for-Windows DEFAULT shell: its /c quote-stripping
+            // (cmd /? rule 2) turns `""<path>" args"` into `"<path>" args`.
+            // KNOWN LIMITATION: under a PowerShell DefaultShell this only
+            // works for space-less profile paths (PS argument-mode parsing
+            // closes the `""` immediately and splits at the unquoted space —
+            // see PowerShell/Win32-OpenSSH#1082). Windows remotes are
+            // experimental; cmd.exe is the supported default.
+            format!(
+                "cmd /c \"\"{}\\.rexec\\rexec.exe\" worker\"",
+                self.home.trim_end_matches('\\')
+            )
+        } else {
+            "~/.rexec/rexec worker".to_string()
+        }
+    }
+
+    /// The `channel.exec` command that attaches to a running worker.
+    pub fn attach_command(&self, pid: u32, offset: u64) -> String {
+        if self.is_windows {
+            format!(
+                "cmd /c \"\"{}\\.rexec\\rexec.exe\" attach --pid {} --offset {}\"",
+                self.home.trim_end_matches('\\'),
+                pid,
+                offset
+            )
+        } else {
+            format!("~/.rexec/rexec attach --pid {pid} --offset {offset}")
+        }
+    }
+}
+
 /// Ensure the remote host has a matching rexec binary. Upload if missing or outdated.
 ///
 /// The worker source is chosen by platform: when the remote OS/arch matches the
 /// local one, the running binary itself is deployed; otherwise (e.g. macOS
 /// local → Linux remote) a prebuilt worker is downloaded from GitHub Releases
 /// first — the local binary would not run on the remote.
+///
+/// Returns the remote's platform environment so the caller can launch the
+/// worker with a platform-correct command.
 pub async fn ensure_remote_binary(
     session: &mut client::Handle<ClientHandler>,
     host: &str,
-) -> Result<()> {
+) -> Result<RemoteEnv> {
     let local_version = env!("CARGO_PKG_VERSION");
     let expected = format!("rexec {}", local_version);
 
-    // Check remote version
-    let remote_output = exec_remote(session, "~/.rexec/rexec --version 2>/dev/null").await?;
-    let remote_version = remote_output.trim();
+    // Detect the platform FIRST: the POSIX probe below must not run on a
+    // Windows remote — `2>/dev/null` is not a cmd/PowerShell redirect (cmd
+    // would create a stray `<drive>:\dev\null` when `<drive>:\dev` exists),
+    // and the round trip is wasted there anyway.
+    let remote_asset = detect_remote_asset(session).await?;
+    let is_windows = remote_asset.starts_with("windows-");
 
-    if remote_version == expected {
-        return Ok(()); // Already up to date
+    if is_windows {
+        let home = remote_home_windows(session).await?;
+        // Probe via explicit `cmd /c`: a bare quoted path is a parse error
+        // under a PowerShell default shell (it would need the & call
+        // operator), which would make this probe ALWAYS look failed and
+        // re-upload the worker on every run.
+        let probe = format!(
+            "cmd /c \"\"{}\\.rexec\\rexec.exe\" --version\"",
+            home.trim_end_matches('\\')
+        );
+        let up_to_date = exec_remote(session, &probe).await?.trim() == expected;
+        if up_to_date {
+            return Ok(RemoteEnv {
+                is_windows: true,
+                home,
+            });
+        }
+    } else {
+        // Check remote version. This probe needs a POSIX shell and `~`
+        // expansion — guaranteed on the Linux/macOS remotes detected above.
+        let remote_output = exec_remote(session, "~/.rexec/rexec --version 2>/dev/null").await?;
+        if remote_output.trim() == expected {
+            return Ok(RemoteEnv {
+                is_windows: false,
+                home: String::new(),
+            }); // Already up to date
+        }
     }
 
-    let remote_asset = detect_remote_asset(session).await?;
     let src_path = if remote_asset == local_asset() {
         // Same platform: deploy the running binary. Canonicalize so a
         // symlinked install (e.g. `cargo install`) isn't copied as a link by
@@ -313,10 +547,24 @@ pub async fn ensure_remote_binary(
         download_worker(&remote_asset).await?
     };
 
-    // Upload binary
-    upload_binary(session, host, &src_path).await?;
+    // Upload binary: Windows has no rsync, so it takes the SFTP path with the
+    // `.exe` worker name.
+    let env = if is_windows {
+        let home = remote_home_windows(session).await?;
+        upload_binary_sftp(session, &src_path, &home).await?;
+        RemoteEnv {
+            is_windows: true,
+            home,
+        }
+    } else {
+        upload_binary(session, host, &src_path).await?;
+        RemoteEnv {
+            is_windows: false,
+            home: String::new(),
+        }
+    };
     crate::status!("✓ Deployed rexec v{} to remote", local_version);
-    Ok(())
+    Ok(env)
 }
 
 /// Release-asset suffix for the platform rexec is running on,
@@ -330,28 +578,77 @@ fn local_asset() -> String {
     format!("{}-{arch}", std::env::consts::OS)
 }
 
-/// Map `uname -sm` output (e.g. "Linux x86_64") to a release-asset suffix
-/// (e.g. "linux-amd64"). Only Linux remotes are supported.
-fn uname_asset(uname: &str) -> Result<String> {
-    let mut parts = uname.split_whitespace();
-    let arch = match (parts.next(), parts.next()) {
-        (Some("Linux"), Some("x86_64")) => "amd64",
-        (Some("Linux"), Some("aarch64")) => "arm64",
-        _ => {
-            return Err(anyhow!(
-                "remote platform {:?} is not supported — the remote must be Linux (amd64/arm64)",
-                uname.trim()
-            ));
-        }
+/// Map remote platform probe output to a release-asset suffix (e.g.
+/// "linux-amd64", "windows-arm64").
+///
+/// Accepts either `uname -sm` output ("Linux x86_64", "Darwin arm64") or the
+/// Windows probe output ("Windows_NT AMD64", see `detect_remote_asset`).
+fn uname_asset(probe: &str) -> Result<String> {
+    let tokens: Vec<&str> = probe.split_whitespace().collect();
+
+    // Windows probe output. The marker is searched for instead of being read
+    // from a fixed position so leading or trailing text cannot defeat detection.
+    if tokens.contains(&"Windows_NT") {
+        let arch = if tokens.contains(&"AMD64") {
+            "amd64"
+        } else if tokens.contains(&"ARM64") {
+            "arm64"
+        } else {
+            return Err(unsupported_platform(probe));
+        };
+        return Ok(format!("windows-{arch}"));
+    }
+
+    let asset = match (tokens.first(), tokens.get(1)) {
+        (Some(&"Linux"), Some(&"x86_64")) => "linux-amd64",
+        (Some(&"Linux"), Some(&"aarch64")) => "linux-arm64",
+        (Some(&"Darwin"), Some(&"x86_64")) => "macos-amd64",
+        (Some(&"Darwin"), Some(&"arm64")) => "macos-arm64",
+        _ => return Err(unsupported_platform(probe)),
     };
-    Ok(format!("linux-{arch}"))
+    Ok(asset.to_string())
 }
 
-/// Detect the remote platform via `uname -sm` and map it to a release-asset
-/// suffix (e.g. "linux-amd64").
+/// Error for a remote platform rexec ships no worker binary for.
+fn unsupported_platform(probe: &str) -> anyhow::Error {
+    anyhow!(
+        "remote platform {:?} is not supported — the remote must be Linux (x86_64/aarch64), \
+         macOS (x86_64/arm64), or Windows (AMD64/ARM64)",
+        probe.trim()
+    )
+}
+
+/// Detect the remote platform and map it to a release-asset suffix
+/// (e.g. "linux-amd64", "windows-amd64").
+///
+/// POSIX remotes answer `uname -sm`. Windows remotes have no `uname`, so when
+/// that probe yields nothing the platform is asked of `cmd.exe` instead. `cmd`
+/// is invoked explicitly because the remote's default SSH shell may be
+/// PowerShell, where `%PROCESSOR_ARCHITECTURE%` is not expanded by the shell
+/// itself but a nested `cmd /c` does expand it.
 async fn detect_remote_asset(session: &client::Handle<ClientHandler>) -> Result<String> {
+    // `exec_remote` discards the exit status, so a missing `uname` surfaces as
+    // empty stdout rather than an error. A Git-for-Windows remote (default
+    // shell = Git Bash) HAS a uname that prints e.g. "MINGW64_NT-10.0 ...",
+    // which uname_asset rejects — so fall back to the cmd probe whenever the
+    // uname output cannot be mapped, not only when it is empty.
     let uname = exec_remote(session, "uname -sm").await?;
-    uname_asset(&uname)
+    if !uname.trim().is_empty()
+        && let Ok(asset) = uname_asset(&uname)
+    {
+        return Ok(asset);
+    }
+
+    let windows = exec_remote(
+        session,
+        r#"cmd /c "echo Windows_NT %PROCESSOR_ARCHITECTURE%""#,
+    )
+    .await?;
+    uname_asset(&windows).map_err(|e| {
+        anyhow!(
+            "remote platform could not be detected (uname: {uname:?}, cmd probe: {windows:?}): {e}"
+        )
+    })
 }
 
 /// Download the prebuilt worker for `asset` (e.g. "linux-amd64") from GitHub
@@ -431,10 +728,22 @@ pub async fn exec_remote(session: &client::Handle<ClientHandler>, command: &str)
 
 /// Check remote dependencies and install if missing.
 ///
-/// Required: rsync, sh. The worker uses SIGHUP ignoring via libc,
-/// not the `nohup` command, so nohup is no longer a dependency.
+/// Required on Linux/macOS: rsync, sh. The worker uses SIGHUP ignoring via
+/// libc, not the `nohup` command, so nohup is no longer a dependency.
+///
+/// Windows remotes have neither rsync nor sh — and the deploy path uploads over
+/// SFTP there — so only `cmd` is required. It ships with the OS and cannot be
+/// installed, hence the check never installs anything.
 pub async fn check_and_install_deps(session: &mut client::Handle<ClientHandler>) -> Result<()> {
     println!("Checking remote dependencies...\n");
+
+    // Platform gate. A failed probe falls through to the POSIX checks, so an
+    // unusual remote keeps the previous behaviour instead of failing here.
+    if let Ok(asset) = detect_remote_asset(session).await
+        && asset.starts_with("windows-")
+    {
+        return check_windows_deps(session).await;
+    }
 
     // Check deps in one round-trip
     let check_cmd = r#"echo "=== Checking dependencies ===";
@@ -538,6 +847,27 @@ done"#;
     Ok(())
 }
 
+/// Windows dependency check: `cmd` is the only requirement, because the remote
+/// SSH server itself needs it to run any command at all (and the worker spawns
+/// commands through it). It ships with Windows, so nothing can be installed.
+async fn check_windows_deps(session: &client::Handle<ClientHandler>) -> Result<()> {
+    println!("Windows remote detected — rsync and sh are not applicable.\n");
+
+    // `where` is a PowerShell alias for `Where-Object`, so it is reached through
+    // `cmd /c` to invoke the real where.exe under either default shell.
+    let output = exec_remote(session, "cmd /c where cmd").await?;
+    let path = output.trim();
+    if path.is_empty() {
+        return Err(anyhow!(
+            "'cmd' not found on remote — the Windows worker needs cmd.exe to run commands"
+        ));
+    }
+
+    println!("✓ cmd: {}", path.lines().next().unwrap_or(path));
+    println!("\n✓ All dependencies satisfied.");
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -550,9 +880,31 @@ mod tests {
     }
 
     #[test]
+    fn test_uname_asset_darwin() {
+        assert_eq!(uname_asset("Darwin x86_64\n").unwrap(), "macos-amd64");
+        assert_eq!(uname_asset("Darwin arm64").unwrap(), "macos-arm64");
+        assert_eq!(uname_asset("  Darwin   arm64  ").unwrap(), "macos-arm64");
+    }
+
+    #[test]
+    fn test_uname_asset_windows() {
+        // Output of `cmd /c "echo Windows_NT %PROCESSOR_ARCHITECTURE%"`.
+        assert_eq!(
+            uname_asset("Windows_NT AMD64\r\n").unwrap(),
+            "windows-amd64"
+        );
+        assert_eq!(uname_asset("Windows_NT ARM64").unwrap(), "windows-arm64");
+        // `%PROCESSOR_ARCHITECTURE%` can come back empty (e.g. unset env), which
+        // is unsupported rather than silently mapped to an arch.
+        assert!(uname_asset("Windows_NT").is_err());
+    }
+
+    #[test]
     fn test_uname_asset_unsupported() {
-        assert!(uname_asset("Darwin arm64").is_err());
         assert!(uname_asset("Linux riscv64").is_err());
+        assert!(uname_asset("Darwin i386").is_err());
+        assert!(uname_asset("FreeBSD amd64").is_err());
+        assert!(uname_asset("Windows_NT x86").is_err());
         assert!(uname_asset("").is_err());
         assert!(uname_asset("Linux").is_err());
     }
@@ -563,7 +915,15 @@ mod tests {
         // so a Linux local only matches a Linux remote of the same arch.
         let asset = local_asset();
         assert!(
-            ["macos-amd64", "macos-arm64", "linux-amd64", "linux-arm64"].contains(&asset.as_str())
+            [
+                "macos-amd64",
+                "macos-arm64",
+                "linux-amd64",
+                "linux-arm64",
+                "windows-amd64",
+                "windows-arm64",
+            ]
+            .contains(&asset.as_str())
         );
     }
 }

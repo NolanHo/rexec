@@ -109,11 +109,12 @@ rexec dev run --sync ./deploy.sh:/opt/app/deploy.sh -- "bash /opt/app/deploy.sh"
 
 ## Disconnect behavior
 
-- **SSH drops:** the remote worker keeps running and writing to a log; the CLI reconnects (backoff 1s→30s, up to 10 tries) and resumes output from the last byte — no data lost.
-- **CLI killed (Ctrl+C / SIGTERM):** prints the remote PID; the remote process continues. Re-attach later with `ssh <host> "~/.rexec/rexec attach --pid <PID> --offset 0"`.
+- **SSH drops:** the remote worker keeps running and writing to a log; the CLI reconnects (backoff 1s→30s, up to 10 tries) and resumes output from the last byte — no data lost. (Linux/macOS remotes; Windows remotes are experimental and do not guarantee survival.)
+- **CLI killed (Ctrl+C / SIGTERM):** prints the remote PID; the remote process continues. Re-attach later with `ssh <host> "~/.rexec/rexec attach --pid <PID> --offset 0"` (Linux/macOS remotes; on a Windows remote use the full `%USERPROFILE%\.rexec\rexec.exe` path under cmd).
 
 ## Prerequisites
 
-- Local (macOS or Linux): `rsync`, `curl`, SSH agent or keys.
-- Remote: Linux only — `rsync`, `sh` (`rexec <host> init` verifies/installs).
+- Local (macOS/Linux/Windows): `curl`, SSH keys (Windows locals: identity-file/default-key auth only — agent auth is unix-socket only). `rsync` too — on Windows get it from MSYS2 (`pacman -S rsync`) or WSL; without it `--sync`/folder sync are unavailable.
+- Remote: Linux/macOS supported — `rsync`, `sh` (`rexec <host> init` verifies/installs). Remote Windows is experimental: it compiles, but is not live-verified and disconnect survival is not guaranteed; `--sync`/`script` cannot target a Windows remote.
+- Windows locals: use MSYS2/WSL-style `--sync` paths (`/c/proj:/remote/dir`). A drive path (`C:\proj:...`) is rejected, because `LOCAL:REMOTE` splitting would read `C` as the host.
 - Cross-platform (e.g. macOS local → Linux remote) works out of the box: the worker is downloaded from GitHub Releases (needs a released tag matching the rexec version; cached in `~/.rexec/cache/`). Same-platform pairs deploy the running binary directly.

@@ -128,7 +128,26 @@ pub struct RemoteHost {
     pub identity_file: Option<PathBuf>,
 }
 
+/// True when `s` starts with a Windows drive prefix (`^[A-Za-z]:`), e.g. `C:\proj`.
+///
+/// Checked on every platform, not just Windows: it can only match input that
+/// carries such a prefix. Needed because `--sync` splits on the first ':',
+/// which would turn `C:\proj:/home/you/proj` into LOCAL="C" and
+/// REMOTE="\proj:/home/you/proj" — handing rsync a host named "C". POSIX paths
+/// cannot start with `X:`, and MSYS2/WSL-style paths (`/c/proj`) parse fine.
+fn has_windows_drive_prefix(s: &str) -> bool {
+    let b = s.as_bytes();
+    b.len() >= 2 && b[0].is_ascii_alphabetic() && b[1] == b':'
+}
+
 fn parse_sync_arg(arg: &str) -> Result<(PathBuf, String)> {
+    if has_windows_drive_prefix(arg) {
+        return Err(anyhow!(
+            "--sync LOCAL looks like a Windows drive path ('{}'), which rsync \
+             cannot use; pass an MSYS2-style path instead, e.g. /c/proj:/remote/dir",
+            arg
+        ));
+    }
     let (local, remote) = arg
         .split_once(':')
         .ok_or_else(|| anyhow!("--sync must be LOCAL:REMOTE, got '{}'", arg))?;
@@ -504,6 +523,23 @@ fn parse_user_host_port(s: &str) -> Result<RemoteHost> {
     })
 }
 
+/// Build the user-facing error for a failed rsync spawn.
+///
+/// Windows has no bundled rsync, so `--sync` depends on a separately installed
+/// MSYS2 or WSL one; a bare "program not found" leaves the user with no way
+/// forward. Only that case gets an install hint — every other failure (and
+/// every unix failure) keeps the original `failed to spawn rsync` context.
+fn rsync_spawn_error(e: std::io::Error) -> anyhow::Error {
+    #[cfg(windows)]
+    if e.kind() == std::io::ErrorKind::NotFound {
+        return anyhow!(
+            "rsync not found — install it via MSYS2 (pacman -S rsync) or use WSL; \
+             --sync is unavailable without it"
+        );
+    }
+    anyhow::Error::new(e).context("failed to spawn rsync")
+}
+
 async fn do_sync(local: &Path, remote_path: &str, remote: &RemoteHost) -> Result<()> {
     let ssh_opts = "-o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new -o ServerAliveInterval=5 -o ServerAliveCountMax=3";
     let ssh_e = match remote.port {
@@ -534,7 +570,7 @@ async fn do_sync(local: &Path, remote_path: &str, remote: &RemoteHost) -> Result
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::inherit())
             .spawn()
-            .context("failed to spawn rsync")?;
+            .map_err(rsync_spawn_error)?;
         return wait_rsync(&mut child, local, &rsync_host, remote, remote_path).await;
     }
 
@@ -571,7 +607,7 @@ async fn do_sync(local: &Path, remote_path: &str, remote: &RemoteHost) -> Result
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::inherit())
         .spawn()
-        .context("failed to spawn rsync")?;
+        .map_err(rsync_spawn_error)?;
 
     wait_rsync(&mut child, local, &rsync_host, remote, &remote_arg).await
 }
@@ -626,6 +662,8 @@ mod tests {
 
     /// Verify that `sh -c shell_quote(input)` reproduces the original input.
     /// This tests the full quoting round-trip through a real shell.
+    /// Unix-only: spawns a local `sh`, which does not exist on Windows.
+    #[cfg(unix)]
     fn assert_shell_roundtrip(input: &str) {
         let quoted = shell_quote(input).unwrap();
         let output = std::process::Command::new("sh")
@@ -652,6 +690,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)] // uses assert_shell_roundtrip (spawns sh)
     fn test_shell_quote_with_double_quotes() {
         // Double quotes inside single quotes are literal
         let quoted = shell_quote(r#"echo "hello world""#).unwrap();
@@ -660,6 +699,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)] // uses assert_shell_roundtrip (spawns sh)
     fn test_shell_quote_with_single_quotes() {
         // Single quotes must be escaped with the '"'"' trick
         let quoted = shell_quote("echo 'hello'").unwrap();
@@ -668,6 +708,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)] // uses assert_shell_roundtrip (spawns sh)
     fn test_shell_quote_with_special_chars() {
         // $, backticks, \, !, etc. should all be literal inside single quotes
         assert_shell_roundtrip("echo $HOME");
@@ -680,12 +721,14 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)] // uses assert_shell_roundtrip (spawns sh)
     fn test_shell_quote_mixed_quotes() {
         assert_shell_roundtrip(r#"echo "it's $HOME""#);
         assert_shell_roundtrip("echo 'single' && echo \"double\"");
     }
 
     #[test]
+    #[cfg(unix)] // uses assert_shell_roundtrip (spawns sh)
     fn test_shell_quote_newline() {
         assert_shell_roundtrip("echo hello\necho world");
     }
@@ -730,6 +773,7 @@ mod tests {
     /// Test the full quoting chain: command → shell_quote → sh -c → result.
     /// This simulates what happens when rexec passes a command to the remote worker.
     #[test]
+    #[cfg(unix)] // spawns a local `sh`
     fn test_full_quoting_chain() {
         // The command the user types (after local shell processing)
         let commands = vec![
@@ -1271,6 +1315,31 @@ mod tests {
         // empty key
         assert!(collect_env(&["=nokey".to_string()], &[]).is_err());
     }
+
+    #[test]
+    fn test_sync_arg_windows_drive_letter_guard() {
+        // `C:\proj` would otherwise parse as host "C" + remote "\proj".
+        assert!(has_windows_drive_prefix(r"C:\proj"));
+        assert!(has_windows_drive_prefix("c:/proj"));
+        assert!(has_windows_drive_prefix("Z:"));
+        assert!(!has_windows_drive_prefix("/home/user/proj"));
+        assert!(!has_windows_drive_prefix("./proj"));
+        assert!(!has_windows_drive_prefix("C"));
+        assert!(!has_windows_drive_prefix("C1:/proj"));
+
+        let err = parse_sync_arg(r"C:\proj:/home/user/proj")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("/c/proj"), "unhelpful error: {}", err);
+
+        // MSYS2-style and POSIX paths still parse as before.
+        let (local, remote) = parse_sync_arg("/c/proj:/home/user/proj").unwrap();
+        assert_eq!(local, PathBuf::from("/c/proj"));
+        assert_eq!(remote, "/home/user/proj");
+        let (local, remote) = parse_sync_arg("./project:/srv/app").unwrap();
+        assert_eq!(local, PathBuf::from("./project"));
+        assert_eq!(remote, "/srv/app");
+    }
 }
 
 /// Simple shell quoting for a single argument.
@@ -1294,12 +1363,14 @@ async fn run_command(
     env: &[(String, String)],
 ) -> Result<()> {
     let mut session = ssh::connect(remote).await?;
-    ssh::ensure_remote_binary(&mut session, host).await?;
+    let remote_env = ssh::ensure_remote_binary(&mut session, host).await?;
 
     // Start worker on remote. The command itself is NOT passed on argv (so
     // `pkill -f`/`pgrep -f` cannot match the worker by command content); it is
     // sent over stdin as a special env entry, alongside any -e/--env vars.
-    let worker_cmd = "~/.rexec/rexec worker";
+    // The launch command is platform-correct: POSIX `~` does not expand under
+    // cmd.exe/PowerShell on Windows remotes.
+    let worker_cmd = remote_env.worker_command();
     let mut channel = session.channel_open_session().await?;
     channel.exec(true, worker_cmd).await?;
 
@@ -1332,21 +1403,36 @@ async fn run_command(
     // stop polling sig_rx to avoid busy-loop on None.
     let mut signal_available = true;
 
-    // Signal handler: print remote info and exit on Ctrl+C / SIGTERM
+    // Signal handler: print remote info and exit on Ctrl+C / SIGTERM.
+    // Both platforms only ever send `()` on sig_tx, so the select! arms below
+    // stay platform-independent.
     let (sig_tx, mut sig_rx) = tokio::sync::mpsc::channel::<()>(1);
     tokio::spawn(async move {
-        use tokio::signal::unix::{SignalKind, signal};
-        let mut sigint = match signal(SignalKind::interrupt()) {
-            Ok(s) => s,
-            Err(_) => return,
-        };
-        let mut sigterm = match signal(SignalKind::terminate()) {
-            Ok(s) => s,
-            Err(_) => return,
-        };
-        tokio::select! {
-            _ = sigint.recv() => {}
-            _ = sigterm.recv() => {}
+        // unix: SIGINT + SIGTERM. A console process on Windows has no SIGTERM,
+        // so ctrl_c() (Ctrl+C / Ctrl+Break) covers the same user intent.
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{SignalKind, signal};
+            let mut sigint = match signal(SignalKind::interrupt()) {
+                Ok(s) => s,
+                Err(_) => return,
+            };
+            let mut sigterm = match signal(SignalKind::terminate()) {
+                Ok(s) => s,
+                Err(_) => return,
+            };
+            tokio::select! {
+                _ = sigint.recv() => {}
+                _ = sigterm.recv() => {}
+            }
+        }
+        #[cfg(windows)]
+        {
+            // Err means the handler could not be installed: drop the task so the
+            // receiver sees None and warns once — same as a failed unix signal().
+            if tokio::signal::ctrl_c().await.is_err() {
+                return;
+            }
         }
         let _ = sig_tx.send(()).await;
     });
@@ -1469,10 +1555,8 @@ async fn run_command(
 
                             match ssh::connect(remote).await {
                                 Ok(new_session) => {
-                                    let attach_cmd = format!(
-                                        "~/.rexec/rexec attach --pid {} --offset {}",
-                                        pid_val, offset
-                                    );
+                                    let attach_cmd =
+                                        remote_env.attach_command(pid_val, offset);
                                     match new_session.channel_open_session().await {
                                         Ok(new_channel) => {
                                             match new_channel.exec(true, attach_cmd.as_str()).await {
@@ -1581,7 +1665,15 @@ async fn run_script(
     // would disable (python3 '$HOME/...' does not expand).
     let remote_script = {
         let mut session = ssh::connect(remote).await?;
-        ssh::ensure_remote_binary(&mut session, host).await?;
+        // `script` requires rsync (do_sync below) and a POSIX remote path
+        // model — reject Windows remotes up front instead of wasting a full
+        // SFTP worker deploy and then failing in the rsync step.
+        let env = ssh::ensure_remote_binary(&mut session, host).await?;
+        if env.is_windows {
+            return Err(anyhow!(
+                "`script` requires a Linux/macOS remote (rsync + POSIX paths); this host is Windows"
+            ));
+        }
         let home = ssh::exec_remote(&mut session, "printf %s \"$HOME\"")
             .await?
             .trim()
