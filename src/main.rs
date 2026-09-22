@@ -213,14 +213,14 @@ enum Action {
         /// for a single alias
         alias: Option<String>,
 
-        /// Also show the detail columns (port, user, identity); the default
-        /// table is name-level only — an alias is all `rexec <alias> run` needs
+        /// Also show the detail columns (user, identity); the default table
+        /// already carries `host:port`, which is part of which machine this is
         #[arg(short = 'l', long = "long")]
         long: bool,
 
-        /// Keep hosts whose alias/hostname/user/description matches PATTERN
+        /// Keep hosts whose alias/host:port/user/description matches PATTERN
         /// (case-insensitive substring; `*`/`?` make it a glob over
-        /// alias+hostname). Repeatable — every pattern must match
+        /// alias+hostname+host:port). Repeatable — every pattern must match
         #[arg(short = 'f', long = "filter", value_name = "PATTERN")]
         filter: Vec<String>,
 
@@ -1836,7 +1836,7 @@ mod tests {
             "description"
         );
         assert!(!host_matches(&e, &no(&["web"]), None, None));
-        // globs match alias/hostname only
+        // globs match alias/hostname/host:port only
         assert!(host_matches(&e, &no(&["mint-*"]), None, None));
         assert!(host_matches(&e, &no(&["192.168.*"]), None, None));
         assert!(
@@ -1850,6 +1850,40 @@ mod tests {
         assert!(host_matches(&e, &[], Some("root"), Some(22)));
         assert!(!host_matches(&e, &[], Some("nolan"), None));
         assert!(!host_matches(&e, &[], None, Some(2222)));
+    }
+
+    #[test]
+    fn test_host_entry_address_and_port_filtering() {
+        let mut e = host_entry("mint-glm52-l20x-1", "47.94.214.197", "root", None);
+        e.port = 26001;
+        assert_eq!(e.address(), "47.94.214.197:26001");
+
+        // IPv6 literals are bracketed so the port stays readable.
+        let mut v6 = host_entry("v6-box", "fe80::1", "root", None);
+        v6.port = 2222;
+        assert_eq!(v6.address(), "[fe80::1]:2222");
+
+        // A config that already writes brackets (`HostName [fe80::1]`) must not
+        // come out doubled — brackets are syntax, not part of the host.
+        let mut v6b = host_entry("v6-bracketed", "[fe80::1]", "root", None);
+        v6b.port = 2222;
+        assert_eq!(v6b.address(), "[fe80::1]:2222");
+
+        let no = |p: &[&str]| p.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        // The port is visible in the table, so it must be searchable: as a
+        // substring (`-f 26001`) and as a glob over the address (`*:26001` —
+        // `47.94.*` would also match the plain hostname and pin nothing).
+        assert!(
+            host_matches(&e, &no(&["26001"]), None, None),
+            "address port"
+        );
+        assert!(
+            host_matches(&e, &no(&["*:26001"]), None, None),
+            "glob over address"
+        );
+        assert!(host_matches(&e, &no(&["47.94.214.197:26001"]), None, None));
+        assert!(!host_matches(&e, &no(&["*:26002"]), None, None));
+        assert!(!host_matches(&e, &no(&["26002"]), None, None));
     }
 
     #[test]
@@ -3582,6 +3616,31 @@ struct HostEntry {
     description: Option<String>,
 }
 
+impl HostEntry {
+    /// The endpoint as it will actually be contacted: `host:port`, with an IPv6
+    /// literal bracketed so the port stays readable (`[fe80::1]:22`).
+    ///
+    /// The port belongs to "which machine this is", not to stage-two detail: the
+    /// same gateway host carries one forwarded port per container, so an alias
+    /// without its port identifies nothing. It is shown in the default table and
+    /// `--long` alike, and `--filter` substring/glob matches it.
+    fn address(&self) -> String {
+        // Brackets are syntax, never part of the host (ssh.rs strips them before
+        // connecting): normalize first, or a config that writes `HostName [::1]`
+        // would render as `[[::1]]:22`.
+        let host = self
+            .hostname
+            .strip_prefix('[')
+            .and_then(|h| h.strip_suffix(']'))
+            .unwrap_or(&self.hostname);
+        if host.contains(':') {
+            format!("[{host}]:{}", self.port)
+        } else {
+            format!("{host}:{}", self.port)
+        }
+    }
+}
+
 /// Descriptions for hosts, from two places (a sidecar entry wins):
 ///
 /// 1. A `# rexec: <text>` comment line directly above a `Host` line in the
@@ -3709,11 +3768,13 @@ fn glob_match(pattern: &str, text: &str) -> bool {
 
 /// Does a host survive the filters?
 ///
-/// A pattern with `*`/`?` glob-matches the alias and hostname only (a glob over
-/// a description is rarely what someone means); a plain pattern is a
-/// case-insensitive substring test over alias, hostname, user and description —
-/// so `-f prod`, `-f sk-`, `-f web1` and `-f "training box"` all do the obvious
-/// thing. Several patterns must all match; `--user`/`--port` are exact.
+/// A pattern with `*`/`?` glob-matches the alias, hostname and `host:port`
+/// address (a glob over a description is rarely what someone means); a plain
+/// pattern is a case-insensitive substring test over alias, address, user and
+/// description — so `-f prod`, `-f sk-`, `-f 26001` and `-f "training box"` all
+/// do the obvious thing. Matching the address is what makes `-f <port>`
+/// work the way the displayed table reads. Several patterns must all match;
+/// `--user`/`--port` are exact.
 fn host_matches(
     entry: &HostEntry,
     patterns: &[String],
@@ -3730,13 +3791,16 @@ fn host_matches(
     {
         return false;
     }
+    let address = entry.address();
     patterns.iter().all(|pat| {
         if pat.contains('*') || pat.contains('?') {
-            glob_match(pat, &entry.alias) || glob_match(pat, &entry.hostname)
+            glob_match(pat, &entry.alias)
+                || glob_match(pat, &entry.hostname)
+                || glob_match(pat, &address)
         } else {
             let needle = pat.to_ascii_lowercase();
             entry.alias.to_ascii_lowercase().contains(&needle)
-                || entry.hostname.to_ascii_lowercase().contains(&needle)
+                || address.to_ascii_lowercase().contains(&needle)
                 || entry.user.to_ascii_lowercase().contains(&needle)
                 || entry
                     .description
@@ -3748,10 +3812,12 @@ fn host_matches(
 
 /// `rexec list`: the host inventory.
 ///
-/// Two stages by design: the default table is name-level (alias, hostname,
-/// description) because an alias is all a `rexec <alias> run` needs; `--long`
-/// adds the connection details, and passing an alias prints them for that one
-/// host. stdout carries the table (or the `--json` array) and nothing else.
+/// Two stages by design: the default table is `ALIAS  HOST:PORT  DESCRIPTION`
+/// — the port is part of the identity of a host (one gateway address carries a
+/// different forwarded port per machine), so it is shown alongside the hostname;
+/// `--long` adds user/identity, and passing an alias prints the resolved details
+/// for that one host. stdout carries the table (or the `--json` array) and
+/// nothing else.
 fn list_hosts(
     alias: Option<&str>,
     long: bool,
@@ -3789,8 +3855,17 @@ fn list_hosts(
             continue;
         }
         let alias = patterns.join(" ");
-        let hostname = host
-            .params
+        // Resolve the way a run does — `config.query` merges every matching
+        // block first-obtained-wins, so a `Host *` Port/User/IdentityFile is
+        // inherited. Reading the block's own params instead would show a
+        // `host:port` (and user/key) that a `rexec <alias> run` does not use,
+        // which is exactly the kind of mismatch this column exists to prevent.
+        let params = patterns
+            .iter()
+            .find(|p| !p.starts_with('!') && !p.contains('*') && !p.contains('?'))
+            .map(|p| config.query(p))
+            .unwrap_or_else(|| host.params.clone());
+        let hostname = params
             .host_name
             .clone()
             .unwrap_or_else(|| alias.split_whitespace().next().unwrap_or("").to_string());
@@ -3798,14 +3873,9 @@ fn list_hosts(
             description: patterns.iter().find_map(|p| descriptions.get(p).cloned()),
             alias,
             hostname,
-            port: host.params.port.unwrap_or(22),
-            user: host
-                .params
-                .user
-                .clone()
-                .unwrap_or_else(|| default_user.clone()),
-            identity: host
-                .params
+            port: params.port.unwrap_or(22),
+            user: params.user.clone().unwrap_or_else(|| default_user.clone()),
+            identity: params
                 .identity_file
                 .as_ref()
                 .and_then(|v| v.first())
@@ -3846,18 +3916,18 @@ fn list_hosts(
         return Ok(());
     }
 
-    // Name-level by default: the port/user/identity columns are stage two.
+    // Host:port is stage one (the port is part of which machine this is);
+    // user/identity are stage two.
     if long {
         println!(
-            "{:<24} {:<28} {:<6} {:<12} {:<30} DESCRIPTION",
-            "ALIAS", "HOSTNAME", "PORT", "USER", "IDENTITY"
+            "{:<24} {:<32} {:<12} {:<30} DESCRIPTION",
+            "ALIAS", "HOST:PORT", "USER", "IDENTITY"
         );
         for e in &entries {
             println!(
-                "{:<24} {:<28} {:<6} {:<12} {:<30} {}",
+                "{:<24} {:<32} {:<12} {:<30} {}",
                 e.alias,
-                e.hostname,
-                e.port,
+                e.address(),
                 e.user,
                 e.identity
                     .as_deref()
@@ -3870,12 +3940,12 @@ fn list_hosts(
             );
         }
     } else {
-        println!("{:<24} {:<28} DESCRIPTION", "ALIAS", "HOSTNAME");
+        println!("{:<24} {:<32} DESCRIPTION", "ALIAS", "HOST:PORT");
         for e in &entries {
             println!(
-                "{:<24} {:<28} {}",
+                "{:<24} {:<32} {}",
                 e.alias,
-                e.hostname,
+                e.address(),
                 e.description
                     .as_deref()
                     .map(|d| single_line(d, 60))

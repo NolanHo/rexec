@@ -108,10 +108,10 @@ Syncs the script to `~/.rexec/scripts/` (or `--sync-to`), then runs it. Interpre
 rexec list [alias]
 ```
 
-Reads `~/.ssh/config` (Include-expanded) and prints the host inventory. Default table is name-level (`ALIAS  HOSTNAME  DESCRIPTION`); `--long` adds port/user/identity, and passing an alias prints that host's resolved details.
+Reads `~/.ssh/config` (Include-expanded) and prints the host inventory. Default table is `ALIAS  HOST:PORT  DESCRIPTION` (the port is part of which machine it is — one gateway address carries a different forwarded port per host); `--long` adds user/identity, and passing an alias prints that host's resolved details.
 
 - Descriptions: a `# rexec: <text>` comment above a `Host` line (works in `Include`d files) or `~/.rexec/hosts.conf` (`alias = description` per line), the sidecar winning.
-- Filters: `-f/--filter PATTERN` (case-insensitive substring over alias/hostname/user/description; `*`/`?` makes it a glob over alias+hostname), repeatable; `--user NAME`, `--port PORT` exact; `--json` prints an array.
+- Filters: `-f/--filter PATTERN` (case-insensitive substring over alias/host:port/user/description; `*`/`?` makes it a glob over alias+hostname+host:port), repeatable; `--user NAME`, `--port PORT` exact; `--json` prints an array.
 
 ### `history` — recorded runs
 

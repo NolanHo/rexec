@@ -137,14 +137,15 @@ Syncs the script to `~/.rexec/scripts/` (or `--sync-to`), then runs it. The inte
 rexec list [alias]
 ```
 
-Reads `~/.ssh/config` (Include-expanded) and prints the host inventory. Two stages by design: the default table is name-level — `ALIAS  HOSTNAME  DESCRIPTION` — because an alias is all `rexec <alias> run` needs; the connection details are one flag (or one host) away.
+Reads `~/.ssh/config` (Include-expanded) and prints the host inventory. The default table is `ALIAS  HOST:PORT  DESCRIPTION`: the port is part of *which machine* this is (one gateway address carries a different forwarded port per machine, so a bare hostname identifies nothing), which is why it sits next to the hostname rather than behind a flag. `--long` adds user/identity, and passing an alias prints the resolved details for that one host.
 
 ```bash
-rexec list                      # alias, hostname, description
-rexec list --long               # + port, user, identity
+rexec list                      # alias, host:port, description
+rexec list --long               # + user, identity
 rexec list my-server            # resolved details for one alias
-rexec list --filter prod        # substring over alias/hostname/user/description
-rexec list -f 'web*' -f staging # repeatable; every pattern must match (globs hit alias/hostname)
+rexec list --filter prod        # substring over alias/host:port/user/description
+rexec list -f 'web*' -f staging # repeatable; every pattern must match (globs hit alias/hostname/host:port)
+rexec list -f 26001             # the port is visible in the table, so it is searchable
 rexec list --user root --port 2222
 rexec list --json               # machine-readable array
 ```
@@ -152,7 +153,7 @@ rexec list --json               # machine-readable array
 - **Descriptions** come from either place (the sidecar wins when both exist):
   - a `# rexec: <text>` comment line directly above a `Host` line in the ssh config — including `Include`d files, since the config is read through the Include-expanding loader; it attaches to every concrete pattern on that line;
   - `~/.rexec/hosts.conf`, one `alias = description` per line (`#` comments allowed) — for annotating aliases without editing their config. It only *annotates* hosts that exist in the ssh config; it never defines a host.
-- **Filtering**: `--filter/-f PATTERN` is a case-insensitive substring over alias, hostname, user and description; with `*`/`?` it is a glob over alias and hostname instead. Repeatable (all must match), and `--user`/`--port` are exact field filters. An empty result prints a note on stderr and exits 0.
+- **Filtering**: `--filter/-f PATTERN` is a case-insensitive substring over alias, `host:port`, user and description; with `*`/`?` it is a glob over alias, hostname and `host:port` instead. Repeatable (all must match), and `--user`/`--port` are exact field filters. An empty result prints a note on stderr and exits 0.
 - Pure-wildcard entries (`Host *`) are skipped: there is no alias to run.
 
 ### `history` — recorded runs
