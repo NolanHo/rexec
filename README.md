@@ -15,6 +15,7 @@ A CLI to sync local files/folders and run commands on remote hosts over SSH, des
 - **SSH config**: resolves host aliases from `~/.ssh/config` (Include-expanded); `user@host:port` literals work everywhere (run **and** sync). An unknown alias is an error with near-miss suggestions — it is never silently treated as a raw hostname (use `user@host` for literal hosts)
 - **Silent on success, full context on failure**: a successful run prints only the command's own stdout/stderr; `-v` adds the decision trace (resolution, auth, deploy, reconnect). Failures always print the error plus that trace in one shot, and a non-zero remote exit prints a one-line warning with the remote log path
 - **Dry run**: `plan` shows resolution, platform, deploy decision and launch command without executing or deploying
+- **Execution history**: every `run`/`script` is recorded locally (`~/.rexec/history`) — command and env verbatim, output capped at 1 MiB per stream (head+tail), exit code/timing/decision trace — and queried with `rexec history list|show|grep|stats|fetch|prune`; `--no-history` or `REXEC_HISTORY=0` turns recording off
 - **Machine-readable**: `--json` emits one JSON summary line on stderr (stdout stays pure command output)
 - **Quiet mode**: `-q` suppresses the remaining warning/progress lines (errors are never suppressed)
 
@@ -63,6 +64,11 @@ rexec <host> script -e API_KEY=sk-xxx ./fetch.py
 rexec list
 rexec list my-server
 
+# Inspect past runs (local record: command, env, output, exit, trace)
+rexec history list -n 10
+rexec history show 20260922T041533Z-921501
+rexec history show 20260922T041533Z-921501 --stderr | tail -20
+
 # Show what a run WOULD do — resolution, deploy decision, launch command —
 # without executing the command and without deploying anything
 rexec my-server plan -- "python train.py --epochs 100"
@@ -110,9 +116,10 @@ On Windows the local side of `--sync` must be an MSYS2/WSL-style path (`/c/proj`
 | `-p PORT` / `--port PORT` | SSH port (overrides `host:port` and ssh-config `Port`) |
 | `-v` / `--verbose` | Print the decision trace (resolution, auth, deploy, reconnect, timings) even on success. Errors always carry it |
 | `--json` | Emit one machine-readable result summary line on stderr (see Output contract) |
+| `--no-history` | Do not record this run in the local execution history (same as `REXEC_HISTORY=0`); reading `rexec history …` still works |
 | `-q` / `--quiet` | Suppress the remaining warning/progress lines. Errors are never suppressed |
 
-Run/plan/sync/script usage is unchanged otherwise: `rexec [-p PORT] [-v] [--json] <alias|user@host:port> <subcommand> ...`.
+Run/plan/sync/script usage is unchanged otherwise: `rexec [-p PORT] [-v] [--json] [--no-history] <alias|user@host:port> <subcommand> ...`.
 
 ### `script` — sync and run a local script
 
@@ -129,6 +136,45 @@ rexec list [alias]
 ```
 
 Reads `~/.ssh/config` and prints each host's alias, hostname, port, and user (pure-wildcard entries like `Host *` are skipped). Pass an alias for the resolved details of a single host.
+
+### `history` — recorded runs
+
+Every `run` and `script` execution is recorded locally — nothing is sent anywhere:
+
+```text
+~/.rexec/history/index.jsonl              append-only, one JSON record per run (the query surface)
+~/.rexec/history/runs/<id>/meta.json      the same record, pretty-printed
+~/.rexec/history/runs/<id>/stdout.log     captured stdout (capped)
+~/.rexec/history/runs/<id>/stderr.log     captured stderr (capped)
+```
+
+`<id>` is `<UTC timestamp>-<pid>`, e.g. `20260922T041533Z-921501`. stdout carries pure data (tables, raw artifacts) so it can be piped; notes and warnings go to stderr.
+
+| Command | What it does |
+|---------|--------------|
+| `rexec history list [-n N] [--host H] [--failed]` | table of recent runs, newest first: id, start, host, exit code (`-` when never observed), duration_ms, command |
+| `rexec history show <id>` | human summary: header fields, command, env, decision trace, artifact paths |
+| `rexec history show <id> --stdout` / `--stderr` | ONLY that artifact's raw bytes (pipe-friendly; an empty capture prints nothing); a missing capture file prints a note on stderr and still exits 0 |
+| `rexec history show <id> --trace` / `--meta` | the decision trace, one line per entry / the raw stored JSON record line |
+| `rexec history grep <pattern> [-n N] [--host H] [--failed] [--output]` | case-insensitive plain substring (no regex) over command + env values, one line per match prefixed by run id; `--output` also searches the captured stdout/stderr |
+| `rexec history stats [--host H]` | runs, failures, per-host counts, duration p50/p95, captured bytes, on-disk tree size |
+| `rexec history path` | print the history root |
+| `rexec history prune [--keep-days N] [--max-mb N]` | delete runs started more than N days ago (default 30), then the oldest runs until the tree fits the size cap; the newest run is never evicted |
+| `rexec history fetch <id> [--out P]` | pull the FULL remote worker log (`~/.rexec/logs/<pid>.log`) over SSH — read-only (one `cat`, no deploy, no writes on the remote) |
+
+```bash
+rexec history list -n 5 --failed          # the last 5 failures
+rexec history grep 'python train.py'      # runs whose command contains this text
+rexec history grep sk-live --output       # env VALUES too (keys are not searched), plus captured output
+rexec history show 20260922T041533Z-921501 --stderr | tail -50
+rexec history fetch 20260922T041533Z-921501 --out /tmp/worker.log
+rexec history prune --keep-days 7 --max-mb 500
+```
+
+- **Capture cap**: each stream is capped at 1 MiB — the head and the tail are kept and the middle is replaced by a `… [N bytes omitted] …` marker, so one chatty run cannot fill the disk while its start and its failure stay readable. `stdout_bytes`/`stderr_bytes` in the record are the true byte totals even when the capture was capped: `show` marks a truncated stream and `stats` sums the true totals.
+- **Switches**: `--no-history` disables recording for one invocation; `REXEC_HISTORY=0` disables it for the whole environment. Both leave reading (`rexec history …`) and pruning fully working.
+- **Commands and env values are stored VERBATIM — no redaction, by explicit product decision.** Anything passed via `-e/--env`/`--env-file` (API keys included) and the command text land in `index.jsonl` in clear text. The tree is owner-only (`~/.rexec/history` and every run dir 0700, files 0600) and never leaves the machine — use `--no-history` / `REXEC_HISTORY=0` for a run whose arguments must not be persisted.
+- **`fetch` prints the worker's raw binary frame stream** (the same bytes the CLI decodes live) — it is not decoded output; `show --stdout/--stderr` is the decoded capture. A missing pid (the worker never started) or a Windows remote fails with a clear message instead of guessing a path.
 
 ## How it works
 

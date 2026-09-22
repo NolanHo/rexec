@@ -39,6 +39,11 @@ rexec <host> script ./deploy.sh -- arg1 arg2
 # List hosts from ~/.ssh/config
 rexec list
 
+# Inspect past runs (local record: command, env, output, exit, trace)
+rexec history list -n 10 --failed
+rexec history show 20260922T041533Z-921501 --stderr | tail -20
+rexec history grep sk-live --output
+
 # Dry run: what a run WOULD do (resolution, deploy decision, launch command)
 rexec <host> plan -- "python main.py"
 
@@ -75,6 +80,7 @@ rexec -q <host> run -- "echo hi"
 | `-p PORT` / `--port PORT` | SSH port (overrides `host:port` and ssh-config `Port`) |
 | `-v` / `--verbose` | Print the decision trace (resolution, auth, deploy, reconnect) even on success; errors always carry it |
 | `--json` | Emit one machine-readable result summary line on stderr |
+| `--no-history` | Do not record this run in the local execution history (same as `REXEC_HISTORY=0`) |
 | `-q` / `--quiet` | Suppress remaining warning/progress lines (errors are never suppressed) |
 
 ### `plan` — dry run (no execution, no deploy)
@@ -101,6 +107,35 @@ rexec list [alias]
 ```
 
 Reads `~/.ssh/config` and prints each host's alias/hostname/port/user (pure-wildcard entries skipped). Pass an alias for single-host details.
+
+### `history` — recorded runs
+
+Every `run`/`script` is recorded locally (nothing leaves the machine):
+
+```text
+~/.rexec/history/index.jsonl           append-only, one JSON record per run
+~/.rexec/history/runs/<id>/meta.json   the same record, pretty-printed
+~/.rexec/history/runs/<id>/stdout.log  captured stdout (capped, head+tail)
+~/.rexec/history/runs/<id>/stderr.log  captured stderr (capped, head+tail)
+```
+
+`<id>` is `<UTC timestamp>-<pid>`, e.g. `20260922T041533Z-921501`. stdout is pure data (pipe it); notes go to stderr.
+
+```bash
+rexec history list -n 5 --failed           # id, start, host, exit, duration_ms, command
+rexec history show <id>                    # summary: header, command, env, trace, artifact paths
+rexec history show <id> --stderr | tail -50  # raw bytes of one artifact only (--stdout/--stderr/--trace/--meta)
+rexec history grep sk-live --output        # case-insensitive substring over command + env VALUES (+ captured output)
+rexec history stats                        # runs, failures, per-host, p50/p95 duration, captured bytes, tree size
+rexec history fetch <id> --out /tmp/worker.log  # FULL remote log, read-only over SSH (raw frame stream, not decoded)
+rexec history prune --keep-days 7 --max-mb 500  # keep the tree small (the newest run is always kept)
+rexec history path                         # where the tree lives
+```
+
+- Each stream is capped at **1 MiB**: head + tail kept, middle replaced by `… [N bytes omitted] …`. The record's `stdout_bytes`/`stderr_bytes` are the true totals.
+- `--no-history` (one invocation) or `REXEC_HISTORY=0` (environment) disables recording; reading and pruning still work.
+- **Commands and env VALUES are stored verbatim — no redaction, by product decision** (an `-e API_KEY=…` value is in `index.jsonl` in clear text). Owner-only tree: dirs 0700, files 0600. Use `--no-history` for runs whose arguments must not be persisted.
+
 
 ### Environment variables
 

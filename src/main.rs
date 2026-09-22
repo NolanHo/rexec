@@ -9,6 +9,7 @@ use russh::ChannelMsg;
 use ssh2_config::{ParseRule, SshConfig};
 
 mod diagnostics;
+mod history;
 mod protocol;
 mod remote;
 mod ssh;
@@ -70,8 +71,8 @@ fn ensure_stderr_line_start() {
 #[macro_export]
 macro_rules! status {
     ($($t:tt)*) => {{
-        if !crate::QUIET.load(std::sync::atomic::Ordering::Relaxed) {
-            crate::ensure_stderr_line_start();
+        if !$crate::QUIET.load(std::sync::atomic::Ordering::Relaxed) {
+            $crate::ensure_stderr_line_start();
             eprintln!($($t)*);
         }
     }};
@@ -86,8 +87,8 @@ macro_rules! status {
 #[macro_export]
 macro_rules! progress {
     ($($t:tt)*) => {{
-        if crate::diagnostics::mode().progress_lines() {
-            crate::status!($($t)*);
+        if $crate::diagnostics::mode().progress_lines() {
+            $crate::status!($($t)*);
         }
     }};
 }
@@ -118,6 +119,11 @@ struct Cli {
     /// Emit a single-line machine-readable result summary on stderr
     #[arg(long = "json", global = true)]
     json: bool,
+
+    /// Do not record this run in the local execution history (same as
+    /// REXEC_HISTORY=0; reading `rexec history …` still works)
+    #[arg(long = "no-history", global = true)]
+    no_history: bool,
 
     #[command(subcommand)]
     action: Action,
@@ -197,6 +203,107 @@ enum Action {
 
         #[arg(long)]
         offset: u64,
+    },
+
+    /// Inspect the local execution history (~/.rexec/history)
+    History {
+        #[command(subcommand)]
+        cmd: HistoryCmd,
+    },
+}
+
+/// `rexec history …` subcommands — all read the local index except `prune`
+/// (which deletes runs) and `fetch` (which reads one file on the remote).
+#[derive(Subcommand)]
+enum HistoryCmd {
+    /// List recent recorded runs, newest first (pure data on stdout)
+    List {
+        /// Maximum number of runs to print
+        #[arg(short = 'n', long, default_value_t = 20)]
+        limit: usize,
+
+        /// Only runs whose host (as typed) or resolved target contains this
+        #[arg(long)]
+        host: Option<String>,
+
+        /// Only runs that failed: non-zero exit, or no exit observed at all
+        #[arg(long)]
+        failed: bool,
+    },
+
+    /// Show one run: a human summary, or one raw artifact with a selector
+    Show {
+        /// Run id, as printed by `rexec history list`
+        id: String,
+
+        /// Write the captured stdout bytes and nothing else (pipe-friendly)
+        #[arg(long)]
+        stdout: bool,
+
+        /// Write the captured stderr bytes and nothing else (pipe-friendly)
+        #[arg(long)]
+        stderr: bool,
+
+        /// Print the recorded decision trace, one line per entry
+        #[arg(long)]
+        trace: bool,
+
+        /// Print the raw stored JSON record line
+        #[arg(long)]
+        meta: bool,
+    },
+
+    /// Case-insensitive substring search over commands and env values
+    Grep {
+        /// Plain substring (no regex); matched against command + env values
+        pattern: String,
+
+        /// Maximum number of matching runs to print
+        #[arg(short = 'n', long, default_value_t = 20)]
+        limit: usize,
+
+        /// Only runs whose host (as typed) or resolved target contains this
+        #[arg(long)]
+        host: Option<String>,
+
+        /// Only runs that failed: non-zero exit, or no exit observed at all
+        #[arg(long)]
+        failed: bool,
+
+        /// Also search the captured stdout/stderr of each matching run
+        #[arg(long)]
+        output: bool,
+    },
+
+    /// Aggregate statistics over the recorded runs
+    Stats {
+        /// Only runs whose host (as typed) or resolved target contains this
+        #[arg(long)]
+        host: Option<String>,
+    },
+
+    /// Print the history root directory (the tree itself appears on first write)
+    Path,
+
+    /// Delete old runs and enforce a size cap
+    Prune {
+        /// Remove runs started more than this many days ago
+        #[arg(long, default_value_t = 30)]
+        keep_days: u64,
+
+        /// Then remove the oldest runs while the tree is larger than this
+        #[arg(long)]
+        max_mb: Option<u64>,
+    },
+
+    /// Pull the FULL worker log of a recorded run from the remote (read-only)
+    Fetch {
+        /// Run id, as printed by `rexec history list`
+        id: String,
+
+        /// Write to this file instead of stdout
+        #[arg(long)]
+        out: Option<PathBuf>,
     },
 }
 
@@ -1862,6 +1969,375 @@ mod tests {
             "{text}"
         );
     }
+
+    // ── history helpers ──
+
+    fn sample_record(id: &str, host: &str, exit: Option<i32>) -> history::RunRecord {
+        history::RunRecord {
+            id: id.to_string(),
+            ts_start: "2026-09-22T04:15:33Z".to_string(),
+            duration_ms: 1200,
+            host: host.to_string(),
+            resolved: format!("root@{host}:22"),
+            command: "echo hi".to_string(),
+            env: vec![("FOO".to_string(), "Bar".to_string())],
+            exit_code: exit,
+            pid: Some(42),
+            deployed: false,
+            stdout_bytes: 3,
+            stderr_bytes: 0,
+            stdout_truncated: false,
+            stderr_truncated: false,
+            rexec_version: "0.3.1".to_string(),
+            trace: vec!["resolve: literal root@host:22".to_string()],
+        }
+    }
+
+    #[test]
+    fn test_single_line_escapes_control_characters() {
+        assert_eq!(single_line("echo hi", 60), "echo hi");
+        assert_eq!(single_line("echo a\necho b", 60), "echo a\\necho b");
+        assert_eq!(single_line("a\tb\rc", 60), "a\\tb\\rc");
+        assert_eq!(single_line("bell\u{7}", 60), "bell\\u0007");
+        // A rendered newline must never survive into a table row.
+        assert!(!single_line("a\nb", 60).contains('\n'));
+    }
+
+    #[test]
+    fn test_single_line_truncates_on_char_boundaries() {
+        // Exactly `max` fits: no marker.
+        assert_eq!(single_line(&"x".repeat(60), 60), "x".repeat(60));
+        // Over budget: `max - 1` characters plus the marker = exactly `max`.
+        let cut = single_line(&"x".repeat(100), 60);
+        assert_eq!(cut.chars().count(), 60);
+        assert_eq!(cut, format!("{}…", "x".repeat(59)));
+        // Multibyte input is cut on a char boundary, never mid-codepoint.
+        let cut = single_line(&"é".repeat(100), 10);
+        assert_eq!(cut.chars().count(), 10);
+        assert_eq!(cut, format!("{}…", "é".repeat(9)));
+        assert_eq!(single_line("anything", 0), "");
+    }
+
+    #[test]
+    fn test_percentile_nearest_rank() {
+        assert_eq!(percentile(&[], 50), None);
+        assert_eq!(percentile(&[5], 95), Some(5));
+        assert_eq!(percentile(&[1, 2, 3, 4], 50), Some(2));
+        assert_eq!(percentile(&[1, 2, 3, 4], 95), Some(4));
+        assert_eq!(percentile(&[10, 20, 30], 50), Some(20));
+        // p0 is the minimum, never an out-of-bounds index.
+        assert_eq!(percentile(&[7, 8, 9], 0), Some(7));
+        // p95 of 10 items is the maximum (nearest rank, no interpolation).
+        assert_eq!(percentile(&[1, 2, 3, 4, 5, 6, 7, 8, 9, 10], 95), Some(10));
+    }
+
+    #[test]
+    fn test_record_matches_host_and_failed_filters() {
+        let ok = sample_record("20260922T041533Z-1", "prod-1", Some(0));
+        let bad = sample_record("20260922T041534Z-2", "dev", Some(1));
+        let unknown = sample_record("20260922T041535Z-3", "dev", None);
+
+        assert!(record_matches(&ok, None, false));
+        assert!(record_matches(&bad, None, false));
+        // `failed` keeps non-zero AND never-observed exits, drops clean runs.
+        assert!(!record_matches(&ok, None, true));
+        assert!(record_matches(&bad, None, true));
+        assert!(record_matches(&unknown, None, true));
+        // Host matches the alias as typed or the resolved target, as a
+        // case-insensitive substring.
+        assert!(record_matches(&ok, Some("prod"), false));
+        assert!(record_matches(&ok, Some("PROD-1"), false));
+        assert!(record_matches(&ok, Some("root@prod-1"), false));
+        assert!(!record_matches(&ok, Some("dev"), false));
+        assert!(record_matches(&ok, Some(""), false));
+    }
+
+    #[test]
+    fn test_match_context_window_and_case_folding() {
+        // 3 chars of context each side of "hello" in "echo hello world".
+        assert_eq!(
+            match_context("echo hello world", "hello", 3, 3).as_deref(),
+            Some("…ho hello wo…")
+        );
+        // ASCII case-insensitive, offsets preserved.
+        assert_eq!(
+            match_context("ECHO Hello World", "hello", 0, 0).as_deref(),
+            Some("…Hello…")
+        );
+        assert_eq!(match_context("nothing here", "absent", 40, 40), None);
+        assert_eq!(match_context("anything", "", 40, 40), None);
+        // The whole text when the context covers it: no clipping markers.
+        assert_eq!(
+            match_context("echo hello world", "hello", 40, 40).as_deref(),
+            Some("echo hello world")
+        );
+        // Newlines in the matched region are escaped, not printed raw.
+        let fragment = match_context("a\nb MATCH c\nd", "match", 40, 40).unwrap();
+        assert!(fragment.contains("\\n"), "{fragment}");
+        assert!(!fragment.contains('\n'), "{fragment}");
+    }
+
+    #[test]
+    fn test_json_string_field_reads_the_id() {
+        assert_eq!(
+            json_string_field(r#"{"id":"abc-1","host":"h"}"#, "id").as_deref(),
+            Some("abc-1")
+        );
+        // Spacing from a pretty-printed line.
+        assert_eq!(
+            json_string_field(r#"{"id": "abc-2"}"#, "id").as_deref(),
+            Some("abc-2")
+        );
+        // The key text also appearing inside another value must not fool it.
+        assert_eq!(
+            json_string_field(r#"{"host":"id","id":"abc-3"}"#, "id").as_deref(),
+            Some("abc-3")
+        );
+        assert_eq!(
+            json_string_field(r#"{"id":"a\"b"}"#, "id").as_deref(),
+            Some("a\"b")
+        );
+        assert_eq!(json_string_field(r#"{"noid":"x"}"#, "id"), None);
+        // A non-string value under the key is not an id.
+        assert_eq!(json_string_field(r#"{"id":123}"#, "id"), None);
+    }
+
+    #[test]
+    fn test_history_enabled_flag_beats_env() {
+        assert!(history_enabled(false, None));
+        assert!(history_enabled(false, Some("1")));
+        assert!(history_enabled(false, Some("")));
+        // Only the exact "0" disables via the environment.
+        assert!(!history_enabled(false, Some("0")));
+        // --no-history wins over everything.
+        assert!(!history_enabled(true, None));
+        assert!(!history_enabled(true, Some("1")));
+    }
+
+    #[test]
+    fn test_rfc3339_utc_known_timestamps() {
+        let at =
+            |secs: u64| rfc3339_utc(std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs));
+        assert_eq!(at(0), "1970-01-01T00:00:00Z");
+        assert_eq!(at(946_684_800), "2000-01-01T00:00:00Z");
+        assert_eq!(at(1_700_000_000), "2023-11-14T22:13:20Z");
+        // Leap day in a leap year (Hinnant's civil_from_days).
+        assert_eq!(at(1_709_208_000), "2024-02-29T12:00:00Z");
+    }
+
+    #[test]
+    fn test_history_specific_helpers() {
+        assert_eq!(human_bytes(0), "0 B");
+        assert_eq!(human_bytes(1023), "1023 B");
+        assert_eq!(human_bytes(1024), "1.0 KiB");
+        assert_eq!(human_bytes(1536), "1.5 KiB");
+        assert_eq!(human_bytes(1024 * 1024), "1.0 MiB");
+
+        assert_eq!(prune_max_bytes(Some(10)), 10 * 1024 * 1024);
+        assert_eq!(prune_max_bytes(Some(0)), 0);
+        // "No cap" must saturate, not overflow (debug builds would panic).
+        assert_eq!(prune_max_bytes(None), u64::MAX);
+
+        assert!(!remote_is_windows("Linux x86_64", Some("linux-amd64")));
+        assert!(!remote_is_windows("Darwin arm64", Some("macos-arm64")));
+        assert!(remote_is_windows("Windows_NT AMD64", Some("windows-amd64")));
+        // Git-Bash/MSYS `uname` is not mapped to a release asset: the raw text
+        // must still be recognized as Windows.
+        assert!(remote_is_windows("MINGW64_NT-10.0-19045", None));
+        assert!(!remote_is_windows("", None));
+    }
+
+    #[test]
+    fn test_history_cli_surface_parses() {
+        // `history` must reach the subcommand parser, not be eaten by the
+        // optional `host` positional.
+        let cli = Cli::parse_from([
+            "rexec", "history", "list", "-n", "5", "--failed", "--host", "prod",
+        ]);
+        assert!(!cli.no_history);
+        assert!(cli.host.is_none());
+        match cli.action {
+            Action::History {
+                cmd:
+                    HistoryCmd::List {
+                        limit,
+                        host,
+                        failed,
+                    },
+            } => {
+                assert_eq!(limit, 5);
+                assert_eq!(host.as_deref(), Some("prod"));
+                assert!(failed);
+            }
+            _ => panic!("expected `history list`"),
+        }
+
+        let cli = Cli::parse_from(["rexec", "--no-history", "history", "show", "x-1", "--meta"]);
+        assert!(cli.no_history);
+        match cli.action {
+            Action::History {
+                cmd:
+                    HistoryCmd::Show {
+                        id,
+                        stdout,
+                        stderr,
+                        trace,
+                        meta,
+                    },
+            } => {
+                assert_eq!(id, "x-1");
+                assert!(meta && !stdout && !stderr && !trace);
+            }
+            _ => panic!("expected `history show`"),
+        }
+
+        let cli = Cli::parse_from([
+            "rexec", "history", "grep", "API_KEY", "--output", "--failed", "-n", "3",
+        ]);
+        match cli.action {
+            Action::History {
+                cmd:
+                    HistoryCmd::Grep {
+                        pattern,
+                        limit,
+                        host,
+                        failed,
+                        output,
+                    },
+            } => {
+                assert_eq!(pattern, "API_KEY");
+                assert_eq!(limit, 3);
+                assert!(host.is_none() && failed && output);
+            }
+            _ => panic!("expected `history grep`"),
+        }
+
+        let cli = Cli::parse_from([
+            "rexec",
+            "history",
+            "prune",
+            "--keep-days",
+            "7",
+            "--max-mb",
+            "50",
+        ]);
+        match cli.action {
+            Action::History {
+                cmd: HistoryCmd::Prune { keep_days, max_mb },
+            } => {
+                assert_eq!(keep_days, 7);
+                assert_eq!(max_mb, Some(50));
+            }
+            _ => panic!("expected `history prune`"),
+        }
+
+        // Defaults: `list` limit 20, `fetch` without --out.
+        let cli = Cli::parse_from(["rexec", "history", "list"]);
+        match cli.action {
+            Action::History {
+                cmd: HistoryCmd::List { limit, .. },
+            } => assert_eq!(limit, 20),
+            _ => panic!("expected `history list`"),
+        }
+        let cli = Cli::parse_from(["rexec", "history", "fetch", "x-1"]);
+        match cli.action {
+            Action::History {
+                cmd: HistoryCmd::Fetch { id, out },
+            } => {
+                assert_eq!(id, "x-1");
+                assert!(out.is_none());
+            }
+            _ => panic!("expected `history fetch`"),
+        }
+        // `host` plus `history` is rejected at dispatch, not parsed as a run.
+        let cli = Cli::parse_from(["rexec", "myhost", "history", "path"]);
+        assert_eq!(cli.host.as_deref(), Some("myhost"));
+        assert!(matches!(
+            cli.action,
+            Action::History {
+                cmd: HistoryCmd::Path
+            }
+        ));
+    }
+
+    #[test]
+    fn test_history_show_rejects_multiple_selectors() {
+        let err = history_show("20260922T041533Z-1", true, true, false, false).unwrap_err();
+        assert!(err.to_string().contains("at most one"), "{err}");
+    }
+
+    #[test]
+    fn test_build_record_maps_summary_capture_and_trace() {
+        let mut cap = RunCapture::new("echo hi", &[("K".to_string(), "V".to_string())]);
+        cap.stdout.push(b"hello");
+        cap.stderr.push(b"oops");
+        let summary = diagnostics::RunSummary {
+            host: "prod".to_string(),
+            resolved: "root@10.0.0.5:22".to_string(),
+            pid: Some(7),
+            exit_code: Some(1),
+            duration_ms: Some(1234),
+            deployed: true,
+            stdout_bytes: 5,
+            stderr_bytes: 4,
+            log_path: None,
+            error: None,
+        };
+        let mut trace = diagnostics::Trace::default();
+        trace.add("resolve: alias prod → root@10.0.0.5:22");
+
+        let rec = build_record(&cap, &summary, &trace);
+        assert_eq!(rec.id, cap.id);
+        assert!(
+            rec.id.ends_with(&format!("-{}", std::process::id())),
+            "{}",
+            rec.id
+        );
+        assert_eq!(rec.ts_start, cap.ts_start);
+        assert!(
+            rec.ts_start.ends_with('Z') && rec.ts_start.len() == 20,
+            "{}",
+            rec.ts_start
+        );
+        assert_eq!(rec.duration_ms, 1234);
+        assert_eq!(rec.host, "prod");
+        assert_eq!(rec.resolved, "root@10.0.0.5:22");
+        assert_eq!(rec.command, "echo hi");
+        assert_eq!(rec.env, vec![("K".to_string(), "V".to_string())]);
+        assert_eq!(rec.exit_code, Some(1));
+        assert_eq!(rec.pid, Some(7));
+        assert!(rec.deployed);
+        assert_eq!((rec.stdout_bytes, rec.stderr_bytes), (5, 4));
+        assert!(!rec.stdout_truncated && !rec.stderr_truncated);
+        assert_eq!(rec.rexec_version, env!("CARGO_PKG_VERSION"));
+        assert_eq!(
+            rec.trace,
+            vec!["resolve: alias prod → root@10.0.0.5:22".to_string()]
+        );
+
+        // A duration that was never measured (the run died before the boundary
+        // could time it) records as 0 rather than panicking.
+        let untimed = diagnostics::RunSummary {
+            duration_ms: None,
+            exit_code: None,
+            ..summary
+        };
+        let rec = build_record(&cap, &untimed, &trace);
+        assert_eq!(rec.duration_ms, 0);
+        assert_eq!(rec.exit_code, None);
+    }
+
+    #[test]
+    fn test_run_capture_marks_truncation_at_the_cap() {
+        let mut cap = RunCapture::new("cat big", &[]);
+        assert!(!cap.stdout.truncated());
+        cap.stdout.push(&vec![b'x'; history::CAPTURE_LIMIT + 1]);
+        assert!(cap.stdout.truncated());
+        assert_eq!(cap.stdout.total(), history::CAPTURE_LIMIT as u64 + 1);
+        // The untouched stream stays untruncated and empty.
+        assert!(!cap.stderr.truncated());
+        assert!(cap.stderr.captured().is_empty());
+    }
 }
 
 /// Simple shell quoting for a single argument.
@@ -1948,6 +2424,86 @@ fn remote_log_hint(remote_env: &ssh::RemoteEnv, pid: u32) -> String {
     }
 }
 
+/// Everything the CLI boundary needs to write a history record, filled by
+/// `run_command` before it touches the remote so a failure still leaves a
+/// record ("why did that fail?" is exactly what history is for).
+///
+/// Kept out of `diagnostics::RunSummary` on purpose: that struct is the
+/// `--json` contract (field order unit-tested) and `diagnostics.rs` belongs to
+/// another workstream, so the record's extra inputs — command, env, captures —
+/// are threaded separately instead of extending it.
+struct RunCapture {
+    id: String,
+    ts_start: String,
+    command: String,
+    env: Vec<(String, String)>,
+    stdout: history::RingCapture,
+    stderr: history::RingCapture,
+}
+
+impl RunCapture {
+    /// Start capturing a run whose command and env are already known.
+    fn new(command: &str, env: &[(String, String)]) -> Self {
+        Self {
+            id: history::new_id(std::process::id()),
+            ts_start: rfc3339_utc(std::time::SystemTime::now()),
+            command: command.to_string(),
+            env: env.to_vec(),
+            stdout: history::RingCapture::new(history::CAPTURE_LIMIT),
+            stderr: history::RingCapture::new(history::CAPTURE_LIMIT),
+        }
+    }
+}
+
+/// Assemble the record for a finished run from the summary, the capture and the
+/// decision trace. Split out of [`record_history`] so the mapping is
+/// unit-testable without writing into the real history tree.
+fn build_record(
+    cap: &RunCapture,
+    summary: &diagnostics::RunSummary,
+    trace: &diagnostics::Trace,
+) -> history::RunRecord {
+    history::RunRecord {
+        id: cap.id.clone(),
+        ts_start: cap.ts_start.clone(),
+        duration_ms: summary.duration_ms.unwrap_or(0),
+        host: summary.host.clone(),
+        resolved: summary.resolved.clone(),
+        command: cap.command.clone(),
+        env: cap.env.clone(),
+        exit_code: summary.exit_code,
+        pid: summary.pid,
+        deployed: summary.deployed,
+        // The captures' own totals are the authoritative byte counts: they are
+        // what the stored logs contain (and where truncation applies), so a
+        // record can never disagree with its own artifacts.
+        stdout_bytes: cap.stdout.total(),
+        stderr_bytes: cap.stderr.total(),
+        stdout_truncated: cap.stdout.truncated(),
+        stderr_truncated: cap.stderr.truncated(),
+        rexec_version: env!("CARGO_PKG_VERSION").to_string(),
+        trace: trace.lines().to_vec(),
+    }
+}
+
+/// Write the history record for a finished run — success OR failure.
+///
+/// Best-effort by contract: history must never change a run's outcome or exit
+/// status, so a write error is one warning line on stderr and nothing more.
+/// `None` means recording is off for this invocation: nothing was captured.
+fn record_history(
+    capture: Option<&RunCapture>,
+    summary: &diagnostics::RunSummary,
+    trace: &diagnostics::Trace,
+) {
+    let Some(cap) = capture else { return };
+    let rec = build_record(cap, summary, trace);
+    if let Err(e) = history::record(&rec, Some(&cap.stdout), Some(&cap.stderr)) {
+        ensure_stderr_line_start();
+        eprintln!("⚠ history: {e:#}");
+    }
+}
+
 /// Core run logic: deploy worker, stream output, reconnect on disconnect.
 ///
 /// Every decision lands in `trace` (printed on failure in any mode, on success
@@ -1963,8 +2519,16 @@ async fn run_command(
     env: &[(String, String)],
     trace: &mut diagnostics::Trace,
     summary: &mut diagnostics::RunSummary,
+    capture: &mut Option<RunCapture>,
 ) -> Result<()> {
     summary.resolved = resolved_label(remote);
+
+    // Record the intent before the first remote touch: the command and its env
+    // are already known, so even a failure to connect leaves an analyzable
+    // record (the ring captures are only allocated when recording is on).
+    if history::enabled() {
+        *capture = Some(RunCapture::new(command, env));
+    }
 
     // TODO(trace): done — the traced variant is on this branch, so it is
     // called here (it records the target, handshake and every auth attempt).
@@ -2089,6 +2653,9 @@ async fn run_command(
                                 FrameType::Stdout => {
                                     use std::io::Write;
                                     summary.stdout_bytes += frame.data.len() as u64;
+                                    if let Some(cap) = capture.as_mut() {
+                                        cap.stdout.push(&frame.data);
+                                    }
                                     let stdout = std::io::stdout();
                                     let mut lock = stdout.lock();
                                     lock.write_all(&frame.data)?;
@@ -2097,6 +2664,9 @@ async fn run_command(
                                 FrameType::Stderr => {
                                     use std::io::Write;
                                     summary.stderr_bytes += frame.data.len() as u64;
+                                    if let Some(cap) = capture.as_mut() {
+                                        cap.stderr.push(&frame.data);
+                                    }
                                     note_stderr_write(&frame.data);
                                     // Interactive stderr gets the remote's error
                                     // output in red; piped/agent use stays
@@ -2167,6 +2737,9 @@ async fn run_command(
                             lock.write_all(data)?;
                             lock.flush()?;
                             summary.stderr_bytes += data.len() as u64;
+                            if let Some(cap) = capture.as_mut() {
+                                cap.stderr.push(data);
+                            }
                             note_stderr_write(data);
                             worker_stderr.extend_from_slice(data);
                             if worker_stderr.len() > WORKER_STDERR_KEEP {
@@ -2323,6 +2896,12 @@ fn detect_runner(script: &Path) -> Result<Option<String>> {
 }
 
 /// Sync a local script to the remote and run it (the `script` subcommand).
+///
+/// Ten parameters is the lint threshold, but they are distinct borrows threaded
+/// straight from `main()` (the three instrumentation borrows — trace, summary,
+/// capture — are shared with `run_command`); grouping them into a struct would
+/// only rename the same fields and re-plumb every call site.
+#[allow(clippy::too_many_arguments)]
 async fn run_script(
     remote: &RemoteHost,
     host: &str,
@@ -2333,6 +2912,7 @@ async fn run_script(
     env_vars: &[(String, String)],
     trace: &mut diagnostics::Trace,
     summary: &mut diagnostics::RunSummary,
+    capture: &mut Option<RunCapture>,
 ) -> Result<()> {
     let basename = script
         .file_name()
@@ -2405,7 +2985,7 @@ async fn run_script(
         "script: synced {} → {remote_script}",
         script.display()
     ));
-    run_command(remote, host, &command, env_vars, trace, summary).await?;
+    run_command(remote, host, &command, env_vars, trace, summary, capture).await?;
     Ok(())
 }
 
@@ -2650,8 +3230,746 @@ fn list_hosts(alias: Option<&str>) -> Result<()> {
     Ok(())
 }
 
-/// Serialize [`diagnostics::RunSummary`] as ONE line of JSON, by hand.
+// ───────────────────────────── history ─────────────────────────────
+//
+// `rexec history …` reads the local store written by `record_history` at the
+// CLI boundary. Everything here is local and read-only except `prune` (which
+// deletes runs) and `fetch` (one read-only `cat` on the remote). stdout carries
+// pure data — tables and raw artifacts — so it can be piped; friendly notes and
+// warnings go to stderr.
+
+/// The enable decision for one invocation: `--no-history` wins, then
+/// `REXEC_HISTORY` (exactly `0` disables; anything else, including unset, keeps
+/// recording on). Pure, so the rule is unit-tested without touching the
+/// process environment.
+fn history_enabled(no_history: bool, rexec_history: Option<&str>) -> bool {
+    !no_history && rexec_history != Some("0")
+}
+
+/// RFC 3339 UTC timestamp (`2026-09-22T04:15:33Z`) for a `SystemTime`.
 ///
+/// `chrono`/`time` are not dependencies (and `Cargo.toml` belongs to another
+/// workstream), so days→civil-date is done here with Howard Hinnant's
+/// algorithm. Second precision: that is the run id's precision, and a record
+/// never needs sub-second resolution to be read back.
+fn rfc3339_utc(t: std::time::SystemTime) -> String {
+    // A clock before 1970 is not worth failing a run over; the epoch stands in.
+    let secs = t
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0) as i64;
+    let days = secs.div_euclid(86_400);
+    let rem = secs.rem_euclid(86_400);
+    let (h, mi, s) = (rem / 3600, (rem % 3600) / 60, rem % 60);
+    // Shift the epoch to 0000-03-01 so the leap day lands at the end of the
+    // 400-year cycle (Hinnant's civil_from_days).
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    format!("{y:04}-{m:02}-{d:02}T{h:02}:{mi:02}:{s:02}Z")
+}
+
+/// Escaped rendering of one character for a single-line cell.
+fn escaped_cell(c: char) -> String {
+    match c {
+        '\n' => "\\n".to_string(),
+        '\r' => "\\r".to_string(),
+        '\t' => "\\t".to_string(),
+        c if (c as u32) < 0x20 || c == '\u{7f}' => format!("\\u{:04x}", c as u32),
+        c => c.to_string(),
+    }
+}
+
+/// One-line view of arbitrary text: C0 controls escaped, then cut to at most
+/// `max` rendered characters (never mid-UTF-8) with a trailing `…` when
+/// something was dropped. Table cells and search fragments both need this — a
+/// raw newline in a recorded command would otherwise break every row.
+fn single_line(text: &str, max: usize) -> String {
+    if max == 0 {
+        return String::new();
+    }
+    let cells: Vec<String> = text.chars().map(escaped_cell).collect();
+    let total: usize = cells.iter().map(|c| c.chars().count()).sum();
+    // When it all fits, keep every character; otherwise reserve one cell for
+    // the marker so the result is still at most `max` wide.
+    let budget = if total <= max { max } else { max - 1 };
+    let mut out = String::with_capacity(total.min(max) + 1);
+    let mut cost = 0;
+    for cell in &cells {
+        let n = cell.chars().count();
+        if cost + n > budget {
+            break;
+        }
+        out.push_str(cell);
+        cost += n;
+    }
+    if total > max {
+        out.push('…');
+    }
+    out
+}
+
+/// Nearest-rank percentile of a SORTED slice (`stats` p50/p95).
+///
+/// Nearest rank (no interpolation) keeps the reported number an actually
+/// observed duration: `index = ceil(percent/100 * n) - 1`. `None` when empty.
+fn percentile(sorted: &[u64], percent: u32) -> Option<u64> {
+    if sorted.is_empty() {
+        return None;
+    }
+    let n = sorted.len();
+    let rank = ((percent as usize) * n).div_ceil(100).max(1);
+    Some(sorted[(rank - 1).min(n - 1)])
+}
+
+/// Byte count in a short human form, for the `stats`/`prune` reports.
+fn human_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit + 1 < UNITS.len() {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} B")
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
+    }
+}
+
+/// Shared `list`/`grep`/`stats` filters.
+///
+/// `host` matches the alias as typed or the resolved target, ASCII-case-
+/// insensitively and as a substring (`--host prod` also finds `prod-2`);
+/// `failed` keeps only runs whose exit was non-zero or was never observed at
+/// all — a worker that died is a failure too.
+fn record_matches(rec: &history::RunRecord, host: Option<&str>, failed: bool) -> bool {
+    if failed && rec.exit_code == Some(0) {
+        return false;
+    }
+    match host {
+        Some(h) if !h.is_empty() => {
+            let h = h.to_ascii_lowercase();
+            rec.host.to_ascii_lowercase().contains(&h)
+                || rec.resolved.to_ascii_lowercase().contains(&h)
+        }
+        _ => true,
+    }
+}
+
+/// One-line window around the first ASCII-case-insensitive occurrence of
+/// `needle_lower` (the caller lowercases it) in `hay`: up to `before` leading
+/// and `after` trailing characters of context, controls escaped, `…` marking a
+/// clipped edge. `None` when there is no match. Plain substring matching — the
+/// `regex` crate is not a dependency.
+fn match_context(hay: &str, needle_lower: &str, before: usize, after: usize) -> Option<String> {
+    if needle_lower.is_empty() {
+        return None;
+    }
+    // ASCII folding preserves byte offsets, so an index into the folded text is
+    // a char boundary in the original (Unicode folding could shift it).
+    let folded = hay.to_ascii_lowercase();
+    let at = folded.find(needle_lower)?;
+    let match_end = at + needle_lower.len();
+    let start = if before == 0 {
+        at
+    } else {
+        hay[..at]
+            .char_indices()
+            .rev()
+            .nth(before - 1)
+            .map(|(i, _)| i)
+            .unwrap_or(0)
+    };
+    let window_end = if after == 0 {
+        match_end
+    } else {
+        hay[match_end..]
+            .char_indices()
+            .nth(after)
+            .map(|(i, _)| match_end + i)
+            .unwrap_or(hay.len())
+    };
+    let mut out = String::new();
+    if start > 0 {
+        out.push('…');
+    }
+    out.push_str(&single_line(&hay[start..window_end], usize::MAX));
+    if window_end < hay.len() {
+        out.push('…');
+    }
+    Some(out)
+}
+
+/// Value of the first `"key":"…"` string field in one JSON line.
+///
+/// Hand-rolled for the same reason `summary_json_line` is: `--meta` must print
+/// the stored index line verbatim, so the raw text is scanned instead of
+/// re-serialized, and no JSON parser is pulled in for one comparison.
+fn json_string_field(line: &str, key: &str) -> Option<String> {
+    let needle = format!("\"{key}\"");
+    let mut rest = line;
+    while let Some(at) = rest.find(&needle) {
+        // Scan past this occurrence either way: the key text can also appear
+        // inside an unrelated string value.
+        rest = rest[at + needle.len()..].trim_start();
+        if let Some(after) = rest.strip_prefix(':').map(str::trim_start)
+            && let Some(body) = after.strip_prefix('"')
+        {
+            let mut out = String::new();
+            let mut escaped = false;
+            for c in body.chars() {
+                if escaped {
+                    out.push(match c {
+                        'n' => '\n',
+                        't' => '\t',
+                        'r' => '\r',
+                        other => other,
+                    });
+                    escaped = false;
+                } else if c == '\\' {
+                    escaped = true;
+                } else if c == '"' {
+                    return Some(out);
+                } else {
+                    out.push(c);
+                }
+            }
+            return None; // unterminated string: malformed line
+        }
+    }
+    None
+}
+
+/// The raw `index.jsonl` line for a run id, printed verbatim by `show --meta`
+/// (key order, spacing and unknown future keys stay exactly as stored —
+/// re-serializing would silently drop what this build does not know).
+fn raw_index_line(id: &str) -> Result<String> {
+    let path = history::index_path()?;
+    let text =
+        std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
+    for line in text.lines() {
+        if json_string_field(line, "id").as_deref() == Some(id) {
+            return Ok(line.to_string());
+        }
+    }
+    Err(anyhow!("no such run: {id}"))
+}
+
+/// Index records, with "no history yet" expressed as an empty list.
+///
+/// The first run on a machine has no index file at all: read-only commands must
+/// treat that as "nothing recorded" (friendly note; `list`/`stats` still exit
+/// 0) rather than as an IO error.
+fn load_index_or_empty() -> Result<Vec<history::RunRecord>> {
+    if !history::index_path()?.exists() {
+        return Ok(Vec::new());
+    }
+    history::load_index()
+}
+
+/// Friendly note for a missing/empty history — stderr, so stdout stays data.
+fn note_empty_history() {
+    match history::history_root() {
+        Ok(root) => eprintln!("(no runs recorded yet — history: {})", root.display()),
+        Err(_) => eprintln!("(no runs recorded yet)"),
+    }
+    if !history::enabled() {
+        eprintln!("(recording is disabled in this invocation: --no-history or REXEC_HISTORY=0)");
+    }
+}
+
+/// Captured-artifact path, from the documented layout (`runs/<id>/stdout.log`,
+/// `stderr.log`). Used only to tell "this stream captured nothing" (a clean run
+/// writes no file for it) from a read error; bytes always come back through
+/// `history::read_artifact`.
+fn artifact_path(id: &str, which: history::Artifact) -> Result<PathBuf> {
+    let name = match which {
+        history::Artifact::Stdout => "stdout.log",
+        history::Artifact::Stderr => "stderr.log",
+    };
+    Ok(history::history_root()?.join("runs").join(id).join(name))
+}
+
+fn artifact_name(which: history::Artifact) -> &'static str {
+    match which {
+        history::Artifact::Stdout => "stdout",
+        history::Artifact::Stderr => "stderr",
+    }
+}
+
+/// Write one captured stream as RAW bytes to stdout — no added newline, so
+/// `show --stdout > f` is byte-identical to the capture.
+fn show_artifact(id: &str, which: history::Artifact) -> Result<()> {
+    let path = artifact_path(id, which)?;
+    if !path.exists() {
+        status!("(no {} captured for run {id})", artifact_name(which));
+        return Ok(());
+    }
+    let bytes =
+        history::read_artifact(id, which).with_context(|| format!("reading {}", path.display()))?;
+    use std::io::Write;
+    let stdout = std::io::stdout();
+    let mut lock = stdout.lock();
+    lock.write_all(&bytes)?;
+    lock.flush()?;
+    Ok(())
+}
+
+/// `history list`: one table row per run, newest first.
+fn history_list(limit: usize, host: Option<&str>, failed: bool) -> Result<()> {
+    let records = load_index_or_empty()?;
+    if records.is_empty() {
+        note_empty_history();
+        return Ok(());
+    }
+    println!(
+        "{:<24} {:<20} {:<20} {:<5} {:>9}  COMMAND",
+        "ID", "STARTED", "HOST", "EXIT", "DURATION_MS"
+    );
+    for rec in records
+        .iter()
+        .filter(|r| record_matches(r, host, failed))
+        .take(limit)
+    {
+        println!(
+            "{:<24} {:<20} {:<20} {:<5} {:>9}  {}",
+            single_line(&rec.id, 24),
+            single_line(&rec.ts_start, 20),
+            single_line(if rec.host.is_empty() { "-" } else { &rec.host }, 20),
+            rec.exit_code
+                .map(|c| c.to_string())
+                .unwrap_or_else(|| "-".to_string()),
+            rec.duration_ms,
+            single_line(&rec.command, 60),
+        );
+    }
+    Ok(())
+}
+
+/// `history show`: a human summary, or exactly one raw artifact when a selector
+/// flag is given (stdout then carries only those bytes).
+fn history_show(id: &str, stdout: bool, stderr: bool, trace: bool, meta: bool) -> Result<()> {
+    let selectors = [stdout, stderr, trace, meta].iter().filter(|s| **s).count();
+    if selectors > 1 {
+        return Err(anyhow!(
+            "choose at most one of --stdout / --stderr / --trace / --meta"
+        ));
+    }
+    let records = load_index_or_empty()?;
+    let Some(rec) = records.iter().find(|r| r.id == id) else {
+        if records.is_empty() {
+            note_empty_history();
+        }
+        return Err(anyhow!("no such run: {id} (see `rexec history list`)"));
+    };
+
+    if stdout {
+        return show_artifact(id, history::Artifact::Stdout);
+    }
+    if stderr {
+        return show_artifact(id, history::Artifact::Stderr);
+    }
+    if trace {
+        for line in &rec.trace {
+            println!("{line}");
+        }
+        return Ok(());
+    }
+    if meta {
+        println!("{}", raw_index_line(id)?);
+        return Ok(());
+    }
+
+    let run_dir = history::history_root()?.join("runs").join(id);
+    let dash = |s: &str| {
+        if s.is_empty() {
+            "-".to_string()
+        } else {
+            s.to_string()
+        }
+    };
+    let opt = |v: Option<u32>| v.map(|v| v.to_string()).unwrap_or_else(|| "-".to_string());
+    let trunc = |t: bool| {
+        if t {
+            " (truncated at the capture cap)"
+        } else {
+            ""
+        }
+    };
+    println!("id:        {}", rec.id);
+    println!("start:     {}", rec.ts_start);
+    println!("duration:  {} ms", rec.duration_ms);
+    println!("version:   {}", rec.rexec_version);
+    println!("host:      {}", dash(&rec.host));
+    println!("resolved:  {}", dash(&rec.resolved));
+    println!(
+        "exit:      {}",
+        rec.exit_code
+            .map(|c| c.to_string())
+            .unwrap_or_else(|| "-".to_string())
+    );
+    println!("pid:       {}", opt(rec.pid));
+    println!("deployed:  {}", if rec.deployed { "yes" } else { "no" });
+    println!(
+        "stdout:    {} B{}",
+        rec.stdout_bytes,
+        trunc(rec.stdout_truncated)
+    );
+    println!(
+        "stderr:    {} B{}",
+        rec.stderr_bytes,
+        trunc(rec.stderr_truncated)
+    );
+    println!("command:   {}", single_line(&rec.command, 200));
+    if rec.env.is_empty() {
+        println!("env:       (none)");
+    } else {
+        for (k, v) in &rec.env {
+            println!("env:       {}={}", single_line(k, 60), single_line(v, 200));
+        }
+    }
+    println!(
+        "artifacts: {} (meta.json, stdout.log, stderr.log)",
+        run_dir.display()
+    );
+    if rec.trace.is_empty() {
+        println!("trace:     (none)");
+    } else {
+        println!("trace:");
+        for line in &rec.trace {
+            println!("  → {line}");
+        }
+    }
+    Ok(())
+}
+
+/// `history grep`: plain case-insensitive substring search over every run's
+/// command and env values (+ captured output with `--output`), one line per
+/// matched source, each prefixed by the run id.
+fn history_grep(
+    pattern: &str,
+    limit: usize,
+    host: Option<&str>,
+    failed: bool,
+    output: bool,
+) -> Result<()> {
+    let records = load_index_or_empty()?;
+    if records.is_empty() {
+        note_empty_history();
+        return Err(anyhow!("nothing recorded to search for {pattern:?}"));
+    }
+    let needle = pattern.to_ascii_lowercase();
+    if needle.is_empty() {
+        return Err(anyhow!("empty search pattern"));
+    }
+    let mut runs = 0usize;
+    for rec in records.iter().filter(|r| record_matches(r, host, failed)) {
+        if runs >= limit {
+            break;
+        }
+        let mut lines: Vec<String> = Vec::new();
+        if let Some(fragment) = match_context(&rec.command, &needle, 40, 40) {
+            lines.push(format!("cmd: {fragment}"));
+        }
+        for (k, v) in &rec.env {
+            if let Some(fragment) = match_context(v, &needle, 40, 40) {
+                lines.push(format!("env {k}={fragment}"));
+            }
+        }
+        if output {
+            for which in [history::Artifact::Stdout, history::Artifact::Stderr] {
+                // A stream that captured nothing simply has nothing to match.
+                let Ok(bytes) = history::read_artifact(&rec.id, which) else {
+                    continue;
+                };
+                let text = String::from_utf8_lossy(&bytes);
+                if let Some(fragment) = match_context(&text, &needle, 40, 40) {
+                    lines.push(format!("{}: {fragment}", artifact_name(which)));
+                }
+            }
+        }
+        if lines.is_empty() {
+            continue;
+        }
+        for line in lines {
+            println!("{} {}", rec.id, line);
+        }
+        runs += 1;
+    }
+    if runs == 0 {
+        return Err(anyhow!("no recorded run matches {pattern:?}"));
+    }
+    Ok(())
+}
+
+/// `history stats`: totals, failures, p50/p95 duration, captured bytes and the
+/// on-disk tree size.
+fn history_stats(host: Option<&str>) -> Result<()> {
+    let records = load_index_or_empty()?;
+    if records.is_empty() {
+        note_empty_history();
+        return Ok(());
+    }
+    let matched: Vec<&history::RunRecord> = records
+        .iter()
+        .filter(|r| record_matches(r, host, false))
+        .collect();
+    let failures = matched.iter().filter(|r| r.exit_code != Some(0)).count();
+    let mut durations: Vec<u64> = matched.iter().map(|r| r.duration_ms).collect();
+    durations.sort_unstable();
+    let stdout_bytes: u64 = matched.iter().map(|r| r.stdout_bytes).sum();
+    let stderr_bytes: u64 = matched.iter().map(|r| r.stderr_bytes).sum();
+    let root = history::history_root()?;
+    let on_disk = history::tree_size(&root);
+    let ms = |v: Option<u64>| match v {
+        Some(v) => format!("{v} ms"),
+        None => "-".to_string(),
+    };
+    println!("runs:      {}", matched.len());
+    println!("failures:  {failures}");
+    println!(
+        "duration:  p50 {}, p95 {}",
+        ms(percentile(&durations, 50)),
+        ms(percentile(&durations, 95))
+    );
+    println!(
+        "captured:  {stdout_bytes} B stdout + {stderr_bytes} B stderr (true bytes seen, before the \
+         per-stream cap)"
+    );
+    println!("on disk:   {on_disk} B ({})", human_bytes(on_disk));
+    println!("per host:");
+    let mut per_host: std::collections::BTreeMap<&str, (usize, usize)> =
+        std::collections::BTreeMap::new();
+    for rec in &matched {
+        let entry = per_host.entry(rec.host.as_str()).or_insert((0, 0));
+        entry.0 += 1;
+        if rec.exit_code != Some(0) {
+            entry.1 += 1;
+        }
+    }
+    for (name, (total, failed)) in &per_host {
+        println!(
+            "  {:<24} {} runs, {} failed",
+            if name.is_empty() { "-" } else { name },
+            total,
+            failed
+        );
+    }
+    println!("history:   {}", root.display());
+    Ok(())
+}
+
+/// Byte budget for `prune`. No `--max-mb` means "no size cap": the literal
+/// `u64::MAX / 2 * 1024 * 1024` overflows (debug builds panic, release wraps to
+/// a bogus few-KiB cap), so the multiply saturates — the intent is an
+/// unreachable cap, not arithmetic.
+fn prune_max_bytes(max_mb: Option<u64>) -> u64 {
+    max_mb.unwrap_or(u64::MAX / 2).saturating_mul(1024 * 1024)
+}
+
+/// `history prune`: delete expired runs, then enforce the size cap.
+fn history_prune(keep_days: u64, max_mb: Option<u64>) -> Result<()> {
+    let (removed, freed) = history::prune(keep_days, prune_max_bytes(max_mb))?;
+    println!(
+        "pruned {removed} run(s), freed {freed} B ({})",
+        human_bytes(freed)
+    );
+    Ok(())
+}
+
+/// Does a read-only platform probe describe a Windows remote? `uname` under
+/// Git-Bash/MSYS reports `MINGW64_NT…`, which `plan_remote_asset` leaves
+/// unmapped, so the raw probe text is checked as well.
+fn remote_is_windows(platform: &str, asset: Option<&str>) -> bool {
+    asset.is_some_and(|a| a.starts_with("windows-"))
+        || platform.contains("Windows_NT")
+        || platform.contains("MINGW")
+        || platform.contains("MSYS")
+}
+
+/// Read a remote file as RAW bytes: exactly one read-only `cat`.
+///
+/// `ssh::exec_remote` returns a `String` built with `from_utf8_lossy`, which
+/// replaces every invalid sequence with U+FFFD — the worker log is a binary
+/// frame stream, so lossy decoding would corrupt precisely the bytes `fetch`
+/// exists to preserve. Hence this byte-exact reader over one channel (no
+/// deploy, no write, no second command). Returns `(stdout, stderr, exit)`.
+async fn read_remote_bytes(
+    session: &russh::client::Handle<ssh::ClientHandler>,
+    command: &str,
+) -> Result<(Vec<u8>, Vec<u8>, Option<i32>)> {
+    let mut channel = session.channel_open_session().await?;
+    channel.exec(true, command).await?;
+    let mut out = Vec::new();
+    let mut err = Vec::new();
+    let mut code = None;
+    let mut eof = false;
+    // Wait for BOTH eof and the exit status: "no such file" is only visible in
+    // the status, and the status may arrive after Eof. A closed channel (`None`)
+    // ends the loop either way.
+    while !(eof && code.is_some()) {
+        let msg = if eof {
+            // After EOF the only thing left is the exit status. OpenSSH always
+            // sends one, but a server that does not must not hang the fetch —
+            // the status is then inferred from stderr/stdout below.
+            match tokio::time::timeout(Duration::from_secs(5), channel.wait()).await {
+                Ok(msg) => msg,
+                Err(_) => break,
+            }
+        } else {
+            channel.wait().await
+        };
+        match msg {
+            Some(ChannelMsg::Data { ref data }) => out.extend_from_slice(data),
+            Some(ChannelMsg::ExtendedData { ref data, ext: 1 }) => err.extend_from_slice(data),
+            Some(ChannelMsg::ExitStatus { exit_status }) => code = Some(exit_status as i32),
+            Some(ChannelMsg::Eof) => eof = true,
+            Some(_) => {}
+            None => break,
+        }
+    }
+    Ok((out, err, code))
+}
+
+/// `history fetch <id> [--out PATH]` — pull the FULL remote worker log of a
+/// recorded run.
+///
+/// READ-ONLY on the remote: connect, one read-only platform probe, one `cat`.
+/// No deploy and no write. The log holds the binary frame protocol the local
+/// CLI decodes, so the bytes are streamed verbatim (decoding them is a
+/// follow-up) and a warning on stderr says so; `--out` keeps stdout clean.
+async fn history_fetch(
+    id: &str,
+    out: Option<&Path>,
+    port: Option<u16>,
+    trace: &mut diagnostics::Trace,
+) -> Result<()> {
+    let records = load_index_or_empty()?;
+    let Some(rec) = records.iter().find(|r| r.id == id) else {
+        if records.is_empty() {
+            note_empty_history();
+        }
+        return Err(anyhow!("no such run: {id} (see `rexec history list`)"));
+    };
+    // No pid means the worker never reported one: there is no remote log to
+    // read, and the record itself is the answer.
+    let pid = rec.pid.ok_or_else(|| {
+        anyhow!(
+            "run {id} has no remote PID, so there is no remote worker log to fetch — the worker \
+             never started. `rexec history show {id}` has what was captured before it failed."
+        )
+    })?;
+    let host = rec.host.clone();
+    // The fetch's decisions go into THIS invocation's trace — never the
+    // recorded run's: reading a record back is not the run that produced it.
+    // Using the boundary's trace (empty for a `history` command) rather than a
+    // throwaway local one is what makes a failed fetch print its resolution and
+    // auth context, as every other command's failure does.
+    let remote = resolve_host(&host, port, trace)?;
+    let session = ssh::connect_traced(&remote, trace).await?;
+    // Read-only platform probe (never deploys): a Windows remote keeps its log
+    // at <home>\.rexec\logs\<pid>.log, which needs a different command path.
+    let (platform, asset) = probe_remote_platform(&session).await;
+    if remote_is_windows(&platform, asset.as_deref()) {
+        let home = probe_windows_home(&session).await;
+        let home = home.trim_end_matches('\\');
+        return Err(anyhow!(
+            "run {id} was on a Windows remote ({platform}): its worker log is at \
+             {home}\\.rexec\\logs\\{pid}.log — fetch it with scp/sftp; `history fetch` reads the \
+             POSIX path only"
+        ));
+    }
+    let command = format!("cat \"$HOME/.rexec/logs/{pid}.log\"");
+    let (bytes, err, code) = read_remote_bytes(&session, &command).await?;
+    // `cat` reports a missing/unreadable file with a non-zero status plus an
+    // error on stderr; a present-but-empty log must still succeed.
+    let failed =
+        code.is_some_and(|c| c != 0) || (code.is_none() && bytes.is_empty() && !err.is_empty());
+    if failed {
+        let detail = String::from_utf8_lossy(&err);
+        let detail = detail.trim();
+        let detail = if detail.is_empty() {
+            String::new()
+        } else {
+            format!(" ({detail})")
+        };
+        return Err(anyhow!(
+            "no worker log at ~/.rexec/logs/{pid}.log on {host}{detail} — the worker removes it \
+             after a clean exit, and a different remote user has a different home"
+        ));
+    }
+    // Say what these bytes are BEFORE dumping them: stderr, so a pipe stays
+    // byte-pure.
+    status!(
+        "⚠ fetched {} B of raw worker frame stream (binary, not decoded) — `rexec history show \
+         {id} --stdout/--stderr` is the decoded capture",
+        bytes.len()
+    );
+    match out {
+        Some(path) => {
+            std::fs::write(path, &bytes).with_context(|| format!("writing {}", path.display()))?;
+            status!("wrote {} bytes to {}", bytes.len(), path.display());
+        }
+        None => {
+            use std::io::Write;
+            let stdout = std::io::stdout();
+            let mut lock = stdout.lock();
+            lock.write_all(&bytes)?;
+            lock.flush()?;
+        }
+    }
+    Ok(())
+}
+
+/// Dispatch `rexec history …`. `port` is the global `-p/--port`, used only by
+/// `fetch`, which re-resolves the recorded host the same way a run does;
+/// `trace` is this invocation's (empty) decision trace, so a failed fetch
+/// reports its resolution/connect context like every other command.
+async fn run_history(
+    cmd: HistoryCmd,
+    port: Option<u16>,
+    trace: &mut diagnostics::Trace,
+) -> Result<()> {
+    match cmd {
+        HistoryCmd::List {
+            limit,
+            host,
+            failed,
+        } => history_list(limit, host.as_deref(), failed),
+        HistoryCmd::Show {
+            id,
+            stdout,
+            stderr,
+            trace,
+            meta,
+        } => history_show(&id, stdout, stderr, trace, meta),
+        HistoryCmd::Grep {
+            pattern,
+            limit,
+            host,
+            failed,
+            output,
+        } => history_grep(&pattern, limit, host.as_deref(), failed, output),
+        HistoryCmd::Stats { host } => history_stats(host.as_deref()),
+        HistoryCmd::Path => {
+            println!("{}", history::history_root()?.display());
+            Ok(())
+        }
+        HistoryCmd::Prune { keep_days, max_mb } => history_prune(keep_days, max_mb),
+        HistoryCmd::Fetch { id, out } => history_fetch(&id, out.as_deref(), port, trace).await,
+    }
+}
+
+/// Serialize [`diagnostics::RunSummary`] as ONE line of JSON, by hand.
 /// `serde` (derive) is a direct dependency but the formatter (`serde_json`) is
 /// not, and `Cargo.toml` is owned by another workstream — so the fields are
 /// written in declaration order with a minimal escaper. The order is stable
@@ -2747,20 +4065,37 @@ fn attach_trace(err: anyhow::Error, trace: &diagnostics::Trace) -> anyhow::Error
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Restore the default SIGPIPE behaviour on unix. Rust ignores SIGPIPE at
+    // startup, which turns a closed pipe into an EPIPE error — and `println!`
+    // PANICS on that ("failed printing to stdout: Broken pipe"). Piping the
+    // output-friendly subcommands (`history show <id> --stdout | head`,
+    // `history list | head`) must instead end the process quietly, the way
+    // cat/grep/ssh do. Fixing it here covers every print path at once.
+    #[cfg(unix)]
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
+
     let cli = Cli::parse();
     QUIET.store(cli.quiet, Ordering::Relaxed);
     JSON_SUMMARY.store(cli.json, Ordering::Relaxed);
+    // `--no-history` and `REXEC_HISTORY=0` both disable recording; the combined
+    // rule is pure and unit-tested (`history::enabled()` is the runtime view).
+    history::set_enabled(history_enabled(
+        cli.no_history,
+        std::env::var("REXEC_HISTORY").ok().as_deref(),
+    ));
     diagnostics::OUTPUT_MODE.store(
         diagnostics::OutputMode::from_flags(cli.quiet, cli.verbose).as_u8(),
         Ordering::Relaxed,
     );
 
-    // The JSON summary describes an execution run; `list` (and the internal
-    // worker/attach commands) have no such summary to report.
+    // The JSON summary describes an execution run; `list` and `history` (and
+    // the internal worker/attach commands) have no such summary to report.
     let json = cli.json
         && !matches!(
             cli.action,
-            Action::List { .. } | Action::Worker | Action::Attach { .. }
+            Action::List { .. } | Action::History { .. } | Action::Worker | Action::Attach { .. }
         );
     let started = Instant::now();
     let mut trace = diagnostics::Trace::default();
@@ -2778,6 +4113,9 @@ async fn main() -> Result<()> {
         log_path: None,
         error: None,
     };
+    // Filled by `run_command` when recording is on; read back at the boundary
+    // below, on success AND failure, so a failed run is recorded too.
+    let mut capture: Option<RunCapture> = None;
 
     let result: Result<()> = async {
         match (cli.host, cli.action, cli.port) {
@@ -2816,6 +4154,7 @@ async fn main() -> Result<()> {
                     &env_vars,
                     &mut trace,
                     &mut summary,
+                    &mut capture,
                 )
                 .await?;
             }
@@ -2843,6 +4182,7 @@ async fn main() -> Result<()> {
                     &env_vars,
                     &mut trace,
                     &mut summary,
+                    &mut capture,
                 )
                 .await?;
             }
@@ -2855,6 +4195,16 @@ async fn main() -> Result<()> {
             // ── Host listing (no host needed) ──
             (_, Action::List { alias }, _) => {
                 list_hosts(alias.as_deref())?;
+            }
+
+            // ── Local run history (no host: it is a local store) ──
+            (None, Action::History { cmd }, port) => {
+                run_history(cmd, port, &mut trace).await?;
+            }
+            (Some(_), Action::History { .. }, _) => {
+                return Err(anyhow!(
+                    "history is a local command and takes no host — use `rexec history …`"
+                ));
             }
 
             // ── Remote operations (internal, invoked via SSH exec) ──
@@ -2912,6 +4262,10 @@ async fn main() -> Result<()> {
                     eprint!("{rendered}");
                 }
             }
+            // Recorded before the JSON line: a best-effort history warning must
+            // not land after the summary this contract keeps LAST on stderr.
+            // The Ok path covers a non-zero remote exit too.
+            record_history(capture.as_ref(), &summary, &trace);
             if json {
                 // stderr, and last: stdout stays pure command output.
                 ensure_stderr_line_start();
@@ -2934,6 +4288,11 @@ async fn main() -> Result<()> {
             // so failure output is unchanged for non-JSON users.
             ensure_stderr_line_start();
             eprintln!("Error: {:?}", attach_trace(err, &trace));
+            // A failure is recorded too, as long as the run got far enough to
+            // know the host and the command (run_command sets the capture
+            // before its first remote touch). Before the JSON line, so a
+            // history warning cannot displace the summary kept last on stderr.
+            record_history(capture.as_ref(), &summary, &trace);
             if json {
                 ensure_stderr_line_start();
                 eprintln!("{}", summary_json_line(&summary));
