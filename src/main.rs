@@ -52,6 +52,40 @@ pub(crate) fn socks5_proxy() -> Option<&'static str> {
     SOCKS5_PROXY.get().map(String::as_str)
 }
 
+/// A usable proxy value is `HOST:PORT`, where HOST is a name, an IPv4 literal,
+/// or an IPv6 literal. Anything else fails here, at argument parsing, instead
+/// of turning into a name-resolution error mid-connection.
+fn validate_socks5(proxy: &str) -> Result<(), String> {
+    let reject = |why: &str| {
+        Err(format!(
+            "--socks5/REXEC_SOCKS5 expects HOST:PORT (the SOCKS5 proxy address), got {proxy:?} ({why})"
+        ))
+    };
+    if proxy.is_empty() {
+        return reject("empty");
+    }
+    if proxy.contains('@') {
+        return reject("no user@ part");
+    }
+    let Ok(parsed) = parse_user_host_port(proxy) else {
+        return reject("unparseable");
+    };
+    if parsed.port.is_none() {
+        return reject("no port");
+    }
+    let host = parsed.hostname.as_str();
+    if host.is_empty() {
+        return reject("empty host");
+    }
+    if host.contains('/') {
+        return reject("looks like a URL");
+    }
+    if host.contains(':') && host.parse::<std::net::Ipv6Addr>().is_err() {
+        return reject("only an IPv6 literal may contain ':' in the host");
+    }
+    Ok(())
+}
+
 /// [`socks5_proxy`] as an owned value, for storing on a resolved hop.
 fn explicit_socks5() -> Option<String> {
     socks5_proxy().map(str::to_string)
@@ -938,6 +972,14 @@ fn warn_unimplemented_routing(
 /// rexec cannot see that order — the config parser hands over a map — so it uses
 /// ProxyJump, and says so once instead of quietly picking one.
 fn warn_both_routing_directives(shown_host: &str, trace: &mut diagnostics::Trace) {
+    if socks5_proxy().is_some() {
+        // The explicit flag wins, so there is nothing to warn about — the
+        // config's ProxyCommand is simply not the route in use.
+        trace.add(format!(
+            "resolve: {shown_host} sets both ProxyJump and a SOCKS5 ProxyCommand; --socks5 takes precedence"
+        ));
+        return;
+    }
     trace.add(format!(
         "resolve: {shown_host} sets both ProxyJump and a SOCKS5 ProxyCommand; using ProxyJump"
     ));
@@ -998,7 +1040,21 @@ fn socks5_from_proxy_command(args: &[String]) -> Option<String> {
     // config leaves it out (verified against OpenBSD nc: `-x 127.0.0.1` dials
     // 127.0.0.1:1080).
     let normalize = |s: &str| -> Option<String> {
-        let parsed = parse_user_host_port(s).ok()?;
+        // ssh2-config hands over the raw token, quotes included; ssh would have
+        // let the shell strip them. `ProxyCommand nc -x "127.0.0.1:1" %h %p` is
+        // common enough to accept.
+        let unquoted = match s.len() {
+            2.. => {
+                let (first, last) = (s.as_bytes()[0], s.as_bytes()[s.len() - 1]);
+                if (first == b'"' && last == b'"') || (first == b'\'' && last == b'\'') {
+                    &s[1..s.len() - 1]
+                } else {
+                    s
+                }
+            }
+            _ => s,
+        };
+        let parsed = parse_user_host_port(unquoted).ok()?;
         if parsed.hostname.is_empty() {
             return None;
         }
@@ -1022,6 +1078,9 @@ fn socks5_from_proxy_command(args: &[String]) -> Option<String> {
     match cmd {
         "nc" | "netcat" | "ncat" => {
             let mut proxy: Option<&str> = None;
+            // `-x` is SOCKS5 on OpenBSD nc; the long `--proxy` option defaults to
+            // an HTTP proxy, so it must carry `--proxy-type socks5` explicitly.
+            let mut proxy_needs_type = false;
             let mut socks = false;
             let mut i = 0;
             while i < flags.len() {
@@ -1029,6 +1088,7 @@ fn socks5_from_proxy_command(args: &[String]) -> Option<String> {
                     // `-x HOST:PORT` (both nc and ncat).
                     "-x" => {
                         proxy = Some(*flags.get(i + 1)?);
+                        proxy_needs_type = false;
                         i += 2;
                     }
                     // `-X 5` = SOCKS5; `-X 4`/`connect` are not supported.
@@ -1042,6 +1102,7 @@ fn socks5_from_proxy_command(args: &[String]) -> Option<String> {
                     // ncat uses long options.
                     "--proxy" => {
                         proxy = Some(*flags.get(i + 1)?);
+                        proxy_needs_type = true;
                         i += 2;
                     }
                     "--proxy-type" => {
@@ -1059,9 +1120,7 @@ fn socks5_from_proxy_command(args: &[String]) -> Option<String> {
                 }
             }
             let proxy = proxy?;
-            // `nc -x` defaults to SOCKS5, `ncat --proxy` needs the explicit type
-            // (ncat's default is an HTTP proxy).
-            if cmd == "ncat" && !socks {
+            if proxy_needs_type && !socks {
                 return None;
             }
             normalize(proxy)
@@ -1169,7 +1228,7 @@ fn resolve_jump_chain(
     }
     let mut chain = Vec::new();
     let mut chain_specs = Vec::new();
-    for (idx, spec) in specs.into_iter().enumerate() {
+    for spec in specs {
         let (spec_user, spec_host, spec_port) = split_jump_spec(&spec);
         // Always merge the matching config — including a bare `Host *` block and
         // a block keyed by the literal address, which is what `ssh -J host`
@@ -1191,11 +1250,9 @@ fn resolve_jump_chain(
             alias: is_defined_alias(config, &spec_host).then(|| spec_host.clone()),
             // Only the first TCP leg can go through a SOCKS5 proxy: every later
             // hop rides a direct-tcpip channel opened on the previous session.
-            socks5: if idx == 0 {
-                explicit_socks5().or_else(|| proxy_command_socks5(&hop_params))
-            } else {
-                None
-            },
+            // A hop's own config proxy is remembered here and pruned below if a
+            // nested chain pushes it deeper (see the end of this function).
+            socks5: proxy_command_socks5(&hop_params),
         };
         // A hop may itself route somewhere we cannot go (`ProxyCommand`); say so
         // per hop — a bare timeout on hop 2 would name the wrong culprit
@@ -1218,6 +1275,19 @@ fn resolve_jump_chain(
         }
         chain.push(hop);
         chain_specs.push(spec);
+    }
+    // Only the first hop can carry a proxy: a hop whose own chain got prepended
+    // becomes hop 2+ (reached through direct-tcpip), so its ProxyCommand is not
+    // usable. Dropping it silently would take a different route than ssh (which
+    // would have applied it where it *was* first) — say so.
+    for hop in chain.iter_mut().skip(1) {
+        if hop.socks5.take().is_some() {
+            eprintln!(
+                "⚠ ssh config: SOCKS5 ProxyCommand for jump host {} is ignored — \
+                 it is not the first hop of the chain",
+                hop.hostname
+            );
+        }
     }
     Ok((chain, chain_specs))
 }
@@ -1470,10 +1540,12 @@ fn resolve_host(
                     // here. With a chain, hop 1 already carries it — ssh gives
                     // ProxyJump precedence over the target's ProxyCommand.
                     parsed.socks5 = if parsed.jump.is_empty() {
-                        explicit_socks5().or_else(|| proxy_command_socks5(&params))
+                        proxy_command_socks5(&params)
                     } else {
                         if proxy_command_socks5(&params).is_some() {
-                            warn_both_routing_directives(&parsed.hostname, trace);
+                            // `host` is what the user typed; `parsed.hostname`
+                            // has already been rewritten by the config HostName.
+                            warn_both_routing_directives(host, trace);
                         }
                         None
                     };
@@ -1516,7 +1588,7 @@ fn resolve_host(
         let host_config = config.query(host);
         let (jump, jump_specs) = resolve_jump_chain(&host_config, &config, 0)?;
         let target_socks5 = if jump.is_empty() {
-            explicit_socks5().or_else(|| proxy_command_socks5(&host_config))
+            proxy_command_socks5(&host_config)
         } else {
             if proxy_command_socks5(&host_config).is_some() {
                 warn_both_routing_directives(host, trace);
@@ -1559,6 +1631,18 @@ fn resolve_host(
         ));
         resolved
     };
+
+    // The explicit proxy must land even when the config was never consulted:
+    // a literal `user@host`/IP target skips the config block entirely, and a
+    // missing ~/.ssh/config makes it fail. With a jump chain, hop 1 carries it
+    // (every later hop rides a direct-tcpip channel).
+    if let Some(proxy) = explicit_socks5() {
+        if remote.jump.is_empty() {
+            remote.socks5 = Some(proxy);
+        } else {
+            remote.jump[0].socks5 = Some(proxy);
+        }
+    }
 
     // --port overrides host:port and ssh-config Port — record which value it
     // replaced, so a surprising -p is visible in the trace. The source is
@@ -2281,6 +2365,75 @@ Host dotted\n  ProxyJump jump.example.com:2222\n";
             unimplemented_routing(&ignored),
             vec!["proxycommand=ssh -W %h:%p jump".to_string()]
         );
+    }
+
+    /// The quoted form must survive the *real* parser (ssh2-config keeps the
+    /// quote characters; ssh would have let the shell strip them).
+    #[test]
+    fn test_quoted_proxy_command_through_real_parser() {
+        let text =
+            "Host a\n  HostName 10.173.91.2\n  ProxyCommand nc -X 5 -x \"127.0.0.1:1\" %h %p\n";
+        let mut reader = std::io::BufReader::new(text.as_bytes());
+        let config = SshConfig::default()
+            .parse(
+                &mut reader,
+                ParseRule::ALLOW_UNKNOWN_FIELDS | ParseRule::ALLOW_UNSUPPORTED_FIELDS,
+            )
+            .unwrap();
+        let params = config.query("a");
+        assert_eq!(
+            proxy_command_socks5(&params).as_deref(),
+            Some("127.0.0.1:1")
+        );
+        assert!(unimplemented_routing(&params).is_empty());
+    }
+
+    /// Both directives on one host: the choice is announced, not silent.
+    #[test]
+    fn test_both_routing_directives_traces_its_choice() {
+        let text = "Host both\n  ProxyJump hop\n  ProxyCommand nc -X 5 -x 127.0.0.1:1 %h %p\n";
+        let mut reader = std::io::BufReader::new(text.as_bytes());
+        let config = SshConfig::default()
+            .parse(
+                &mut reader,
+                ParseRule::ALLOW_UNKNOWN_FIELDS | ParseRule::ALLOW_UNSUPPORTED_FIELDS,
+            )
+            .unwrap();
+        let params = config.query("both");
+        assert_eq!(proxy_jump_specs(&params), vec!["hop".to_string()]);
+        assert_eq!(
+            proxy_command_socks5(&params).as_deref(),
+            Some("127.0.0.1:1")
+        );
+        let mut trace = diagnostics::Trace::default();
+        warn_both_routing_directives("both", &mut trace);
+        assert!(
+            trace.lines().join("\n").contains("using ProxyJump"),
+            "{:?}",
+            trace.lines()
+        );
+    }
+
+    #[test]
+    fn test_validate_socks5_accepts_only_host_port() {
+        for good in [
+            "127.0.0.1:1080",
+            "proxy.internal:1080",
+            "[fe80::1]:1080",
+            "socks:9",
+        ] {
+            assert!(validate_socks5(good).is_ok(), "rejected {good:?}");
+        }
+        for bad in [
+            "127.0.0.1",
+            "socks5://127.0.0.1:1080",
+            "127.0.0.1:1080:1080",
+            "user@127.0.0.1:1080",
+            ":1080",
+            "",
+        ] {
+            assert!(validate_socks5(bad).is_err(), "accepted {bad:?}");
+        }
     }
 
     /// The route label must mention a SOCKS5 proxy, so warnings never claim a
@@ -6077,13 +6230,8 @@ async fn main() -> Result<()> {
         .or_else(|| std::env::var("REXEC_SOCKS5").ok())
         .filter(|s| !s.trim().is_empty());
     if let Some(proxy) = &socks5 {
-        let parsed = parse_user_host_port(proxy.trim());
-        let usable =
-            !proxy.contains('@') && parsed.as_ref().map(|p| p.port.is_some()).unwrap_or(false);
-        if !usable {
-            eprintln!(
-                "Error: --socks5/REXEC_SOCKS5 expects HOST:PORT (the SOCKS5 proxy address), got {proxy:?}"
-            );
+        if let Err(msg) = validate_socks5(proxy.trim()) {
+            eprintln!("Error: {msg}");
             std::process::exit(2);
         }
         let _ = SOCKS5_PROXY.set(proxy.trim().to_string());

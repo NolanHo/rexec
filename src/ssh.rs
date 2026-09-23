@@ -1511,6 +1511,16 @@ mod tests {
         method_reply: u8,
         connect_reply: u8,
     ) -> (String, tokio::task::JoinHandle<Option<String>>) {
+        fake_proxy_with_bnd(method_reply, connect_reply, 0x01).await
+    }
+
+    /// [`fake_proxy`] with control over the BND.ADDR address type in the reply
+    /// (`0x01` = 4-byte IPv4 + port, `0x03` = length-prefixed domain + port).
+    async fn fake_proxy_with_bnd(
+        method_reply: u8,
+        connect_reply: u8,
+        bnd_atyp: u8,
+    ) -> (String, tokio::task::JoinHandle<Option<String>>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let handle = tokio::spawn(async move {
@@ -1553,12 +1563,27 @@ mod tests {
                         u16::from_be_bytes(port)
                     )
                 }
+                0x04 => {
+                    let mut v6 = [0u8; 16];
+                    sock.read_exact(&mut v6).await.unwrap();
+                    sock.read_exact(&mut port).await.unwrap();
+                    format!("[::1]:{}", u16::from_be_bytes(port))
+                }
                 other => panic!("unexpected ATYP {other:#04x}"),
             };
 
-            sock.write_all(&[0x05, connect_reply, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
-                .await
-                .unwrap();
+            let mut reply = vec![0x05, connect_reply, 0x00, bnd_atyp];
+            match bnd_atyp {
+                0x01 => reply.extend_from_slice(&[0, 0, 0, 0, 0, 0]),
+                0x03 => {
+                    // length-prefixed "bnd" + port
+                    reply.push(3);
+                    reply.extend_from_slice(b"bnd");
+                    reply.extend_from_slice(&[0, 0]);
+                }
+                other => panic!("unconfigured BND ATYP {other:#04x}"),
+            }
+            sock.write_all(&reply).await.unwrap();
             if connect_reply == 0x00 {
                 let mut buf = [0u8; 5];
                 sock.read_exact(&mut buf).await.unwrap();
@@ -1610,6 +1635,55 @@ mod tests {
             fake.await.unwrap().as_deref(),
             Some("wg-internal.example:2222")
         );
+    }
+
+    #[tokio::test]
+    async fn test_socks5_connect_ipv6_literal_uses_atyp4() {
+        let (proxy, fake) = fake_proxy(0x00, 0x00).await;
+        let mut trace = diagnostics::Trace::default();
+        let mut stream = socks5_connect(&proxy, "::1", 22, &mut trace).await.unwrap();
+        stream.write_all(b"six16").await.unwrap();
+        let mut echoed = [0u8; 5];
+        stream.read_exact(&mut echoed).await.unwrap();
+        assert_eq!(&echoed, b"six16");
+        assert_eq!(fake.await.unwrap().as_deref(), Some("[::1]:22"));
+    }
+
+    #[tokio::test]
+    async fn test_socks5_connect_consumes_domain_bnd_address() {
+        // A proxy may answer with a BND.ADDR of any ATYP; a length-prefixed
+        // domain is the one with a variable size, so a mis-parse would desync
+        // the tunnel. The echo proves the socket sits exactly on the data.
+        let (proxy, _fake) = fake_proxy_with_bnd(0x00, 0x00, 0x03).await;
+        let mut trace = diagnostics::Trace::default();
+        let mut stream = socks5_connect(&proxy, "10.173.91.2", 22, &mut trace)
+            .await
+            .unwrap();
+        stream.write_all(b"abcde").await.unwrap();
+        let mut echoed = [0u8; 5];
+        stream.read_exact(&mut echoed).await.unwrap();
+        assert_eq!(&echoed, b"abcde");
+    }
+
+    #[tokio::test]
+    async fn test_socks5_connect_reports_truncated_reply() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut greeting = [0u8; 3];
+            sock.read_exact(&mut greeting).await.unwrap();
+            sock.write_all(&[0x05, 0x00]).await.unwrap();
+            let mut head = [0u8; 4];
+            sock.read_exact(&mut head).await.unwrap();
+            // …and then close without a CONNECT reply.
+        });
+        let mut trace = diagnostics::Trace::default();
+        let err = socks5_connect(&addr.to_string(), "10.173.91.2", 22, &mut trace)
+            .await
+            .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("CONNECT reply"), "{msg}");
     }
 
     #[tokio::test]
