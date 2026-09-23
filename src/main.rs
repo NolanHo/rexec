@@ -1667,11 +1667,27 @@ fn rsync_endpoint(remote: &RemoteHost) -> (String, String) {
 /// The `ssh` command rsync runs (`-e`): the port of the resolved target plus,
 /// for a literal target, the explicit `-J` chain from `rsync_endpoint`.
 fn sync_ssh_e(remote: &RemoteHost) -> String {
+    sync_ssh_e_with(remote, crate::socks5_proxy())
+}
+
+/// [`sync_ssh_e`] with the explicit proxy passed in, so the composition is
+/// testable without touching the process-wide `--socks5` state.
+fn sync_ssh_e_with(remote: &RemoteHost, explicit_socks5: Option<&str>) -> String {
     const SSH_OPTS: &str = "-o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new -o ServerAliveInterval=5 -o ServerAliveCountMax=3";
     let (_, jump_arg) = rsync_endpoint(remote);
+    // A config-derived ProxyCommand reaches rsync's ssh through the alias/config,
+    // but `--socks5` is a rexec-level flag that ssh knows nothing about: spell
+    // it out as a ProxyCommand. rsync splits `-e` itself and honours quoting,
+    // so the value stays one argv element (verified with a fake ssh).
+    let proxy_arg = match explicit_socks5 {
+        Some(proxy) if !proxy.contains('\'') => {
+            format!(" -o ProxyCommand='nc -X 5 -x {proxy} %h %p'")
+        }
+        _ => String::new(),
+    };
     match remote.port {
-        Some(p) => format!("ssh -p {p} {SSH_OPTS}{jump_arg}"),
-        None => format!("ssh {SSH_OPTS}{jump_arg}"),
+        Some(p) => format!("ssh -p {p} {SSH_OPTS}{proxy_arg}{jump_arg}"),
+        None => format!("ssh {SSH_OPTS}{proxy_arg}{jump_arg}"),
     }
 }
 
@@ -2337,6 +2353,17 @@ Host dotted\n  ProxyJump jump.example.com:2222\n";
         remote.port = None;
         let e = sync_ssh_e(&remote);
         assert!(e.starts_with("ssh -o BatchMode=yes"), "{e}");
+
+        // An explicit `--socks5` must reach the ssh rsync spawns: ssh cannot see
+        // the rexec flag, and the alias hand-off only covers config directives.
+        let e = sync_ssh_e_with(&remote, Some("127.0.0.1:1080"));
+        assert!(
+            e.contains("-o ProxyCommand='nc -X 5 -x 127.0.0.1:1080 %h %p'"),
+            "{e}"
+        );
+        // The config-derived case stays untouched (ssh applies its own config).
+        let e = sync_ssh_e_with(&remote, None);
+        assert!(!e.contains("ProxyCommand"), "{e}");
     }
 
     /// Duplicate routing directives inside one block keep the FIRST value

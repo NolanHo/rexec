@@ -119,7 +119,7 @@ On Windows the local side of `--sync` must be an MSYS2/WSL-style path (`/c/proj`
 | `-v` / `--verbose` | Print the decision trace (resolution, auth, deploy, reconnect, timings) even on success. Errors always carry it |
 | `--json` | Emit one machine-readable result summary line on stderr (see Output contract). Applies to `run`/`script`/`plan`/`init`; `list` emits its own host array; `history …` ignores it |
 | `--no-history` | Do not record this run in the local execution history (same as `REXEC_HISTORY=0`); reading `rexec history …` still works |
-| `--socks5 HOST:PORT` | Route the first hop through this SOCKS5 proxy (no-auth). Overrides ssh-config `ProxyCommand`; also settable via `REXEC_SOCKS5`. With `ProxyJump`, the proxy covers the first jump leg |
+| `--socks5 HOST:PORT` | Route the first hop through this SOCKS5 proxy (no-auth). Overrides ssh-config `ProxyCommand`; also settable via `REXEC_SOCKS5`. With `ProxyJump`, the proxy covers the first jump leg, and `--sync` passes it to rsync's ssh as a `-o ProxyCommand=…` |
 | `--reveal-secrets` | Print secret values (env vars) instead of `***` in output. Values are **recorded** locally either way; without this flag every printed surface masks them |
 | `-q` / `--quiet` | Suppress the remaining warning/progress lines. Errors are never suppressed |
 

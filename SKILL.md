@@ -84,7 +84,7 @@ rexec -q <host> run -- "echo hi"
 | `--json` | Emit one machine-readable result summary line on stderr (`run`/`script`/`plan`/`init`/`list`; `history` ignores it) |
 | `--no-history` | Do not record this run in the local execution history (same as `REXEC_HISTORY=0`) |
 | `--reveal-secrets` | Print secret values (env vars) instead of `***`; they are recorded locally either way |
-| `--socks5 HOST:PORT` | Route the first hop through this SOCKS5 proxy (no-auth); overrides ssh-config `ProxyCommand`. Also `REXEC_SOCKS5` |
+| `--socks5 HOST:PORT` | Route the first hop through this SOCKS5 proxy (no-auth); overrides ssh-config `ProxyCommand`, and is passed to rsync's ssh for `--sync`. Also `REXEC_SOCKS5` |
 | `-q` / `--quiet` | Suppress remaining warning/progress lines (errors are never suppressed) |
 
 ### `plan` — dry run (no execution, no deploy)
