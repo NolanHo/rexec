@@ -90,7 +90,7 @@ rexec -q my-server run -- "echo only-this"
 - **A non-zero remote exit prints one warning line** to stderr: `⚠ remote exit <code> (log: ~/.rexec/logs/<pid>.log)`. Exit code 0 prints nothing. **rexec's own exit status mirrors the remote code** (like `ssh`), so `rexec … && next` and scripts checking `$?` see the failure; a signal-killed remote process (no real code, reported as `-1`) exits `255`. Caveat: when stdout is piped into a reader that exits early (`| head`), the process ends on SIGPIPE (141) before the remote code can be propagated.
 - **`--json` emits exactly one JSON line on stderr, last** (after the trace/warning), with stable field order: `host`, `resolved`, `pid`, `exit_code`, `duration_ms`, `deployed`, `stdout_bytes`, `stderr_bytes`, `log_path` (always `null` for now — the warning line carries the remote log path), and `error` only on failure. stdout is never polluted.
 - **`ProxyJump` is honoured, and the route is visible.** A jump chain from the ssh config (including chained jumps: `nebula99 → lyg2004 → js4`) is tunnelled with `direct-tcpip` channels — each hop authenticates on its own with its own `User`/`IdentityFile`, exactly like `ssh -J`. `plan` prints the route (`route: via 192.168.4.70:42200 → 10.30.40.4:22`) and `-v` traces every hop (`connect: jump 1/2 … connected in 167ms`). Jump sessions get keepalives so an idle tunnel is not reaped. `--sync` hands rsync the alias (or an explicit `-J` chain for literal targets) so the ssh rsync spawns takes the same route.
-- **`ProxyCommand` is not implemented, and that is said out loud.** When the config asks for one, rexec prints one warning line naming the directive and the route it actually used (`⚠ ssh config: proxycommand=… for <host> is not implemented; connecting directly to …`) instead of dying in a bare connect timeout. Every other unsupported directive (`SendEnv`, `StrictHostKeyChecking`, `LocalForward`, …) stays silent.
+- **`ProxyCommand` is honored when it is a SOCKS5 proxy, and said out loud when it is not.** The recognizable shapes — `nc -X 5 -x HOST[:PORT] %h %p`, `nc -x HOST[:PORT] %h %p`, `ncat --proxy HOST[:PORT] --proxy-type socks5 %h %p`, `connect [-5] -S HOST[:PORT] %h %p` (port defaults to 1080) — are used as a real SOCKS5 CONNECT (no-auth only) for the first hop, and show up in the route (`route: via socks5 127.0.0.1:1080`) and the trace. Any other ProxyCommand (a `ssh -W` jump host — the warning points at `ProxyJump` instead — SOCKS4/HTTP proxies, `socat`'s ambiguous grammar, unknown flags) keeps the one-line warning naming the route actually used (`⚠ ssh config: proxycommand=… for <host> is not implemented; connecting directly to …`). Every other unsupported directive (`SendEnv`, `StrictHostKeyChecking`, `LocalForward`, …) stays silent.
 
 ### `plan` — dry run
 
@@ -119,10 +119,11 @@ On Windows the local side of `--sync` must be an MSYS2/WSL-style path (`/c/proj`
 | `-v` / `--verbose` | Print the decision trace (resolution, auth, deploy, reconnect, timings) even on success. Errors always carry it |
 | `--json` | Emit one machine-readable result summary line on stderr (see Output contract). Applies to `run`/`script`/`plan`/`init`; `list` emits its own host array; `history …` ignores it |
 | `--no-history` | Do not record this run in the local execution history (same as `REXEC_HISTORY=0`); reading `rexec history …` still works |
+| `--socks5 HOST:PORT` | Route the first hop through this SOCKS5 proxy (no-auth). Overrides ssh-config `ProxyCommand`; also settable via `REXEC_SOCKS5`. With `ProxyJump`, the proxy covers the first jump leg |
 | `--reveal-secrets` | Print secret values (env vars) instead of `***` in output. Values are **recorded** locally either way; without this flag every printed surface masks them |
 | `-q` / `--quiet` | Suppress the remaining warning/progress lines. Errors are never suppressed |
 
-Run/plan/sync/script usage is unchanged otherwise: `rexec [-p PORT] [-v] [--json] [--no-history] [--reveal-secrets] <alias|user@host:port> <subcommand> ...`.
+Run/plan/sync/script usage is unchanged otherwise: `rexec [-p PORT] [-v] [--json] [--no-history] [--reveal-secrets] [--socks5 HOST:PORT] <alias|user@host:port> <subcommand> ...`.
 
 ### `script` — sync and run a local script
 

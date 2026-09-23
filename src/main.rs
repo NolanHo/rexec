@@ -39,6 +39,24 @@ pub(crate) static REMOTE_EXIT: AtomicI32 = AtomicI32::new(0);
 /// transcript just because rexec ran.
 pub(crate) static REVEAL_SECRETS: AtomicBool = AtomicBool::new(false);
 
+/// SOCKS5 proxy for this invocation (`--socks5 HOST:PORT` or `REXEC_SOCKS5`).
+///
+/// Applies to the *first* TCP leg of the route — the target itself for a direct
+/// connection, the outermost jump host for a `ProxyJump` chain. It overrides an
+/// ssh-config `ProxyCommand`; without it, a `ProxyCommand` that is one of the
+/// recognizable SOCKS5 shapes is used instead of only being warned about.
+static SOCKS5_PROXY: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// The explicit SOCKS5 proxy for this invocation, if any.
+pub(crate) fn socks5_proxy() -> Option<&'static str> {
+    SOCKS5_PROXY.get().map(String::as_str)
+}
+
+/// [`socks5_proxy`] as an owned value, for storing on a resolved hop.
+fn explicit_socks5() -> Option<String> {
+    socks5_proxy().map(str::to_string)
+}
+
 /// True when the user opted into seeing secret values in output.
 pub(crate) fn reveal_secrets() -> bool {
     REVEAL_SECRETS.load(Ordering::Relaxed)
@@ -152,6 +170,11 @@ struct Cli {
     /// either way; without this flag every printed surface masks them
     #[arg(long = "reveal-secrets", global = true)]
     reveal_secrets: bool,
+
+    /// Route the first hop through this SOCKS5 proxy (`HOST:PORT`). Overrides
+    /// ssh-config `ProxyCommand`; also settable via the `REXEC_SOCKS5` env var
+    #[arg(long = "socks5", value_name = "HOST:PORT", global = true)]
+    socks5: Option<String>,
 
     #[command(subcommand)]
     action: Action,
@@ -384,6 +407,13 @@ pub struct RemoteHost {
     /// and end up offering a key that host does not accept — that is exactly how
     /// rsync to `10.30.40.4` failed while rexec's own path succeeded.
     pub alias: Option<String>,
+    /// SOCKS5 proxy (`HOST:PORT`) to reach this hop's TCP address through.
+    ///
+    /// Set on the *first* TCP leg only: the explicit `--socks5`/`REXEC_SOCKS5`,
+    /// or the host's own `ProxyCommand` when it is one of the recognizable
+    /// SOCKS5 shapes (`nc -x`, `ncat --proxy … --proxy-type socks5`, …). Later
+    /// jump hops are reached through `direct-tcpip` and need no proxy.
+    pub socks5: Option<String>,
 }
 
 /// True when `s` starts with a Windows drive prefix (`^[A-Za-z]:`), e.g. `C:\proj`.
@@ -860,10 +890,14 @@ fn load_user_ssh_config() -> Result<(PathBuf, SshConfig)> {
 /// Returned as sorted `directive=value` strings for a stable trace/warning.
 fn unimplemented_routing(params: &ssh2_config::HostParams) -> Vec<String> {
     const ROUTING: [&str; 1] = ["proxycommand"];
+    // A `ProxyCommand` we can actually honor (one of the SOCKS5 shapes) is not
+    // unimplemented, so it must not be warned about.
+    let socks5_honored = proxy_command_socks5(params).is_some();
     let mut hits: Vec<String> = params
         .unsupported_fields
         .iter()
         .filter(|(k, _)| ROUTING.contains(&k.to_ascii_lowercase().as_str()))
+        .filter(|(k, _)| !(socks5_honored && k.eq_ignore_ascii_case("proxycommand")))
         .map(|(k, v)| format!("{k}={}", v.join(" ")))
         .collect();
     hits.sort();
@@ -885,19 +919,172 @@ fn warn_unimplemented_routing(
 ) {
     for hit in unimplemented_routing(params) {
         trace.add(format!("resolve: {hit} not implemented → via {route}"));
+        // The most common unsupported ProxyCommand is a jump host in disguise
+        // (`ssh -W %h:%p hop`). Point at the directive that *is* implemented
+        // instead of leaving the reader to translate it.
+        let hint = if hit.starts_with("proxycommand=ssh") && hit.contains(" -W ") {
+            " — that looks like a jump host: `ProxyJump <hop>` in the config is implemented"
+        } else {
+            ""
+        };
         eprintln!(
-            "⚠ ssh config: {hit} for {shown_host} is not implemented; connecting {route} to {target}"
+            "⚠ ssh config: {hit} for {shown_host} is not implemented; connecting {route} to {target}{hint}"
         );
     }
 }
 
-/// `directly` for a direct connection, otherwise the jump chain label — the
-/// phrase used in routing warnings.
+/// A host may set both `ProxyJump` and a SOCKS5 `ProxyCommand`. OpenSSH uses
+/// whichever line comes FIRST in the file (verified against `ssh -G`/`ssh -v`);
+/// rexec cannot see that order — the config parser hands over a map — so it uses
+/// ProxyJump, and says so once instead of quietly picking one.
+fn warn_both_routing_directives(shown_host: &str, trace: &mut diagnostics::Trace) {
+    trace.add(format!(
+        "resolve: {shown_host} sets both ProxyJump and a SOCKS5 ProxyCommand; using ProxyJump"
+    ));
+    eprintln!(
+        "⚠ ssh config: {shown_host} sets both ProxyJump and a SOCKS5 ProxyCommand; rexec uses \
+         ProxyJump (ssh uses whichever line comes first) — pass --socks5 to force the proxy"
+    );
+}
+
+/// `directly` for a direct connection, otherwise the route label — the phrase
+/// used in routing warnings. A SOCKS5 proxy counts as routing: the connection
+/// does not leave this process straight for the target.
 fn route_phrase(remote: &RemoteHost) -> String {
-    if remote.jump.is_empty() {
+    if remote.jump.is_empty() && remote.socks5.is_none() {
         "directly".to_string()
     } else {
         jump_chain_label(remote)
+    }
+}
+
+/// The SOCKS5 proxy an ssh-config `ProxyCommand` points at, when it is one of
+/// the shapes that unambiguously mean "dial this SOCKS5 proxy and CONNECT
+/// through it".
+///
+/// Only a strict allowlist is accepted — anything else keeps the
+/// "not implemented" warning instead of guessing at shell semantics:
+///
+/// ```text
+/// nc -X 5 -x HOST[:PORT] %h %p      nc -x HOST[:PORT] %h %p
+/// netcat -X 5 -x HOST[:PORT] %h %p  ncat --proxy HOST[:PORT] --proxy-type socks5 %h %p
+/// connect [-5] -S HOST[:PORT] %h %p
+/// ```
+///
+/// The port defaults to 1080 where the tool does. Rejected on purpose:
+/// `-X 4`/SOCKS4, `-X connect`/`-H`/`--proxy` without `--proxy-type socks5`
+/// (HTTP CONNECT), `ssh -W %h:%p jump` (that is a jump host — `ProxyJump`
+/// covers it), and `socat` (its SOCKS5 address grammar differs between versions
+/// and sources, so a wrong guess would silently dial the wrong endpoint).
+fn proxy_command_socks5(params: &ssh2_config::HostParams) -> Option<String> {
+    let args: Vec<String> = params
+        .unsupported_fields
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("proxycommand"))
+        .map(|(_, v)| v.clone())
+        .unwrap_or_default();
+    socks5_from_proxy_command(&args)
+}
+
+/// The pure form of [`proxy_command_socks5`]: recognize a tokenized
+/// `ProxyCommand` (the crate hands over argv-split tokens, quotes already
+/// resolved).
+fn socks5_from_proxy_command(args: &[String]) -> Option<String> {
+    let argv: Vec<&str> = args.iter().map(String::as_str).collect();
+    let (cmd, rest) = argv.split_first()?;
+    // `ProxyCommand /usr/bin/nc …` is just as common as a bare `nc`.
+    let cmd = cmd.rsplit('/').next().unwrap_or(cmd);
+    // `nc -x`/`connect -S` default to the conventional SOCKS port when the
+    // config leaves it out (verified against OpenBSD nc: `-x 127.0.0.1` dials
+    // 127.0.0.1:1080).
+    let normalize = |s: &str| -> Option<String> {
+        let parsed = parse_user_host_port(s).ok()?;
+        if parsed.hostname.is_empty() {
+            return None;
+        }
+        // Keep IPv6 literals bracketed: `fe80::1:1080` would otherwise parse
+        // back as an address with no port at all.
+        let host = if parsed.hostname.contains(':') {
+            format!("[{}]", parsed.hostname)
+        } else {
+            parsed.hostname.clone()
+        };
+        Some(format!("{host}:{}", parsed.port.unwrap_or(1080)))
+    };
+
+    // Every other supported shape ends with the destination placeholders.
+    let (tail_host, tail_port) = (rest.get(rest.len().checked_sub(2)?)?, rest.last()?);
+    if *tail_host != "%h" || *tail_port != "%p" {
+        return None;
+    }
+    let flags = &rest[..rest.len() - 2];
+
+    match cmd {
+        "nc" | "netcat" | "ncat" => {
+            let mut proxy: Option<&str> = None;
+            let mut socks = false;
+            let mut i = 0;
+            while i < flags.len() {
+                match flags[i] {
+                    // `-x HOST:PORT` (both nc and ncat).
+                    "-x" => {
+                        proxy = Some(*flags.get(i + 1)?);
+                        i += 2;
+                    }
+                    // `-X 5` = SOCKS5; `-X 4`/`connect` are not supported.
+                    "-X" => {
+                        if *flags.get(i + 1)? != "5" {
+                            return None;
+                        }
+                        socks = true;
+                        i += 2;
+                    }
+                    // ncat uses long options.
+                    "--proxy" => {
+                        proxy = Some(*flags.get(i + 1)?);
+                        i += 2;
+                    }
+                    "--proxy-type" => {
+                        if !flags.get(i + 1)?.eq_ignore_ascii_case("socks5") {
+                            return None;
+                        }
+                        socks = true;
+                        i += 2;
+                    }
+                    // Benign flags that take no value.
+                    "-q" | "-v" | "-n" => i += 1,
+                    // `-w N` takes a value; skip both tokens.
+                    "-w" => i += 2,
+                    _ => return None,
+                }
+            }
+            let proxy = proxy?;
+            // `nc -x` defaults to SOCKS5, `ncat --proxy` needs the explicit type
+            // (ncat's default is an HTTP proxy).
+            if cmd == "ncat" && !socks {
+                return None;
+            }
+            normalize(proxy)
+        }
+        "connect" | "connect-proxy" => {
+            // `connect [-5] -S HOST[:PORT] %h %p` (-S = SOCKS, default SOCKS5).
+            // `-H` is an HTTP proxy there, so it must not match.
+            let mut proxy: Option<&str> = None;
+            let mut i = 0;
+            while i < flags.len() {
+                match flags[i] {
+                    "-S" => {
+                        proxy = Some(*flags.get(i + 1)?);
+                        i += 2;
+                    }
+                    "-5" => i += 1,
+                    "-q" | "-v" => i += 1,
+                    _ => return None,
+                }
+            }
+            normalize(proxy?)
+        }
+        _ => None,
     }
 }
 
@@ -982,7 +1169,7 @@ fn resolve_jump_chain(
     }
     let mut chain = Vec::new();
     let mut chain_specs = Vec::new();
-    for spec in specs {
+    for (idx, spec) in specs.into_iter().enumerate() {
         let (spec_user, spec_host, spec_port) = split_jump_spec(&spec);
         // Always merge the matching config — including a bare `Host *` block and
         // a block keyed by the literal address, which is what `ssh -J host`
@@ -1002,6 +1189,13 @@ fn resolve_jump_chain(
             jump: Vec::new(),
             jump_specs: Vec::new(),
             alias: is_defined_alias(config, &spec_host).then(|| spec_host.clone()),
+            // Only the first TCP leg can go through a SOCKS5 proxy: every later
+            // hop rides a direct-tcpip channel opened on the previous session.
+            socks5: if idx == 0 {
+                explicit_socks5().or_else(|| proxy_command_socks5(&hop_params))
+            } else {
+                None
+            },
         };
         // A hop may itself route somewhere we cannot go (`ProxyCommand`); say so
         // per hop — a bare timeout on hop 2 would name the wrong culprit
@@ -1073,18 +1267,26 @@ fn jump_j_arg(remote: &RemoteHost) -> Option<String> {
 
 /// `a → b → c` label for a jump chain, or `direct` when there is none.
 fn jump_chain_label(remote: &RemoteHost) -> String {
-    if remote.jump.is_empty() {
+    // A SOCKS5 proxy is part of the route, not a detail: "direct" would be a
+    // lie and a warning that said "connecting directly" would send the reader
+    // looking for a firewall problem.
+    let proxy = if remote.jump.is_empty() {
+        remote.socks5.clone()
+    } else {
+        remote.jump[0].socks5.clone()
+    };
+    let mut legs: Vec<String> = Vec::new();
+    if let Some(p) = proxy {
+        legs.push(format!("socks5 {p}"));
+    }
+    legs.extend(remote.jump.iter().map(|h| {
+        let port = h.port.unwrap_or(22);
+        format!("{}:{port}", h.hostname)
+    }));
+    if legs.is_empty() {
         return "direct".to_string();
     }
-    let hops: Vec<String> = remote
-        .jump
-        .iter()
-        .map(|h| {
-            let port = h.port.unwrap_or(22);
-            format!("{}:{port}", h.hostname)
-        })
-        .collect();
-    format!("via {}", hops.join(" → "))
+    format!("via {}", legs.join(" → "))
 }
 
 /// Local user name, used the way `ssh` and `list` do when no `User` is
@@ -1224,6 +1426,7 @@ fn resolve_host(
                 jump: Vec::new(),
                 jump_specs: Vec::new(),
                 alias: None,
+                socks5: None,
             },
             None => parse_user_host_port(host)?,
         };
@@ -1262,6 +1465,18 @@ fn resolve_host(
                 Ok((jump, jump_specs)) => {
                     parsed.jump = jump;
                     parsed.jump_specs = jump_specs;
+                    // Without a jump chain this host *is* the first TCP leg, so
+                    // the proxy (explicit, else its own ProxyCommand) applies
+                    // here. With a chain, hop 1 already carries it — ssh gives
+                    // ProxyJump precedence over the target's ProxyCommand.
+                    parsed.socks5 = if parsed.jump.is_empty() {
+                        explicit_socks5().or_else(|| proxy_command_socks5(&params))
+                    } else {
+                        if proxy_command_socks5(&params).is_some() {
+                            warn_both_routing_directives(&parsed.hostname, trace);
+                        }
+                        None
+                    };
                 }
                 // A config problem must not break a literal target, but it must
                 // not disappear either: a broken `ProxyJump` silently turning
@@ -1300,6 +1515,14 @@ fn resolve_host(
         }
         let host_config = config.query(host);
         let (jump, jump_specs) = resolve_jump_chain(&host_config, &config, 0)?;
+        let target_socks5 = if jump.is_empty() {
+            explicit_socks5().or_else(|| proxy_command_socks5(&host_config))
+        } else {
+            if proxy_command_socks5(&host_config).is_some() {
+                warn_both_routing_directives(host, trace);
+            }
+            None
+        };
         let resolved = RemoteHost {
             hostname: host_config
                 .host_name
@@ -1314,6 +1537,7 @@ fn resolve_host(
             jump,
             jump_specs,
             alias: Some(host.to_string()),
+            socks5: target_socks5,
         };
         let key = resolved
             .identity_file
@@ -1394,6 +1618,7 @@ fn parse_user_host_port(s: &str) -> Result<RemoteHost> {
         jump: Vec::new(),
         jump_specs: Vec::new(),
         alias: None,
+        socks5: None,
     })
 }
 
@@ -1928,6 +2153,7 @@ Host dotted\n  ProxyJump jump.example.com:2222\n";
             jump: Vec::new(),
             jump_specs: Vec::new(),
             alias: None,
+            socks5: None,
         };
         assert_eq!(route_phrase(&remote), "directly");
         remote.jump = vec![RemoteHost {
@@ -1938,8 +2164,143 @@ Host dotted\n  ProxyJump jump.example.com:2222\n";
             jump: Vec::new(),
             jump_specs: Vec::new(),
             alias: Some("js4".to_string()),
+            socks5: None,
         }];
         assert_eq!(route_phrase(&remote), "via 192.168.4.70:42200");
+    }
+
+    /// Recognition of the `ProxyCommand` shapes that mean "SOCKS5 proxy here".
+    /// Anything ambiguous must stay unrecognized (and keep its warning).
+    #[test]
+    fn test_socks5_from_proxy_command_shapes() {
+        let args = |s: &str| s.split_whitespace().map(str::to_string).collect::<Vec<_>>();
+        let yes = |s: &str| socks5_from_proxy_command(&args(s));
+        let no = |s: &str| assert_eq!(socks5_from_proxy_command(&args(s)), None, "accepted: {s}");
+
+        // Accepted, all spelling out the proxy address.
+        assert_eq!(
+            yes("nc -X 5 -x 127.0.0.1:1080 %h %p").as_deref(),
+            Some("127.0.0.1:1080")
+        );
+        assert_eq!(
+            yes("nc -x 127.0.0.1:1080 %h %p").as_deref(),
+            Some("127.0.0.1:1080")
+        );
+        assert_eq!(
+            yes("/usr/bin/nc -w 5 -x 127.0.0.1:1080 %h %p").as_deref(),
+            Some("127.0.0.1:1080")
+        );
+        assert_eq!(
+            yes("ncat --proxy 127.0.0.1:1080 --proxy-type socks5 %h %p").as_deref(),
+            Some("127.0.0.1:1080")
+        );
+        assert_eq!(
+            yes("connect -S 127.0.0.1:1080 %h %p").as_deref(),
+            Some("127.0.0.1:1080")
+        );
+        // The conventional SOCKS port is assumed when the config omits it.
+        assert_eq!(
+            yes("nc -X 5 -x 127.0.0.1 %h %p").as_deref(),
+            Some("127.0.0.1:1080")
+        );
+        assert_eq!(
+            yes("ncat --proxy 127.0.0.1 --proxy-type socks5 %h %p").as_deref(),
+            Some("127.0.0.1:1080")
+        );
+        assert_eq!(
+            yes("connect -5 -S 127.0.0.1 %h %p").as_deref(),
+            Some("127.0.0.1:1080")
+        );
+        assert_eq!(
+            yes("nc -x [fe80::1]:1080 %h %p").as_deref(),
+            Some("[fe80::1]:1080"),
+            "IPv6 proxy addresses keep their brackets on the wire"
+        );
+
+        // Rejected: a jump host (ProxyJump covers it), SOCKS4/HTTP, wrong
+        // arity, unknown flags, a proxy without a port.
+        no("ssh -W %h:%p jump");
+        no("nc -X 4 -x 127.0.0.1:1080 %h %p");
+        no("nc -X connect -x 127.0.0.1:1080 %h %p");
+        no("connect -4 -S 127.0.0.1:1080 %h %p");
+        no("socat - SOCKS5:127.0.0.1:1080:%h:%p");
+        no("nc -x 127.0.0.1:1080 %h");
+        no("nc -x 127.0.0.1:1080");
+        no("nc -x 127.0.0.1:1080 --weird %h %p");
+        no("ncat --proxy 127.0.0.1:1080 %h %p");
+        no("ncat --proxy 127.0.0.1:1080 --proxy-type http %h %p");
+        no("socat - SOCKS4:127.0.0.1:1080:%h:%p");
+        no("connect -H 127.0.0.1:8080 %h %p");
+    }
+
+    /// A config whose `ProxyCommand` is a SOCKS5 shape must be honored, not
+    /// warned about; other shapes keep the warning.
+    #[test]
+    fn test_proxy_command_socks5_suppresses_the_warning() {
+        let parse = |line: &str| {
+            let text = format!("Host a\n  HostName 10.173.91.2\n  {line}\n");
+            let mut reader = std::io::BufReader::new(text.as_bytes());
+            let config = SshConfig::default()
+                .parse(
+                    &mut reader,
+                    ParseRule::ALLOW_UNKNOWN_FIELDS | ParseRule::ALLOW_UNSUPPORTED_FIELDS,
+                )
+                .unwrap();
+            config.query("a")
+        };
+
+        let honored = parse("ProxyCommand nc -X 5 -x 127.0.0.1:1080 %h %p");
+        assert_eq!(
+            proxy_command_socks5(&honored).as_deref(),
+            Some("127.0.0.1:1080")
+        );
+        assert!(
+            unimplemented_routing(&honored).is_empty(),
+            "an honored ProxyCommand is not unimplemented"
+        );
+
+        let ignored = parse("ProxyCommand ssh -W %h:%p jump");
+        assert_eq!(proxy_command_socks5(&ignored), None);
+        assert_eq!(
+            unimplemented_routing(&ignored),
+            vec!["proxycommand=ssh -W %h:%p jump".to_string()]
+        );
+    }
+
+    /// The route label must mention a SOCKS5 proxy, so warnings never claim a
+    /// direct connection when one is in use.
+    #[test]
+    fn test_route_labels_include_socks5() {
+        let mut remote = RemoteHost {
+            hostname: "10.173.91.2".to_string(),
+            port: Some(22),
+            user: None,
+            identity_file: None,
+            jump: Vec::new(),
+            jump_specs: Vec::new(),
+            alias: None,
+            socks5: Some("127.0.0.1:1080".to_string()),
+        };
+        assert_eq!(jump_chain_label(&remote), "via socks5 127.0.0.1:1080");
+        assert_eq!(route_phrase(&remote), "via socks5 127.0.0.1:1080");
+
+        // With a jump chain the proxy belongs to the first leg, which the label
+        // takes from the first hop when the target itself carries none.
+        remote.socks5 = None;
+        remote.jump = vec![RemoteHost {
+            hostname: "192.168.4.70".to_string(),
+            port: Some(42200),
+            user: None,
+            identity_file: None,
+            jump: Vec::new(),
+            jump_specs: Vec::new(),
+            alias: Some("js4".to_string()),
+            socks5: Some("127.0.0.1:1080".to_string()),
+        }];
+        assert_eq!(
+            jump_chain_label(&remote),
+            "via socks5 127.0.0.1:1080 → 192.168.4.70:42200"
+        );
     }
 
     /// The `-e` string rsync gets: port of the resolved target, and `-J` only
@@ -1959,9 +2320,11 @@ Host dotted\n  ProxyJump jump.example.com:2222\n";
                 jump: Vec::new(),
                 jump_specs: Vec::new(),
                 alias: Some("js4".to_string()),
+                socks5: None,
             }],
             jump_specs: vec!["js4".to_string()],
             alias: None,
+            socks5: None,
         };
         let e = sync_ssh_e(&remote);
         assert!(e.starts_with("ssh -p 22 -o BatchMode=yes"), "{e}");
@@ -2106,6 +2469,7 @@ Host js4\n  HostName 192.168.4.70\n  Port 42200\n  User zengqixin\n";
             jump: chain.clone(),
             jump_specs: specs,
             alias: None,
+            socks5: None,
         };
         assert_eq!(
             jump_j_arg(&target).as_deref(),
@@ -2140,6 +2504,7 @@ Host js4\n  HostName 192.168.4.70\n  Port 42200\n  User zengqixin\n";
             jump: Vec::new(),
             jump_specs: Vec::new(),
             alias: Some("js4".to_string()),
+            socks5: None,
         };
         let alias_target = RemoteHost {
             hostname: "10.30.40.4".to_string(),
@@ -2149,6 +2514,7 @@ Host js4\n  HostName 192.168.4.70\n  Port 42200\n  User zengqixin\n";
             jump: vec![js4],
             jump_specs: vec!["js4".to_string()],
             alias: Some("lyg2004".to_string()),
+            socks5: None,
         };
         assert_eq!(
             rsync_endpoint(&alias_target),
@@ -2158,6 +2524,7 @@ Host js4\n  HostName 192.168.4.70\n  Port 42200\n  User zengqixin\n";
 
         let literal = RemoteHost {
             alias: None,
+            socks5: None,
             ..alias_target.clone()
         };
         assert_eq!(
@@ -2204,6 +2571,7 @@ Host js4\n  HostName 192.168.4.70\n  Port 42200\n  User zengqixin\n";
             jump: Vec::new(),
             jump_specs: Vec::new(),
             alias: None,
+            socks5: None,
         };
         assert_eq!(jump_chain_label(&target), "direct");
         target.jump = vec![
@@ -2215,6 +2583,7 @@ Host js4\n  HostName 192.168.4.70\n  Port 42200\n  User zengqixin\n";
                 jump: Vec::new(),
                 jump_specs: Vec::new(),
                 alias: None,
+                socks5: None,
             },
             RemoteHost {
                 hostname: "10.30.40.4".to_string(),
@@ -2224,6 +2593,7 @@ Host js4\n  HostName 192.168.4.70\n  Port 42200\n  User zengqixin\n";
                 jump: Vec::new(),
                 jump_specs: Vec::new(),
                 alias: None,
+                socks5: None,
             },
         ];
         assert_eq!(
@@ -5672,6 +6042,25 @@ async fn main() -> Result<()> {
     QUIET.store(cli.quiet, Ordering::Relaxed);
     JSON_SUMMARY.store(cli.json, Ordering::Relaxed);
     REVEAL_SECRETS.store(cli.reveal_secrets, Ordering::Relaxed);
+    // `--socks5` wins over `REXEC_SOCKS5`; an unusable value fails here rather
+    // than turning into a confusing connect error later.
+    let socks5 = cli
+        .socks5
+        .clone()
+        .or_else(|| std::env::var("REXEC_SOCKS5").ok())
+        .filter(|s| !s.trim().is_empty());
+    if let Some(proxy) = &socks5 {
+        let parsed = parse_user_host_port(proxy.trim());
+        let usable =
+            !proxy.contains('@') && parsed.as_ref().map(|p| p.port.is_some()).unwrap_or(false);
+        if !usable {
+            eprintln!(
+                "Error: --socks5/REXEC_SOCKS5 expects HOST:PORT (the SOCKS5 proxy address), got {proxy:?}"
+            );
+            std::process::exit(2);
+        }
+        let _ = SOCKS5_PROXY.set(proxy.trim().to_string());
+    }
     // `--no-history` and `REXEC_HISTORY=0` both disable recording; the combined
     // rule is pure and unit-tested (`history::enabled()` is the runtime view).
     history::set_enabled(history_enabled(

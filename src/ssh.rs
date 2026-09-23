@@ -441,6 +441,10 @@ fn hop_config() -> Arc<client::Config> {
 }
 
 /// TCP connect to a hop, with the 15s guard and a trace line on failure.
+///
+/// When the hop carries a SOCKS5 proxy (`ProxyCommand nc -x …`, or an explicit
+/// `--socks5`), the socket is a CONNECT tunnel through that proxy instead of a
+/// direct connection.
 async fn tcp_connect(
     remote: &RemoteHost,
     trace: &mut diagnostics::Trace,
@@ -456,6 +460,12 @@ async fn tcp_connect(
         .trim_start_matches('[')
         .trim_end_matches(']');
 
+    if let Some(proxy) = &remote.socks5 {
+        return socks5_connect(proxy, tcp_host, port, trace)
+            .await
+            .with_context(|| format!("{role} {addr} via SOCKS5 proxy {proxy}"));
+    }
+
     let tcp = tokio::time::timeout(
         Duration::from_secs(15),
         tokio::net::TcpStream::connect((tcp_host, port)),
@@ -470,6 +480,176 @@ async fn tcp_connect(
             Err(e)
         }
     }
+}
+
+/// Connect to `host:port` through a SOCKS5 proxy (`proxy` is `HOST:PORT`).
+///
+/// Implements just enough of RFC 1928 for a CLI: no-auth method negotiation,
+/// one `CONNECT`, and reply decoding. The returned socket is the tunnelled
+/// stream, ready to be used as an SSH transport. No authentication methods are
+/// attempted — a proxy that demands one gets a clear error instead of a
+/// mysterious hang.
+async fn socks5_connect(
+    proxy: &str,
+    host: &str,
+    port: u16,
+    trace: &mut diagnostics::Trace,
+) -> Result<tokio::net::TcpStream> {
+    let proxy_addr_parsed = crate::parse_user_host_port(proxy)
+        .with_context(|| format!("parsing SOCKS5 proxy address {proxy:?}"))?;
+    let proxy_port = proxy_addr_parsed
+        .port
+        .ok_or_else(|| anyhow!("SOCKS5 proxy {proxy:?} has no port"))?;
+    let proxy_host = proxy_addr_parsed
+        .hostname
+        .trim_start_matches('[')
+        .trim_end_matches(']');
+    let proxy_label = format!("{proxy_host}:{proxy_port}");
+    let target = format!("{host}:{port}");
+    crate::progress!("⇢ socks5 {proxy_label} → {target}");
+    trace.add(format!("connect: socks5 {proxy_label} → {target}"));
+
+    let started = std::time::Instant::now();
+    let mut stream = tokio::time::timeout(
+        Duration::from_secs(15),
+        tokio::net::TcpStream::connect((proxy_host, proxy_port)),
+    )
+    .await
+    .with_context(|| format!("SOCKS5 proxy {proxy_label} timed out (15s)"))
+    .and_then(|r| r.with_context(|| format!("Connecting to SOCKS5 proxy {proxy_label}")))?;
+
+    tokio::time::timeout(
+        Duration::from_secs(15),
+        socks5_handshake(&mut stream, host, port),
+    )
+    .await
+    .with_context(|| {
+        format!(
+            "SOCKS5 handshake with {proxy_label} timed out (15s) — the proxy may not route {target}"
+        )
+    })?
+    .with_context(|| format!("SOCKS5 CONNECT {target} through {proxy_label}"))?;
+
+    trace.add(format!(
+        "connect: socks5 tunnel to {target} established in {}ms",
+        started.elapsed().as_millis()
+    ));
+    Ok(stream)
+}
+
+/// RFC 1928 no-auth negotiation, then one `CONNECT` for `host:port`.
+///
+/// The ATYP is picked from the host itself: an IP literal is sent as IPv4/IPv6
+/// (no client-side DNS), a name as DOMAINNAME so the proxy resolves it — which
+/// is what makes a WireGuard-internal name resolvable on the far side.
+async fn socks5_handshake(stream: &mut tokio::net::TcpStream, host: &str, port: u16) -> Result<()> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    // Greeting: VER=5, NMETHODS=1, METHODS=[0x00 "no authentication"].
+    stream
+        .write_all(&[0x05, 0x01, 0x00])
+        .await
+        .context("sending the SOCKS5 greeting")?;
+    let mut method = [0u8; 2];
+    stream
+        .read_exact(&mut method)
+        .await
+        .context("reading the SOCKS5 method reply")?;
+    match method {
+        [0x05, 0x00] => {}
+        [0x05, 0x02] => {
+            return Err(anyhow!(
+                "SOCKS5 proxy requires username/password authentication, which rexec does not support"
+            ));
+        }
+        [0x05, 0xff] => {
+            return Err(anyhow!(
+                "SOCKS5 proxy offers no acceptable authentication method"
+            ));
+        }
+        [ver, m] => {
+            return Err(anyhow!(
+                "unexpected SOCKS5 method reply (version {ver:#04x}, method {m:#04x})"
+            ));
+        }
+    }
+
+    let mut req = vec![0x05, 0x01, 0x00];
+    match host.parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V4(v4)) => {
+            req.push(0x01);
+            req.extend_from_slice(&v4.octets());
+        }
+        Ok(std::net::IpAddr::V6(v6)) => {
+            req.push(0x04);
+            req.extend_from_slice(&v6.octets());
+        }
+        Err(_) => {
+            let bytes = host.as_bytes();
+            if bytes.len() > 255 {
+                return Err(anyhow!("hostname {host:?} is too long for SOCKS5"));
+            }
+            req.push(0x03);
+            req.push(bytes.len() as u8);
+            req.extend_from_slice(bytes);
+        }
+    }
+    req.extend_from_slice(&port.to_be_bytes());
+    stream
+        .write_all(&req)
+        .await
+        .context("sending the SOCKS5 CONNECT request")?;
+
+    let mut head = [0u8; 4];
+    stream
+        .read_exact(&mut head)
+        .await
+        .context("reading the SOCKS5 CONNECT reply")?;
+    if head[0] != 0x05 {
+        return Err(anyhow!("unexpected SOCKS5 reply version {:#04x}", head[0]));
+    }
+    if head[1] != 0x00 {
+        let reason = match head[1] {
+            0x01 => "general SOCKS server failure",
+            0x02 => "connection not allowed by ruleset",
+            0x03 => "network unreachable",
+            0x04 => "host unreachable",
+            0x05 => "connection refused",
+            0x06 => "TTL expired",
+            0x07 => "command not supported",
+            0x08 => "address type not supported",
+            _ => "unknown SOCKS5 failure",
+        };
+        return Err(anyhow!(
+            "SOCKS5 proxy could not reach {host}:{port}: {reason} ({:#04x})",
+            head[1]
+        ));
+    }
+
+    // Consume BND.ADDR/BND.PORT so the socket is positioned at the tunnel data.
+    let skip = match head[3] {
+        0x01 => 4 + 2,
+        0x04 => 16 + 2,
+        0x03 => {
+            let mut len = [0u8; 1];
+            stream
+                .read_exact(&mut len)
+                .await
+                .context("reading the SOCKS5 bound-address length")?;
+            usize::from(len[0]) + 2
+        }
+        other => {
+            return Err(anyhow!(
+                "SOCKS5 reply carries unsupported address type {other:#04x}"
+            ));
+        }
+    };
+    let mut bound = vec![0u8; skip];
+    stream
+        .read_exact(&mut bound)
+        .await
+        .context("reading the SOCKS5 bound address")?;
+    Ok(())
 }
 
 /// Open a `direct-tcpip` channel to `to` through `from`, as a stream usable as
@@ -1318,6 +1498,151 @@ async fn check_windows_deps(session: &client::Handle<ClientHandler>) -> Result<(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    /// A fake SOCKS5 proxy: performs the no-auth negotiation, records the
+    /// CONNECT target, answers with `connect_reply`, and (on success) echoes
+    /// five bytes so the caller can prove the tunnel carries data.
+    ///
+    /// Returns the proxy address and a handle yielding the CONNECT target as
+    /// `host:port` (`None` when the exchange stopped at the method reply).
+    async fn fake_proxy(
+        method_reply: u8,
+        connect_reply: u8,
+    ) -> (String, tokio::task::JoinHandle<Option<String>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut greeting = [0u8; 3];
+            sock.read_exact(&mut greeting).await.unwrap();
+            assert_eq!(greeting, [0x05, 0x01, 0x00], "no-auth greeting");
+            sock.write_all(&[0x05, method_reply]).await.unwrap();
+            if method_reply != 0x00 {
+                return None;
+            }
+
+            let mut head = [0u8; 4];
+            sock.read_exact(&mut head).await.unwrap();
+            assert_eq!(&head[..3], &[0x05, 0x01, 0x00], "CONNECT request header");
+            let mut port = [0u8; 2];
+            let target = match head[3] {
+                0x01 => {
+                    let mut v4 = [0u8; 4];
+                    sock.read_exact(&mut v4).await.unwrap();
+                    sock.read_exact(&mut port).await.unwrap();
+                    format!(
+                        "{}.{}.{}.{}:{}",
+                        v4[0],
+                        v4[1],
+                        v4[2],
+                        v4[3],
+                        u16::from_be_bytes(port)
+                    )
+                }
+                0x03 => {
+                    let mut len = [0u8; 1];
+                    sock.read_exact(&mut len).await.unwrap();
+                    let mut name = vec![0u8; usize::from(len[0])];
+                    sock.read_exact(&mut name).await.unwrap();
+                    sock.read_exact(&mut port).await.unwrap();
+                    format!(
+                        "{}:{}",
+                        String::from_utf8(name).unwrap(),
+                        u16::from_be_bytes(port)
+                    )
+                }
+                other => panic!("unexpected ATYP {other:#04x}"),
+            };
+
+            sock.write_all(&[0x05, connect_reply, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+                .await
+                .unwrap();
+            if connect_reply == 0x00 {
+                let mut buf = [0u8; 5];
+                sock.read_exact(&mut buf).await.unwrap();
+                sock.write_all(&buf).await.unwrap();
+            }
+            Some(target)
+        });
+        (addr.to_string(), handle)
+    }
+
+    #[tokio::test]
+    async fn test_socks5_connect_tunnels_ipv4_and_traces() {
+        let (proxy, fake) = fake_proxy(0x00, 0x00).await;
+        let mut trace = diagnostics::Trace::default();
+        let mut stream = socks5_connect(&proxy, "10.173.91.2", 22, &mut trace)
+            .await
+            .unwrap();
+
+        stream.write_all(b"hello").await.unwrap();
+        let mut echoed = [0u8; 5];
+        stream.read_exact(&mut echoed).await.unwrap();
+        assert_eq!(&echoed, b"hello", "tunnel must carry both directions");
+
+        assert_eq!(fake.await.unwrap().as_deref(), Some("10.173.91.2:22"));
+        let lines = trace.lines().join("\n");
+        assert!(
+            lines.contains(&format!("socks5 {proxy} → 10.173.91.2:22")),
+            "{lines}"
+        );
+        assert!(
+            lines.contains("socks5 tunnel to 10.173.91.2:22 established"),
+            "{lines}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_socks5_connect_sends_domain_names_as_domains() {
+        // A name must go on the wire as DOMAINNAME (the proxy resolves it) —
+        // that is what makes WireGuard-internal names work from here.
+        let (proxy, fake) = fake_proxy(0x00, 0x00).await;
+        let mut trace = diagnostics::Trace::default();
+        let mut stream = socks5_connect(&proxy, "wg-internal.example", 2222, &mut trace)
+            .await
+            .unwrap();
+        stream.write_all(b"probe").await.unwrap();
+        let mut echoed = [0u8; 5];
+        stream.read_exact(&mut echoed).await.unwrap();
+        assert_eq!(
+            fake.await.unwrap().as_deref(),
+            Some("wg-internal.example:2222")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_socks5_connect_reports_missing_auth_support() {
+        let (proxy, _fake) = fake_proxy(0x02, 0x00).await;
+        let mut trace = diagnostics::Trace::default();
+        let err = socks5_connect(&proxy, "10.173.91.2", 22, &mut trace)
+            .await
+            .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("authentication"), "{msg}");
+    }
+
+    #[tokio::test]
+    async fn test_socks5_connect_reports_refusal_code() {
+        let (proxy, _fake) = fake_proxy(0x00, 0x05).await;
+        let mut trace = diagnostics::Trace::default();
+        let err = socks5_connect(&proxy, "10.173.91.2", 22, &mut trace)
+            .await
+            .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("connection refused"), "{msg}");
+        assert!(msg.contains("10.173.91.2:22"), "{msg}");
+    }
+
+    #[tokio::test]
+    async fn test_socks5_connect_rejects_unusable_proxy_address() {
+        let mut trace = diagnostics::Trace::default();
+        let err = socks5_connect("127.0.0.1", "10.173.91.2", 22, &mut trace)
+            .await
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("no port"), "{err:#}");
+    }
 
     #[test]
     fn test_uname_asset_linux() {

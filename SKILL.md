@@ -64,7 +64,7 @@ rexec -q <host> run -- "echo hi"
 - **Non-zero remote exit** prints exactly one warning line to stderr: `⚠ remote exit <code> (log: ~/.rexec/logs/<pid>.log)`; exit code 0 prints nothing. rexec's own exit status **mirrors the remote code** (ssh semantics) — a signal-killed remote process (reported as `-1`) exits `255`; piping stdout into an early-exiting reader (`| head`) ends the process on SIGPIPE (141) instead.
 - **`--json`** writes one JSON line to stderr, last (after the trace/warning): `host`, `resolved`, `pid`, `exit_code`, `duration_ms`, `deployed`, `stdout_bytes`, `stderr_bytes`, `log_path` (`null` for now — the warning line carries the remote log path), `error` (failure only), always in that order. stdout is never polluted.
 - **`ProxyJump` is honoured**: jump chains from the ssh config (chained jumps included) are tunnelled hop by hop, each hop authenticating with its own `User`/`IdentityFile`. `plan` prints `route: via …`; `-v` traces every hop. `--sync` passes the alias (or `-J` for a literal target) to rsync's ssh so it takes the same route.
-- **`ProxyCommand` is not implemented**: rexec prints one warning line naming the directive and the route it used (`⚠ ssh config: proxycommand=… for <host> is not implemented; connecting directly to …`). Other unsupported directives (`SendEnv`, `StrictHostKeyChecking`, …) stay silent.
+- **`ProxyCommand` is honored when it is a SOCKS5 proxy**: `nc -X 5 -x HOST[:PORT] %h %p`, `nc -x HOST[:PORT] %h %p`, `ncat --proxy HOST[:PORT] --proxy-type socks5 %h %p`, `connect [-5] -S HOST[:PORT] %h %p` (default port 1080) are used as a real SOCKS5 CONNECT (no-auth only) for the first hop and appear in the route (`route: via socks5 127.0.0.1:1080`) and trace. Other shapes (a `ssh -W` jump — the warning points at `ProxyJump` — SOCKS4/HTTP, `socat`) keep one warning line naming the route actually used. Unsupported directives (`SendEnv`, `StrictHostKeyChecking`, …) stay silent.
 
 ### `run` options
 
@@ -84,6 +84,7 @@ rexec -q <host> run -- "echo hi"
 | `--json` | Emit one machine-readable result summary line on stderr (`run`/`script`/`plan`/`init`/`list`; `history` ignores it) |
 | `--no-history` | Do not record this run in the local execution history (same as `REXEC_HISTORY=0`) |
 | `--reveal-secrets` | Print secret values (env vars) instead of `***`; they are recorded locally either way |
+| `--socks5 HOST:PORT` | Route the first hop through this SOCKS5 proxy (no-auth); overrides ssh-config `ProxyCommand`. Also `REXEC_SOCKS5` |
 | `-q` / `--quiet` | Suppress remaining warning/progress lines (errors are never suppressed) |
 
 ### `plan` — dry run (no execution, no deploy)
