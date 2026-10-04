@@ -11,6 +11,7 @@ use ssh2_config::{ParseRule, SshConfig};
 mod diagnostics;
 mod history;
 mod protocol;
+mod python_runtime;
 mod remote;
 mod ssh;
 
@@ -256,12 +257,23 @@ enum Action {
         #[arg(long = "interpreter", value_name = "CMD")]
         interpreter: Option<String>,
 
+        /// Run the script with rexec's bundled CPython runtime (Linux remotes
+        /// only; requires downloading ~30 MiB on first use)
+        #[arg(long = "python", conflicts_with = "interpreter")]
+        python: bool,
+
         /// Local script file to sync and run
         script: PathBuf,
 
         /// Arguments passed to the script (use -- to separate options)
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
+    },
+
+    /// Manage rexec's bundled CPython runtime on a Linux remote
+    Python {
+        #[command(subcommand)]
+        cmd: PythonCmd,
     },
 
     /// List SSH hosts configured in ~/.ssh/config
@@ -315,6 +327,22 @@ enum Action {
         #[command(subcommand)]
         cmd: HistoryCmd,
     },
+}
+
+/// `rexec python …` subcommands. Both require a host and neither deploys the
+/// worker: `status` is strictly read-only (one probe round trip), `install`
+/// only ever writes under `<home>/.rexec/py/`.
+#[derive(Subcommand)]
+enum PythonCmd {
+    /// Download and install the pinned runtime (idempotent; ready → one probe)
+    Install {
+        /// Reinstall even when the runtime is already ready
+        #[arg(long)]
+        reinstall: bool,
+    },
+
+    /// Report the runtime state without downloading, uploading or writing
+    Status,
 }
 
 /// `rexec history …` subcommands — all read the local index except `prune`
@@ -1731,7 +1759,7 @@ fn rsync_spawn_error(e: std::io::Error) -> anyhow::Error {
 /// chain. (ssh matches `Host` blocks by the hostname it is given: a resolved
 /// `user@<HostName>` matches no block keyed on the alias — at best `Host *` —
 /// which is how rsync got the wrong key before this.)
-fn rsync_endpoint(remote: &RemoteHost) -> (String, String) {
+pub(crate) fn rsync_endpoint(remote: &RemoteHost) -> (String, String) {
     match &remote.alias {
         Some(alias) => (alias.clone(), String::new()),
         None => {
@@ -1750,7 +1778,10 @@ fn rsync_endpoint(remote: &RemoteHost) -> (String, String) {
 
 /// The `ssh` command rsync runs (`-e`): the port of the resolved target plus,
 /// for a literal target, the explicit `-J` chain from `rsync_endpoint`.
-fn sync_ssh_e(remote: &RemoteHost) -> String {
+///
+/// Shared with `python_runtime`'s payload upload so `--port`, `ProxyJump` and
+/// `--socks5` apply there exactly as they do to `--sync`/`script`.
+pub(crate) fn sync_ssh_e(remote: &RemoteHost) -> String {
     sync_ssh_e_with(remote, crate::socks5_proxy())
 }
 
@@ -3443,6 +3474,130 @@ Host js4\n  HostName 192.168.4.70\n  Port 42200\n  User zengqixin\n";
     }
 
     #[test]
+    fn test_script_python_conflicts_with_interpreter() {
+        // `--python` and `--interpreter` are two answers to "how do I run
+        // this?" — clap rejects the combination at parse time (exit code 2),
+        // before any connection is attempted.
+        let err = match Cli::try_parse_from([
+            "rexec",
+            "host",
+            "script",
+            "--python",
+            "--interpreter",
+            "python3",
+            "x.py",
+        ]) {
+            Ok(_) => panic!("--python + --interpreter must be a usage error"),
+            Err(err) => err,
+        };
+        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+        assert_eq!(err.exit_code(), 2, "clap usage errors exit with 2");
+    }
+
+    #[test]
+    fn test_script_python_flag_alone_parses() {
+        let cli = Cli::parse_from(["rexec", "host", "script", "--python", "x.py", "--", "-u"]);
+        match cli.action {
+            Action::Script {
+                python,
+                interpreter,
+                script,
+                args,
+                ..
+            } => {
+                assert!(python);
+                assert!(interpreter.is_none());
+                assert_eq!(script, PathBuf::from("x.py"));
+                assert_eq!(args, vec!["-u".to_string()]);
+            }
+            _ => panic!("expected `script --python`"),
+        }
+    }
+
+    #[test]
+    fn test_python_install_parses_with_and_without_reinstall() {
+        let cli = Cli::parse_from(["rexec", "host", "python", "install", "--reinstall"]);
+        assert_eq!(cli.host.as_deref(), Some("host"));
+        match cli.action {
+            Action::Python {
+                cmd: PythonCmd::Install { reinstall },
+            } => assert!(reinstall, "--reinstall must reach the subcommand"),
+            _ => panic!("expected `python install --reinstall`"),
+        }
+
+        let cli = Cli::parse_from(["rexec", "-p", "2222", "host", "python", "install"]);
+        assert_eq!(cli.port, Some(2222), "global --port still composes");
+        match cli.action {
+            Action::Python {
+                cmd: PythonCmd::Install { reinstall },
+            } => assert!(!reinstall, "install without --reinstall is idempotent"),
+            _ => panic!("expected `python install`"),
+        }
+    }
+
+    #[test]
+    fn test_python_status_parses_with_and_without_host() {
+        let cli = Cli::parse_from(["rexec", "host", "python", "status"]);
+        match cli.action {
+            Action::Python {
+                cmd: PythonCmd::Status,
+            } => {}
+            _ => panic!("expected `python status`"),
+        }
+
+        // A host-less `python` invocation PARSES (host is an `Option`) and is
+        // rejected at dispatch, like every other remote action.
+        let cli = Cli::parse_from(["rexec", "python", "status"]);
+        assert!(cli.host.is_none());
+        assert!(matches!(
+            cli.action,
+            Action::Python {
+                cmd: PythonCmd::Status
+            }
+        ));
+    }
+
+    #[test]
+    fn test_python_action_requires_a_host() {
+        // The exact guard the dispatch arm calls for a host-less `python`.
+        let err = require_host(None, "python").expect_err("no host is an error");
+        assert_eq!(err.to_string(), "python requires a host");
+        assert_eq!(
+            require_host(Some("host"), "python").unwrap(),
+            "host",
+            "a host passes through unchanged"
+        );
+    }
+
+    #[test]
+    fn test_python_json_line_field_order_and_error_omission() {
+        let report = PythonReport {
+            runtime_key: "cpython-3.13.16+20261001-x86_64-unknown-linux-gnu".to_string(),
+            installed: false,
+            path: "/home/u/.rexec/py/cpython-3.13.16+20261001-x86_64-unknown-linux-gnu".to_string(),
+            deployed: false,
+            error: None,
+        };
+        assert_eq!(
+            python_json_line("myhost", &report),
+            "{\"host\":\"myhost\",\"runtime_key\":\"cpython-3.13.16+20261001-x86_64-unknown-linux-gnu\",\
+             \"installed\":false,\"path\":\"/home/u/.rexec/py/cpython-3.13.16+20261001-x86_64-unknown-linux-gnu\",\
+             \"deployed\":false}"
+        );
+
+        let report = PythonReport {
+            installed: true,
+            deployed: true,
+            error: Some("boom".to_string()),
+            ..report
+        };
+        let line = python_json_line("myhost", &report);
+        assert!(line.ends_with(",\"error\":\"boom\"}"), "{line}");
+        assert!(line.contains("\"installed\":true"), "{line}");
+        assert!(line.contains("\"deployed\":true"), "{line}");
+    }
+
+    #[test]
     fn test_collect_env_flags() {
         let env = vec!["A=b".to_string(), "C=d".to_string()];
         assert_eq!(
@@ -4117,9 +4272,15 @@ Host js4\n  HostName 192.168.4.70\n  Port 42200\n  User zengqixin\n";
     }
 }
 
+/// Reject an action that needs a host but was invoked without one, with the
+/// same shape as the other remote actions (`script requires a host`).
+fn require_host<'a>(host: Option<&'a str>, action: &str) -> Result<&'a str> {
+    host.ok_or_else(|| anyhow!("{action} requires a host"))
+}
+
 /// Simple shell quoting for a single argument.
 /// Rejects null bytes to prevent command injection via C-string truncation.
-fn shell_quote(s: &str) -> Result<String> {
+pub(crate) fn shell_quote(s: &str) -> Result<String> {
     if s.contains('\0') {
         return Err(anyhow!("command contains null byte — rejected for safety"));
     }
@@ -4700,6 +4861,7 @@ async fn run_script(
     host: &str,
     script: &Path,
     interpreter: Option<&str>,
+    python: bool,
     sync_to: Option<&str>,
     args: &[String],
     env_vars: &[(String, String)],
@@ -4718,11 +4880,20 @@ async fn run_script(
         .to_string_lossy()
         .to_string();
 
+    // What the extension/shebang detection picks — the same decision the
+    // pre-change code made whenever `--interpreter` was absent. Computed once
+    // so the managed-runtime decision and the runner agree.
+    let detected = detect_runner(script)?;
+    let is_python_file = detected.as_deref() == Some("python3");
+
     // Ensure the remote dir exists (single-file rsync does not create parents)
     // and resolve it to an absolute path. Using an absolute path for the
     // runner command avoids relying on shell tilde expansion, which quoting
     // would disable (python3 '$HOME/...' does not expand).
-    let remote_script = {
+    //
+    // Returns the remote script path plus the managed interpreter to use (a
+    // shell-quoted absolute path) when the bundled runtime was selected.
+    let (remote_script, managed_runner) = {
         let mut session = ssh::connect_traced(remote, trace).await?;
         // `script` requires rsync (do_sync below) and a POSIX remote path
         // model — reject Windows remotes up front instead of wasting a full
@@ -4747,36 +4918,194 @@ async fn run_script(
             None => format!("{}/.rexec/scripts", home),
         };
         ssh::exec_remote(&mut session, &format!("mkdir -p {}", shell_quote(&dir)?)).await?;
-        format!("{}/{}", dir, basename)
+        let remote_script = format!("{}/{}", dir, basename);
+
+        // ── Bundled-CPython decision (`python_runtime::needs_managed_runtime`) ──
+        // The remote asset label comes from the platform probe the worker
+        // deploy already ran (`RemoteEnv.remote_asset`) — no second `uname`.
+        let remote_is_linux = env.remote_asset.starts_with("linux-");
+        let remote_label = if env.remote_asset.is_empty() {
+            "unknown"
+        } else {
+            env.remote_asset.as_str()
+        };
+
+        if python && !remote_is_linux {
+            // Explicit `--python` on a non-Linux remote: an explicit error, and
+            // the runtime payload is neither downloaded nor uploaded. (The
+            // worker deploy above is the pre-existing `script` behaviour; its
+            // platform probe is where `remote_asset` comes from.)
+            return Err(anyhow!(
+                "`--python` requires a Linux remote — this host is {remote_label}, and the bundled \
+                 CPython runtime is Linux-only. The runtime was not downloaded or uploaded."
+            ));
+        }
+
+        // The `command -v python3` round trip only runs when its result can
+        // change the outcome: a `.py` file, no explicit interpreter, no forced
+        // runtime, and a Linux remote.
+        let probe_can_matter =
+            !python && interpreter.is_none() && is_python_file && remote_is_linux;
+        let remote_python3 = if probe_can_matter {
+            python_runtime::probe_system_python3(&session).await?
+        } else {
+            false
+        };
+
+        let managed_runner = if python_runtime::needs_managed_runtime(
+            python,
+            interpreter,
+            is_python_file,
+            remote_python3,
+            remote_is_linux,
+        ) {
+            let flavor = python_runtime::probe_flavor(&session).await?;
+            let target = python_runtime::runtime_target(&home, &env.remote_asset, flavor)?;
+            // `--python` selects the runtime; it does not force a reinstall —
+            // a ready runtime still costs exactly one read-only round trip.
+            let outcome = python_runtime::install(&session, remote, &target, false, trace).await?;
+            summary.deployed |= outcome.deployed;
+            // The interpreter path is an absolute path under a possibly
+            // spaced home: quote it, and let `assemble_remote_command` emit it
+            // verbatim (it never quotes the runner).
+            Some(shell_quote(&outcome.interpreter)?)
+        } else {
+            if is_python_file && interpreter.is_none() && !remote_python3 && !remote_is_linux {
+                // Keep today's literal `python3`; say why only under -v.
+                progress!(
+                    "python: the bundled runtime is Linux-only — remote {remote_label}, keeping \
+                     the literal `python3`"
+                );
+            }
+            None
+        };
+
+        (remote_script, managed_runner)
     };
 
     do_sync(script, &remote_script, remote).await?;
 
-    let runner = match interpreter {
+    let runner: Option<String> = match interpreter {
         Some(i) => Some(i.to_string()),
-        None => detect_runner(script)?,
+        None => managed_runner.or(detected),
     };
-    let mut parts: Vec<String> = Vec::new();
-    match &runner {
-        Some(r) => {
-            parts.push(r.clone());
-            parts.push(shell_quote(&remote_script)?);
-        }
-        None => {
-            // shebang: chmod +x then run directly
-            let q = shell_quote(&remote_script)?;
-            parts.push(format!("chmod +x {} && {}", q, q));
-        }
-    }
-    for a in args {
-        parts.push(shell_quote(a)?);
-    }
-    let command = parts.join(" ");
+    // Byte-identical to v0.4.2 whenever the managed runtime is not used (the
+    // characterization tests in `python_runtime` lock the literals).
+    let command = python_runtime::assemble_remote_command(runner.as_deref(), &remote_script, args)?;
     trace.add(format!(
         "script: synced {} → {remote_script}",
         script.display()
     ));
     run_command(remote, host, &command, env_vars, trace, summary, capture).await?;
+    Ok(())
+}
+
+/// What `python status` / `python install` report (`--json` contract).
+///
+/// A different shape from [`diagnostics::RunSummary`]: nothing is executed, so
+/// there is no pid/exit_code; the runtime facts are what the user asked for.
+#[derive(Default)]
+struct PythonReport {
+    runtime_key: String,
+    installed: bool,
+    path: String,
+    deployed: bool,
+    error: Option<String>,
+}
+
+/// The `--json` line for `python status` / `python install`, one line on stderr:
+/// `host`, `runtime_key`, `installed`, `path`, `deployed`, and `error` only on
+/// failure.
+fn python_json_line(host: &str, report: &PythonReport) -> String {
+    let mut out = String::with_capacity(192);
+    out.push_str("{\"host\":");
+    out.push_str(&json_string(host));
+    out.push_str(",\"runtime_key\":");
+    out.push_str(&json_string(&report.runtime_key));
+    out.push_str(",\"installed\":");
+    out.push_str(if report.installed { "true" } else { "false" });
+    out.push_str(",\"path\":");
+    out.push_str(&json_string(&report.path));
+    out.push_str(",\"deployed\":");
+    out.push_str(if report.deployed { "true" } else { "false" });
+    if let Some(error) = &report.error {
+        out.push_str(",\"error\":");
+        out.push_str(&json_string(error));
+    }
+    out.push('}');
+    out
+}
+
+/// `rexec <host> python status|install` — the managed CPython runtime.
+///
+/// Deliberately never calls `ensure_remote_binary_traced`: `status` must not
+/// deploy (or write) anything at all, and neither command needs the worker.
+/// The platform probe is the same read-only mirror `plan` uses, so this path
+/// cannot upload a payload by accident.
+async fn run_python(
+    remote: &RemoteHost,
+    cmd: &PythonCmd,
+    trace: &mut diagnostics::Trace,
+    report: &mut PythonReport,
+) -> Result<()> {
+    let session = ssh::connect_traced(remote, trace).await?;
+    let (platform, asset) = probe_remote_platform(&session).await;
+    let platform_label = if platform.trim().is_empty() {
+        "unrecognized".to_string()
+    } else {
+        platform.trim().to_string()
+    };
+    let asset = asset.ok_or_else(|| {
+        anyhow!(
+            "the bundled CPython runtime needs a Linux remote, and this remote's platform is \
+             unrecognized (probe: {platform_label}) — nothing was downloaded, uploaded or written"
+        )
+    })?;
+    if !asset.starts_with("linux-") {
+        return Err(anyhow!(
+            "the bundled CPython runtime is Linux-only — this remote is {asset} (probe: \
+             {platform_label}); nothing was downloaded, uploaded or written"
+        ));
+    }
+
+    let home = python_runtime::probe_home(&session).await?;
+    let flavor = python_runtime::probe_flavor(&session).await?;
+    let target = python_runtime::runtime_target(&home, &asset, flavor)?;
+    report.runtime_key = target.key.clone();
+    report.path = target.runtime_dir.clone();
+
+    match cmd {
+        PythonCmd::Status => {
+            // READ-ONLY: one probe round trip. No download, no upload, no write.
+            let ready = python_runtime::probe_ready(&session, &target, trace).await?;
+            let state = match &ready {
+                Some(vv) if vv.is_empty() => "ready (no version recorded)".to_string(),
+                Some(vv) => format!("ready ({vv})"),
+                None => "not installed".to_string(),
+            };
+            println!("runtime:  {}", target.key);
+            println!(
+                "asset:    {} ({} bytes)",
+                target.payload.asset, target.payload.size
+            );
+            println!("state:    {state}");
+            println!("path:     {}", target.runtime_dir);
+            report.installed = ready.is_some();
+        }
+        PythonCmd::Install { reinstall } => {
+            let outcome =
+                python_runtime::install(&session, remote, &target, *reinstall, trace).await?;
+            report.installed = true;
+            report.deployed = outcome.deployed;
+            if !outcome.deployed {
+                progress!(
+                    "✓ CPython {} runtime {} is already ready",
+                    python_runtime::PYTHON_VERSION,
+                    target.key
+                );
+            }
+        }
+    }
     Ok(())
 }
 
@@ -4908,6 +5237,7 @@ async fn plan_command(
     let launch = ssh::RemoteEnv {
         is_windows,
         home,
+        remote_asset: asset.clone().unwrap_or_default(),
         deployed: false,
     }
     .worker_command();
@@ -5946,7 +6276,10 @@ fn remote_is_windows(platform: &str, asset: Option<&str>) -> bool {
 /// frame stream, so lossy decoding would corrupt precisely the bytes `fetch`
 /// exists to preserve. Hence this byte-exact reader over one channel (no
 /// deploy, no write, no second command). Returns `(stdout, stderr, exit)`.
-async fn read_remote_bytes(
+///
+/// Also the status-preserving primitive `python_runtime` wraps with a timeout:
+/// its remote unpack/stamp steps must not guess success from output text.
+pub(crate) async fn read_remote_bytes(
     session: &russh::client::Handle<ssh::ClientHandler>,
     command: &str,
 ) -> Result<(Vec<u8>, Vec<u8>, Option<i32>)> {
@@ -6274,6 +6607,9 @@ async fn main() -> Result<()> {
     // Filled by `run_command` when recording is on; read back at the boundary
     // below, on success AND failure, so a failed run is recorded too.
     let mut capture: Option<RunCapture> = None;
+    // Filled by the `python` action: its `--json` contract differs from the run
+    // summary (see `python_json_line`), so it owns the single JSON line.
+    let mut python_report: Option<PythonReport> = None;
 
     let result: Result<()> = async {
         match (cli.host, cli.action, cli.port) {
@@ -6335,6 +6671,7 @@ async fn main() -> Result<()> {
                 Action::Script {
                     script,
                     interpreter,
+                    python,
                     sync_to,
                     env,
                     env_file,
@@ -6355,6 +6692,7 @@ async fn main() -> Result<()> {
                     &host,
                     &script,
                     interpreter.as_deref(),
+                    python,
                     sync_to.as_deref(),
                     &args,
                     &env_vars,
@@ -6363,6 +6701,25 @@ async fn main() -> Result<()> {
                     &mut capture,
                 )
                 .await?;
+            }
+            (host, Action::Python { cmd }, port) => {
+                // The python report owns the JSON line even when the action
+                // fails before a target exists (host-less, unknown platform),
+                // so `--json` keeps one shape for the whole subcommand.
+                let mut report = PythonReport::default();
+                let result: Result<()> = async {
+                    // `require_host` is the same guard the other remote actions
+                    // spell out per-arm.
+                    let host = require_host(host.as_deref(), "python")?;
+                    let remote = resolve_host(host, port, &mut trace)?;
+                    summary.resolved = resolved_label(&remote);
+                    // No history capture: nothing is executed, and
+                    // `python status` is a pure read.
+                    run_python(&remote, &cmd, &mut trace, &mut report).await
+                }
+                .await;
+                python_report = Some(report);
+                result?;
             }
             (Some(host), Action::Plan { command }, port) => {
                 let remote = resolve_host(&host, port, &mut trace)?;
@@ -6454,7 +6811,14 @@ async fn main() -> Result<()> {
             // not land after the summary this contract keeps LAST on stderr.
             // The Ok path covers a non-zero remote exit too.
             record_history(capture.as_ref(), &summary, &trace);
-            if json {
+            if let Some(report) = &python_report {
+                // `python status`/`install` have their own one-line contract;
+                // the run summary would describe a run that never happened.
+                if json {
+                    ensure_stderr_line_start();
+                    eprintln!("{}", python_json_line(&summary.host, report));
+                }
+            } else if json {
                 // stderr, and last: stdout stays pure command output.
                 ensure_stderr_line_start();
                 eprintln!("{}", summary_json_line(&summary));
@@ -6481,7 +6845,15 @@ async fn main() -> Result<()> {
             // before its first remote touch). Before the JSON line, so a
             // history warning cannot displace the summary kept last on stderr.
             record_history(capture.as_ref(), &summary, &trace);
-            if json {
+            if let Some(report) = python_report.as_mut() {
+                report.error = Some(summary.error.clone().unwrap_or_default());
+            }
+            if let Some(report) = &python_report {
+                if json {
+                    ensure_stderr_line_start();
+                    eprintln!("{}", python_json_line(&summary.host, report));
+                }
+            } else if json {
                 ensure_stderr_line_start();
                 eprintln!("{}", summary_json_line(&summary));
             }

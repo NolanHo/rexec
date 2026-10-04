@@ -8,6 +8,7 @@ A CLI to sync local files/folders and run commands on remote hosts over SSH, des
 
 - **Folder/file sync**: rsync a local file or folder to the remote before running
 - **Script run**: one-command sync + run a local script (`script` subcommand)
+- **Bundled Python runtime**: a pinned CPython for Linux remotes, so `rexec <host> script --python foo.py` runs without any Python on the host, with `python install`/`python status` to pre-warm or inspect it
 - **Host listing**: list SSH hosts from `~/.ssh/config` (`list` subcommand)
 - **Disconnect resilience**: remote worker ignores SIGHUP and writes to a log; CLI reconnects with backoff and resumes from the last byte (Linux/macOS remotes; Windows remotes are experimental and do not guarantee disconnect survival)
 - **Auto binary deploy**: deploys a version-matched worker to the remote on first use — uploads itself when platforms match, otherwise downloads the prebuilt worker from GitHub Releases (e.g. macOS local → Linux remote)
@@ -60,6 +61,13 @@ rexec <host> script ./deploy.sh -- arg1 arg2
 rexec <host> script --interpreter python3 ./train.py -- --epochs 10
 rexec <host> script -e API_KEY=sk-xxx ./fetch.py
 
+# Force the rexec-managed CPython runtime (Linux remotes; no remote python3 needed)
+rexec <host> script --python ./train.py -- --epochs 10
+
+# Pre-warm / inspect the managed runtime on a host
+rexec <host> python install
+rexec <host> python status
+
 # List hosts from ~/.ssh/config
 rexec list
 rexec list my-server
@@ -88,7 +96,7 @@ rexec -q my-server run -- "echo only-this"
 - **Success is silent.** In normal mode stdout/stderr carry the command's own output and nothing else — the one exception is the first-connect known-hosts notice (`⚠ Accepting new host key for …`, the same warning `ssh` prints) and the non-zero-exit warning below. `-v/--verbose` adds the decision trace (resolved target, auth attempts, platform/deploy decision, remote PID, reconnect events, timings).
 - **Errors and warnings carry their full context in one shot.** A failure prints the error plus the decision trace — no need to re-run with `-v`. An unknown host alias fails with near-miss suggestions from the configured aliases (prefix/substring matches) and the hint to use `user@host` for a literal host. If the worker dies before it starts, the error includes the worker's own stderr and the launch command that was attempted.
 - **A non-zero remote exit prints one warning line** to stderr: `⚠ remote exit <code> (log: ~/.rexec/logs/<pid>.log)`. Exit code 0 prints nothing. **rexec's own exit status mirrors the remote code** (like `ssh`), so `rexec … && next` and scripts checking `$?` see the failure; a signal-killed remote process (no real code, reported as `-1`) exits `255`. Caveat: when stdout is piped into a reader that exits early (`| head`), the process ends on SIGPIPE (141) before the remote code can be propagated.
-- **`--json` emits exactly one JSON line on stderr, last** (after the trace/warning), with stable field order: `host`, `resolved`, `pid`, `exit_code`, `duration_ms`, `deployed`, `stdout_bytes`, `stderr_bytes`, `log_path` (always `null` for now — the warning line carries the remote log path), and `error` only on failure. stdout is never polluted.
+- **`--json` emits exactly one JSON line on stderr, last** (after the trace/warning), with stable field order: `host`, `resolved`, `pid`, `exit_code`, `duration_ms`, `deployed`, `stdout_bytes`, `stderr_bytes`, `log_path` (always `null` for now — the warning line carries the remote log path), and `error` only on failure. stdout is never polluted. `deployed` means **any payload was deployed to the remote during this invocation** — the worker or the managed Python runtime — and the recorded history entry carries the same meaning.
 - **`ProxyJump` is honoured, and the route is visible.** A jump chain from the ssh config (including chained jumps: `nebula99 → lyg2004 → js4`) is tunnelled with `direct-tcpip` channels — each hop authenticates on its own with its own `User`/`IdentityFile`, exactly like `ssh -J`. `plan` prints the route (`route: via 192.168.4.70:42200 → 10.30.40.4:22`) and `-v` traces every hop (`connect: jump 1/2 … connected in 167ms`). Jump sessions get keepalives so an idle tunnel is not reaped. `--sync` hands rsync the alias (or an explicit `-J` chain for literal targets) so the ssh rsync spawns takes the same route.
 - **`ProxyCommand` is honored when it is a SOCKS5 proxy, and said out loud when it is not.** The recognizable shapes — `nc -X 5 -x HOST[:PORT] %h %p`, `nc -x HOST[:PORT] %h %p`, `ncat --proxy HOST[:PORT] --proxy-type socks5 %h %p`, `connect [-5] -S HOST[:PORT] %h %p` (port defaults to 1080) — are used as a real SOCKS5 CONNECT (no-auth only) for the first hop, and show up in the route (`route: via socks5 127.0.0.1:1080`) and the trace. Any other ProxyCommand (a `ssh -W` jump host — the warning points at `ProxyJump` instead — SOCKS4/HTTP proxies, `socat`'s ambiguous grammar, unknown flags) keeps the one-line warning naming the route actually used (`⚠ ssh config: proxycommand=… for <host> is not implemented; connecting directly to …`). Every other unsupported directive (`SendEnv`, `StrictHostKeyChecking`, `LocalForward`, …) stays silent.
 
@@ -98,7 +106,7 @@ rexec -q my-server run -- "echo only-this"
 rexec <host> plan -- "<command>"
 ```
 
-Connects, resolves the host, probes the remote platform and the installed worker, then prints the resolution, the deploy decision (`nothing — up-to-date` / `upload self` / `download <asset> from <url>`), the exact launch command, and the script-file indirection note. It exits 0 **without executing the command and without deploying anything** — safe to run against production hosts.
+Connects, resolves the host, probes the remote platform and the installed worker, then prints the resolution, the deploy decision (`nothing — up-to-date` / `upload self` / `download <asset> from <url>`), the exact launch command, and the script-file indirection note. It exits 0 **without executing the command and without deploying anything** — safe to run against production hosts. The bundled Python runtime does not change this: `plan` never downloads or deploys it either.
 
 ### `run` options
 
@@ -110,6 +118,8 @@ Connects, resolves the host, probes the remote platform and the installed worker
 | `-- <command...>` | Command to run on the remote (joined; executed by the worker from a private script file). |
 
 On Windows the local side of `--sync` must be an MSYS2/WSL-style path (`/c/proj`), not a drive path: `C:\proj:/remote/dir` is rejected, since `LOCAL:REMOTE` splitting would read `C` as a host. `--sync` and the `script` subcommand (both rsync-based) work with Linux/macOS remotes only — they cannot target a Windows remote.
+
+**Syncing a folder is destructive**: the folder branch always passes rsync `--delete`, and the remote path is used exactly as you wrote it — sync a folder onto a home directory and everything under it that is absent locally is deleted, including `~/.rexec/**`: the 7 MiB worker binary and, once installed, the ~105 MiB managed Python runtime. Recovery is a full reinstall, i.e. a re-download.
 
 ### Global options
 
@@ -128,10 +138,27 @@ Run/plan/sync/script usage is unchanged otherwise: `rexec [-p PORT] [-v] [--json
 ### `script` — sync and run a local script
 
 ```bash
-rexec <host> script [--interpreter CMD] [--sync-to REMOTE_DIR] [-e K=V] [--env-file F] <local_script> [-- args...]
+rexec <host> script [--interpreter CMD] [--python] [--sync-to REMOTE_DIR] [-e K=V] [--env-file F] <local_script> [-- args...]
 ```
 
 Syncs the script to `~/.rexec/scripts/` (or `--sync-to`), then runs it. The interpreter is auto-detected: a `#!` shebang runs the script directly; otherwise `.py` → `python3`, else `sh`. Override with `--interpreter`. Args after `--` are passed to the script.
+
+**`--python` runs the script with the rexec-managed CPython runtime** (Linux remotes only), so the host needs no Python of its own. Without `--interpreter`/`--python`, a `.py` script is resolved with a read-only probe of the remote (`command -v python3`): if a system `python3` is present, behaviour is unchanged; if it is absent, the managed runtime runs the script. Precedence is `--interpreter` > `--python` > auto-detect, and passing `--python` together with `--interpreter` is a usage error. The runtime is pinned, installed on demand and cached by Python version — see `python` below for the layout, the first-run cost and the two subcommands.
+
+### `python` — the managed CPython runtime
+
+```bash
+rexec <host> python install [--reinstall]   # pre-warm or repair the runtime on this host (idempotent)
+rexec <host> python status                  # read-only: is it ready, which payload, how big
+```
+
+`python install` installs the runtime if it is missing and does nothing when it is already in place; `--reinstall` forces the full install again. `python status` never downloads, never uploads and never writes on the remote — it only reports whether the runtime is ready there, which payload would be used and its size.
+
+The runtime is a pinned CPython 3.13.16 from [python-build-standalone](https://github.com/astral-sh/python-build-standalone) (release 20261001), picked for the remote's architecture and libc. The tarball is cached locally as `~/.rexec/cache/<asset>` (the same cache directory as the worker, distinct file names) and unpacked on the remote under `~/.rexec/py/<key>/`, with the interpreter at `<key>/python/bin/python3` — for an x86_64 glibc host, `<key>` is `cpython-3.13.16+20261001-x86_64-unknown-linux-gnu`. The local file is verified against its pinned sha256 and byte count before it is uploaded, and the remote's own `tar` unpacks it. A stamp file at `~/.rexec/py/<key>/.stamp` is written only after the interpreter has actually run, so a stamp means the runtime works — not merely that the files are there. A hard-killed install (Ctrl-C, `kill -9`, a dropped connection) can leave a `<key>.tar.gz.<nonce>` or `<key>.tmp.<nonce>` entry under `~/.rexec/py/`, or — when the kill lands between the swap's `mv` and the nested-copy guard — a `<key>.tmp.<nonce>` entry *inside* `~/.rexec/py/<key>/`; none of these is the runtime directory or the stamp path, so they are inert — clean them up manually with `rm -rf ~/.rexec/py/<key>.tmp.* ~/.rexec/py/<key>.tar.gz.* ~/.rexec/py/<key>/<key>.tmp.*`. The local cache is disposable: `~/.rexec/cache/<asset>` holds one file per payload variant — the worker assets and the Python payloads — and deleting it is safe, because the next run re-downloads whatever it needs.
+
+**First-run cost** (x86_64 glibc): roughly a 33 MiB download, a 33 MiB upload and 105 MiB unpacked on the remote — once per host. The cache is keyed by **Python** version, not by rexec version, so a rexec upgrade does not re-transfer it; readiness itself is a single read-only probe (stamp plus executable marker in one round trip), and selecting the payload adds one more read-only libc/arch probe. Out of scope: third-party packages/pip, venv management, multiple Python versions, macOS/Windows remotes and runtime auto-update.
+
+**Concurrent installs are not locked**: two simultaneous `rexec … script --python` runs against the same host both install, and the guarantee is only last-writer-wins — each install extracts into a random-suffixed temp directory and then replaces the runtime directory, so they do not nest and do not corrupt each other. Replacing the runtime directory while a script is running does not break the already-running interpreter, but that process's later attempts to start a *new* interpreter from the same path may fail.
 
 ### `list` — show configured hosts
 
@@ -201,7 +228,7 @@ rexec history prune --keep-days 7 --max-mb 500
 
 1. If `--sync` is given, runs `rsync -az [--delete] -e "ssh [-p PORT] ..."` to sync the local file/folder to the remote. The port from `host:port` or `--port` is passed to rsync via `ssh -p` (so `user@host:port` works for sync too).
 2. Connects via russh (pure Rust SSH), authenticates via agent → identity-file → default keys (Windows locals: identity-file/default keys only — russh's agent client speaks the unix socket protocol).
-3. Ensures `~/.rexec/rexec` exists on the remote and matches the local version. If the remote platform matches the local one, it uploads the running binary via rsync; otherwise it downloads the version-pinned worker from GitHub Releases (cached in `~/.rexec/cache/`, so each version/target is downloaded once) and rsyncs that over.
+3. Ensures `~/.rexec/rexec` exists on the remote and matches the local version. If the remote platform matches the local one, it uploads the running binary via rsync; otherwise it downloads the version-pinned worker from GitHub Releases (cached in `~/.rexec/cache/`, so each version/target is downloaded once) and rsyncs that over. When an invocation needs the managed Python runtime (`--python`, or a `.py` script auto-detected on a host without `python3`), the pinned runtime payload is fetched the same way — cached in `~/.rexec/cache/<asset>`, verified against its sha256 and byte count before upload, unpacked under `~/.rexec/py/<key>/` by the remote's `tar` — and a `.stamp` is written only after the interpreter has actually run.
 4. Starts `~/.rexec/rexec worker` over the SSH channel. The **command and env vars are sent over stdin** (not argv), so neither appears in the remote worker's `ps`/`pkill -f`/`pgrep -f` output.
 5. The worker ignores SIGHUP, writes the command to a private script (`~/.rexec/run/<pid>.sh`, mode 0600, removed on exit; stale ones swept on startup), spawns `sh <script>`, and streams stdout/stderr back via a binary frame protocol — writing every frame to `~/.rexec/logs/<pid>.log` and to the SSH channel. The script-file indirection keeps command text out of every process's cmdline, so `sh -c "pkill -f foo"`-style self-kills cannot happen.
 6. On SSH disconnect: the worker keeps running; the CLI reconnects with exponential backoff (1s→30s, max 10) and resumes from the last byte offset via `~/.rexec/rexec attach --pid <PID> --offset <N>`.
@@ -218,7 +245,7 @@ rexec history prune --keep-days 7 --max-mb 500
 
 ## `init` Command
 
-Checks that `rsync` and `sh` exist on the remote host. If `rsync` is missing, auto-detects the package manager (`apt-get`/`yum`/`dnf`/`apk`/`pacman`) and installs it. (`nohup` is not required — the worker handles disconnect survival via SIGHUP.)
+Checks that `rsync`, `sh` and `tar` exist on the remote host. If `rsync` is missing, auto-detects the package manager (`apt-get`/`yum`/`dnf`/`apk`/`pacman`) and installs it; `tar` gets the same detection/install path and the same failure hint (the managed Python runtime is unpacked with it). (`nohup` is not required — the worker handles disconnect survival via SIGHUP.)
 
 ```bash
 rexec my-server init
@@ -252,3 +279,4 @@ Cross-platform deploys (e.g. macOS local → Linux remote) download these releas
 - `rsync` (system) — required for sync (local + remote; on Windows install it via MSYS2 or WSL)
 - `curl` (system) — required locally, to download cross-platform workers from GitHub Releases
 - `sh` (system) — required on a Linux/macOS remote
+- `tar` (system) — required on the remote to unpack the managed Python runtime (`rexec <host> init` checks it)
