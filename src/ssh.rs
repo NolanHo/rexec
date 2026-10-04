@@ -988,6 +988,12 @@ pub struct RemoteEnv {
     /// Absolute home path for Windows remotes (`C:\Users\...`); empty for
     /// POSIX remotes, whose launch commands use `~` literally.
     pub home: String,
+    /// Release-asset label of the remote platform (e.g. `linux-amd64`,
+    /// `macos-arm64`, `windows-amd64`), filled by the platform probe this
+    /// function already runs. Callers that need the platform — the bundled
+    /// Python runtime is Linux-only — must read it from here instead of
+    /// running a second `uname -sm`.
+    pub remote_asset: String,
     /// True when THIS call actually deployed (uploaded/downloaded) the
     /// worker — false when the remote was already up to date. Lets callers
     /// report the deploy fact without re-probing.
@@ -1092,6 +1098,7 @@ pub async fn ensure_remote_binary_traced(
             return Ok(RemoteEnv {
                 is_windows: true,
                 home,
+                remote_asset: remote_asset.clone(),
                 deployed: false,
             });
         }
@@ -1109,6 +1116,7 @@ pub async fn ensure_remote_binary_traced(
             return Ok(RemoteEnv {
                 is_windows: false,
                 home: String::new(),
+                remote_asset: remote_asset.clone(),
                 deployed: false,
             }); // Already up to date
         }
@@ -1136,6 +1144,7 @@ pub async fn ensure_remote_binary_traced(
         RemoteEnv {
             is_windows: true,
             home,
+            remote_asset: remote_asset.clone(),
             deployed: true,
         }
     } else {
@@ -1143,6 +1152,7 @@ pub async fn ensure_remote_binary_traced(
         RemoteEnv {
             is_windows: false,
             home: String::new(),
+            remote_asset,
             deployed: true,
         }
     };
@@ -1352,8 +1362,10 @@ pub async fn exec_remote(session: &client::Handle<ClientHandler>, command: &str)
 
 /// Check remote dependencies and install if missing.
 ///
-/// Required on Linux/macOS: rsync, sh. The worker uses SIGHUP ignoring via
-/// libc, not the `nohup` command, so nohup is no longer a dependency.
+/// Required on Linux/macOS: rsync, sh, tar. `tar` unpacks the managed CPython
+/// runtime (`rexec <host> script --python`); the worker itself does not need it.
+/// The worker uses SIGHUP ignoring via libc, not the `nohup` command, so nohup
+/// is no longer a dependency.
 ///
 /// Windows remotes have neither rsync nor sh — and the deploy path uploads over
 /// SFTP there — so only `cmd` is required. It ships with the OS and cannot be
@@ -1374,7 +1386,7 @@ pub async fn check_and_install_deps(session: &mut client::Handle<ClientHandler>)
 
     // Check deps in one round-trip
     let check_cmd = r#"echo "=== Checking dependencies ===";
-for tool in rsync sh; do
+for tool in rsync sh tar; do
   if command -v "$tool" >/dev/null 2>&1; then
     echo "✓ $tool: $(command -v $tool)";
   else
@@ -1399,17 +1411,18 @@ fi"#;
     let output = exec_remote(session, check_cmd).await?;
     print!("{}", output);
 
-    // Parse which deps are missing
-    let missing_rsync = output.contains("✗ rsync");
-    let missing_sh = output.contains("✗ sh");
+    // Parse which deps are missing (`✗ <tool>` at a token boundary). A missing
+    // `tar` must be reported even when `rsync` is present — that is why the
+    // early return on "rsync found" is gone.
+    let missing = crate::python_runtime::missing_remote_deps(&output);
 
-    if missing_sh {
+    if missing.contains(&"sh") {
         return Err(anyhow!(
             "'sh' not found on remote — this is a critical dependency. Please install a POSIX shell manually."
         ));
     }
 
-    if !missing_rsync {
+    if missing.is_empty() {
         println!("\n✓ All dependencies satisfied.");
         return Ok(());
     }
@@ -1431,19 +1444,20 @@ fi"#;
 
     if pm == "none" {
         eprintln!("\n⚠ Could not detect a package manager on the remote host.");
-        eprintln!("  Missing: rsync");
+        eprintln!("  Missing: {}", missing.join(", "));
         eprintln!("  Please install it manually.");
         return Err(anyhow!("no package manager detected, cannot auto-install"));
     }
 
     println!("\nInstalling missing dependencies via {}...", pm);
 
+    let packages = missing.join(" ");
     let install_cmd = match pm {
-        "apt-get" => "sudo apt-get update -qq && sudo apt-get install -y -qq rsync".to_string(),
-        "yum" => "sudo yum install -y -q rsync".to_string(),
-        "dnf" => "sudo dnf install -y -q rsync".to_string(),
-        "apk" => "sudo apk add --quiet rsync".to_string(),
-        "pacman" => "sudo pacman -S --noconfirm --quiet rsync".to_string(),
+        "apt-get" => format!("sudo apt-get update -qq && sudo apt-get install -y -qq {packages}"),
+        "yum" => format!("sudo yum install -y -q {packages}"),
+        "dnf" => format!("sudo dnf install -y -q {packages}"),
+        "apk" => format!("sudo apk add --quiet {packages}"),
+        "pacman" => format!("sudo pacman -S --noconfirm --quiet {packages}"),
         _ => return Err(anyhow!("unsupported package manager")),
     };
 
@@ -1453,7 +1467,7 @@ fi"#;
 
     // Verify installation
     println!("\n=== Verifying installation ===");
-    let verify_cmd = r#"for tool in rsync sh; do
+    let verify_cmd = r#"for tool in rsync sh tar; do
   if command -v "$tool" >/dev/null 2>&1; then
     echo "✓ $tool: $(command -v $tool)";
   else
@@ -1464,9 +1478,12 @@ done"#;
     let verify_output = exec_remote(session, verify_cmd).await?;
     print!("{}", verify_output);
 
-    if verify_output.contains("STILL NOT FOUND") {
+    let still_missing = crate::python_runtime::missing_remote_deps(&verify_output);
+    if !still_missing.is_empty() {
         return Err(anyhow!(
-            "some dependencies are still missing after installation"
+            "some dependencies are still missing after installation: {} — install them manually \
+             (the managed CPython runtime unpacks with `tar`)",
+            still_missing.join(", ")
         ));
     }
 
