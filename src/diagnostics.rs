@@ -21,32 +21,47 @@ use std::io::IsTerminal;
 use std::sync::atomic::AtomicU8;
 
 /// Selected output mode, parsed once from the CLI flags.
-#[derive(Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum OutputMode {
     #[default]
     Normal,
     Quiet,
+    /// `-v`: the decisions (resolved target, route, deploy, pid, exit).
     Verbose,
+    /// `-vv`: `-v` plus the plumbing — auth attempts, connect timings, the
+    /// internal worker launch. What an agent usually does NOT want to pay for.
+    Verbose2,
 }
 
 impl OutputMode {
-    pub fn from_flags(quiet: bool, verbose: bool) -> Self {
+    pub fn from_flags(quiet: bool, verbose: u8) -> Self {
         match (quiet, verbose) {
             (true, _) => OutputMode::Quiet,
-            (_, true) => OutputMode::Verbose,
-            _ => OutputMode::Normal,
+            (_, 0) => OutputMode::Normal,
+            (_, 1) => OutputMode::Verbose,
+            _ => OutputMode::Verbose2,
         }
     }
 
     /// Decision-trace lines are printed on success only in verbose mode.
     pub fn trace_on_success(self) -> bool {
-        self == OutputMode::Verbose
+        matches!(self, OutputMode::Verbose | OutputMode::Verbose2)
     }
 
     /// Legacy progress lines (sync/reconnect) — verbose only; normal mode is
     /// silent on success.
     pub fn progress_lines(self) -> bool {
-        self == OutputMode::Verbose
+        matches!(self, OutputMode::Verbose | OutputMode::Verbose2)
+    }
+
+    /// Highest trace entry level to render on SUCCESS: `-v` shows decisions
+    /// (level 0), `-vv` adds the plumbing (level 1). Failures always render
+    /// everything, so context is never lost.
+    pub fn trace_level(self) -> u8 {
+        match self {
+            OutputMode::Verbose2 => 1,
+            _ => 0,
+        }
     }
 
     pub fn as_u8(self) -> u8 {
@@ -54,6 +69,7 @@ impl OutputMode {
             OutputMode::Normal => 0,
             OutputMode::Quiet => 1,
             OutputMode::Verbose => 2,
+            OutputMode::Verbose2 => 3,
         }
     }
 
@@ -61,6 +77,7 @@ impl OutputMode {
         match v {
             1 => OutputMode::Quiet,
             2 => OutputMode::Verbose,
+            3 => OutputMode::Verbose2,
             _ => OutputMode::Normal,
         }
     }
@@ -82,21 +99,41 @@ pub fn mode() -> OutputMode {
 /// the full context arrives in one shot.
 #[derive(Default)]
 pub struct Trace {
-    entries: Vec<String>,
+    /// `(level, line)`; level 0 = decision, 1 = plumbing (`-vv` / failures).
+    entries: Vec<(u8, String)>,
 }
 
 impl Trace {
+    /// A decision the user needs: always rendered when the trace is shown.
     pub fn add(&mut self, msg: impl Into<String>) {
-        self.entries.push(msg.into());
+        self.entries.push((0, msg.into()));
+    }
+
+    /// Plumbing (auth attempts, connect timings, internal launch commands).
+    /// Kept for failures and `-vv`, dropped from a successful `-v` run: a
+    /// successful verbose run should say what was decided, not how.
+    pub fn add_detail(&mut self, msg: impl Into<String>) {
+        self.entries.push((1, msg.into()));
     }
 
     /// Render as an indented block, ready to print under an error message.
     pub fn render(&self) -> String {
-        if self.entries.is_empty() {
+        self.render_level(u8::MAX)
+    }
+
+    /// [`render`] with entries above `max` dropped (0 = decisions only).
+    pub fn render_level(&self, max: u8) -> String {
+        let kept: Vec<&str> = self
+            .entries
+            .iter()
+            .filter(|(level, _)| *level <= max)
+            .map(|(_, line)| line.as_str())
+            .collect();
+        if kept.is_empty() {
             return String::new();
         }
         let mut out = String::from("decision trace:\n");
-        for e in &self.entries {
+        for e in kept {
             out.push_str("  → ");
             out.push_str(e);
             out.push('\n');
@@ -104,8 +141,8 @@ impl Trace {
         out
     }
 
-    pub fn lines(&self) -> &[String] {
-        &self.entries
+    pub fn lines(&self) -> Vec<&str> {
+        self.entries.iter().map(|(_, line)| line.as_str()).collect()
     }
 }
 
@@ -134,4 +171,58 @@ pub fn stderr_is_tty() -> bool {
 /// ANSI red wrapper (no-op guarantee is the caller's job via `stderr_is_tty`).
 pub fn red(s: &str) -> String {
     format!("\x1b[31m{s}\x1b[0m")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_output_mode_levels() {
+        assert_eq!(OutputMode::from_flags(false, 0), OutputMode::Normal);
+        assert_eq!(OutputMode::from_flags(false, 1), OutputMode::Verbose);
+        assert_eq!(OutputMode::from_flags(false, 2), OutputMode::Verbose2);
+        assert_eq!(OutputMode::from_flags(false, 9), OutputMode::Verbose2);
+        assert_eq!(OutputMode::from_flags(true, 2), OutputMode::Quiet);
+        // levels survive the global round-trip
+        for mode in [
+            OutputMode::Normal,
+            OutputMode::Quiet,
+            OutputMode::Verbose,
+            OutputMode::Verbose2,
+        ] {
+            assert_eq!(OutputMode::from_u8(mode.as_u8()), mode);
+        }
+        assert_eq!(OutputMode::Verbose.trace_level(), 0, "-v: decisions only");
+        assert_eq!(OutputMode::Verbose2.trace_level(), 1, "-vv: plus plumbing");
+        assert_eq!(OutputMode::Normal.trace_level(), 0);
+        assert!(OutputMode::Verbose2.trace_on_success());
+        assert!(OutputMode::Verbose2.progress_lines());
+    }
+
+    #[test]
+    fn test_trace_render_filters_plumbing() {
+        let mut trace = Trace::default();
+        trace.add("resolve: alias prod → root@10.0.0.5:22");
+        trace.add_detail("auth: identity file /root/.ssh/id_ed25519 → success");
+        trace.add_detail("timing: 3330 ms, stdout 0 B, stderr 0 B");
+
+        // `-v`: decisions only — the plumbing an agent does not want to pay for.
+        let level1 = trace.render_level(0);
+        assert!(level1.contains("resolve: alias"), "{level1}");
+        assert!(!level1.contains("auth:"), "{level1}");
+        assert!(!level1.contains("timing:"), "{level1}");
+
+        // `-vv` and the failure path render everything.
+        for rendered in [trace.render_level(1), trace.render()] {
+            assert!(rendered.contains("auth:"), "{rendered}");
+            assert!(rendered.contains("timing:"), "{rendered}");
+        }
+
+        // A trace with nothing worth showing prints nothing at all.
+        let mut quiet = Trace::default();
+        quiet.add_detail("auth: agent → failed");
+        assert_eq!(quiet.render_level(0), "");
+        assert!(!quiet.render().is_empty(), "failures keep full context");
+    }
 }

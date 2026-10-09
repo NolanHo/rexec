@@ -187,10 +187,11 @@ struct Cli {
     #[arg(short = 'q', long = "quiet", global = true)]
     quiet: bool,
 
-    /// Print the decision trace (resolution, auth, deploy) even on success;
-    /// errors always carry it
-    #[arg(short = 'v', long = "verbose", global = true)]
-    verbose: bool,
+    /// Print the decision trace (resolution, route, deploy) even on success;
+    /// errors always carry it. Repeat for the plumbing details (`-vv`: auth
+    /// attempts, connect timings, the worker launch command)
+    #[arg(short = 'v', long = "verbose", action = clap::ArgAction::Count, global = true)]
+    verbose: u8,
 
     /// Emit a single-line machine-readable result summary on stderr
     #[arg(long = "json", global = true)]
@@ -4420,7 +4421,7 @@ fn build_record(
         stdout_truncated: cap.stdout.truncated(),
         stderr_truncated: cap.stderr.truncated(),
         rexec_version: env!("CARGO_PKG_VERSION").to_string(),
-        trace: trace.lines().to_vec(),
+        trace: trace.lines().iter().map(|l| l.to_string()).collect(),
         // Only rexec-level failures carry an error here; a remote non-zero exit
         // is already visible in `exit_code`.
         error: summary.error.clone(),
@@ -4493,7 +4494,7 @@ async fn run_command(
     // The launch command is platform-correct: POSIX `~` does not expand under
     // cmd.exe/PowerShell on Windows remotes.
     let worker_cmd = remote_env.worker_command();
-    trace.add(format!("worker: launching `{worker_cmd}`"));
+    trace.add_detail(format!("worker: launching `{worker_cmd}`"));
     let mut channel = session.channel_open_session().await?;
     channel.exec(true, worker_cmd.clone()).await?;
 
@@ -4992,7 +4993,7 @@ async fn run_script(
     // Byte-identical to v0.4.2 whenever the managed runtime is not used (the
     // characterization tests in `python_runtime` lock the literals).
     let command = python_runtime::assemble_remote_command(runner.as_deref(), &remote_script, args)?;
-    trace.add(format!(
+    trace.add_detail(format!(
         "script: synced {} → {remote_script}",
         script.display()
     ));
@@ -5297,13 +5298,13 @@ async fn plan_command(
     );
     println!("  note: plan only — connected and probed; nothing was executed or deployed.");
 
-    trace.add(format!("plan: route {}", jump_chain_label(remote)));
-    trace.add(format!("plan: platform {platform_label}"));
-    trace.add(format!(
+    trace.add_detail(format!("plan: route {}", jump_chain_label(remote)));
+    trace.add_detail(format!("plan: platform {platform_label}"));
+    trace.add_detail(format!(
         "plan: worker remote {remote_label} vs local {local_version}"
     ));
-    trace.add(format!("plan: deploy would be {deploy}"));
-    trace.add(format!("plan: launch `{launch}` (not executed)"));
+    trace.add_detail(format!("plan: deploy would be {deploy}"));
+    trace.add_detail(format!("plan: launch `{launch}` (not executed)"));
     Ok(())
 }
 
@@ -6646,7 +6647,7 @@ async fn main() -> Result<()> {
                 }
                 if let Some(sync_arg) = &sync {
                     let (local, remote_path) = parse_sync_arg(sync_arg)?;
-                    trace.add(format!("sync: {} → {}", local.display(), remote_path));
+                    trace.add_detail(format!("sync: {} → {}", local.display(), remote_path));
                     do_sync(&local, &remote_path, &remote).await?;
                 }
                 let env_vars = collect_env(&env, &env_file)?;
@@ -6788,7 +6789,7 @@ async fn main() -> Result<()> {
     // A timing line only makes sense once a decision was recorded; a pure
     // argument error must not grow a "decision trace" it never had.
     if !trace.lines().is_empty() {
-        trace.add(format!(
+        trace.add_detail(format!(
             "timing: {} ms, stdout {} B, stderr {} B",
             summary.duration_ms.unwrap_or(0),
             summary.stdout_bytes,
@@ -6801,7 +6802,9 @@ async fn main() -> Result<()> {
             // Success is silent in normal mode: stdout/stderr carry the
             // command's own output and nothing else. `-v` adds the trace.
             if diagnostics::mode().trace_on_success() {
-                let rendered = trace.render();
+                // `-v` = decisions, `-vv` = decisions + plumbing; failures use
+                // the full render below, so context is never lost.
+                let rendered = trace.render_level(diagnostics::mode().trace_level());
                 if !rendered.is_empty() {
                     ensure_stderr_line_start();
                     eprint!("{rendered}");

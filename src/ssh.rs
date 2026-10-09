@@ -74,7 +74,7 @@ async fn authenticate(
         .user
         .clone()
         .unwrap_or_else(|| std::env::var("USER").unwrap_or_else(|_| "root".to_string()));
-    trace.add(format!("auth: user {user}"));
+    trace.add_detail(format!("auth: user {user}"));
 
     // 1. Try SSH agent
     if try_agent_auth(session, &user, trace).await.is_ok() {
@@ -92,7 +92,7 @@ async fn authenticate(
                 let result = match session.authenticate_publickey(&user, key_with_hash).await {
                     Ok(result) => result,
                     Err(e) => {
-                        trace.add(format!(
+                        trace.add_detail(format!(
                             "auth: identity file {} → failed: {e:#}",
                             id_file.display()
                         ));
@@ -100,20 +100,20 @@ async fn authenticate(
                     }
                 };
                 if matches!(result, AuthResult::Success) {
-                    trace.add(format!(
+                    trace.add_detail(format!(
                         "auth: identity file {} → success",
                         id_file.display()
                     ));
                     return Ok(());
                 }
-                trace.add(format!(
+                trace.add_detail(format!(
                     "auth: identity file {} → rejected",
                     id_file.display()
                 ));
             }
             // An unreadable identity file used to fall through silently; the
             // trace records it so the failure context is complete in one shot.
-            Err(e) => trace.add(format!(
+            Err(e) => trace.add_detail(format!(
                 "auth: identity file {} → failed: {e:#}",
                 id_file.display()
             )),
@@ -125,7 +125,7 @@ async fn authenticate(
     for name in &["id_rsa", "id_ed25519", "id_ecdsa"] {
         let path = home.join(".ssh").join(name);
         if !path.exists() {
-            trace.add(format!(
+            trace.add_detail(format!(
                 "auth: default keys {} → not present",
                 path.display()
             ));
@@ -134,7 +134,7 @@ async fn authenticate(
         let key = match load_private_key(&path) {
             Ok(key) => key,
             Err(e) => {
-                trace.add(format!(
+                trace.add_detail(format!(
                     "auth: default keys {} → failed: {e:#}",
                     path.display()
                 ));
@@ -145,7 +145,7 @@ async fn authenticate(
         let result = match session.authenticate_publickey(&user, key_with_hash).await {
             Ok(result) => result,
             Err(e) => {
-                trace.add(format!(
+                trace.add_detail(format!(
                     "auth: default keys {} → failed: {e:#}",
                     path.display()
                 ));
@@ -153,10 +153,10 @@ async fn authenticate(
             }
         };
         if matches!(result, AuthResult::Success) {
-            trace.add(format!("auth: default keys {} → success", path.display()));
+            trace.add_detail(format!("auth: default keys {} → success", path.display()));
             return Ok(());
         }
-        trace.add(format!("auth: default keys {} → rejected", path.display()));
+        trace.add_detail(format!("auth: default keys {} → rejected", path.display()));
     }
 
     Err(anyhow!(
@@ -178,7 +178,7 @@ async fn try_agent_auth(
         Ok(agent) => agent,
         Err(e) => {
             let e = anyhow::Error::new(e).context("connecting to SSH agent");
-            trace.add(format!("auth: agent → failed: {e:#}"));
+            trace.add_detail(format!("auth: agent → failed: {e:#}"));
             return Err(e);
         }
     };
@@ -186,7 +186,7 @@ async fn try_agent_auth(
         Ok(identities) => identities,
         Err(e) => {
             let e = anyhow::Error::new(e);
-            trace.add(format!("auth: agent → failed: {e:#}"));
+            trace.add_detail(format!("auth: agent → failed: {e:#}"));
             return Err(e);
         }
     };
@@ -200,18 +200,18 @@ async fn try_agent_auth(
         let result = match result {
             Ok(result) => result,
             Err(e) => {
-                trace.add(format!("auth: agent (identities: {count}) → failed: {e:#}"));
+                trace.add_detail(format!("auth: agent (identities: {count}) → failed: {e:#}"));
                 return Err(e);
             }
         };
         if matches!(result, AuthResult::Success) {
-            trace.add(format!("auth: agent (identities: {count}) → success"));
+            trace.add_detail(format!("auth: agent (identities: {count}) → success"));
             return Ok(());
         }
     }
 
     let err = anyhow!("no agent identity was accepted");
-    trace.add(format!(
+    trace.add_detail(format!(
         "auth: agent (identities: {count}) → rejected: {err:#}"
     ));
     Err(err)
@@ -234,7 +234,7 @@ async fn try_agent_auth(
     let err = anyhow!(
         "SSH agent auth is not supported on Windows (unix socket only) — use an identity file"
     );
-    trace.add(format!("auth: agent → failed: {err:#}"));
+    trace.add_detail(format!("auth: agent → failed: {err:#}"));
     Err(err)
 }
 
@@ -452,7 +452,7 @@ async fn tcp_connect(
 ) -> Result<tokio::net::TcpStream> {
     let port = remote.port.unwrap_or(22);
     let addr = format!("{}:{}", remote.hostname, port);
-    trace.add(format!("connect: {role} {addr}"));
+    trace.add_detail(format!("connect: {role} {addr}"));
 
     // Parse the hostname for TCP connect (strip any bracket notation)
     let tcp_host = remote
@@ -507,7 +507,7 @@ async fn socks5_connect(
     let proxy_label = format!("{proxy_host}:{proxy_port}");
     let target = format!("{host}:{port}");
     crate::progress!("⇢ socks5 {proxy_label} → {target}");
-    trace.add(format!("connect: socks5 {proxy_label} → {target}"));
+    trace.add_detail(format!("connect: socks5 {proxy_label} → {target}"));
 
     let started = std::time::Instant::now();
     let mut stream = tokio::time::timeout(
@@ -530,7 +530,7 @@ async fn socks5_connect(
     })?
     .with_context(|| format!("SOCKS5 CONNECT {target} through {proxy_label}"))?;
 
-    trace.add(format!(
+    trace.add_detail(format!(
         "connect: socks5 tunnel to {target} established in {}ms",
         started.elapsed().as_millis()
     ));
@@ -669,7 +669,7 @@ async fn open_tunnel(
         .to_string();
     let port = to.port.unwrap_or(22);
     let addr = format!("{host}:{port}");
-    trace.add(format!(
+    trace.add_detail(format!(
         "connect: opening direct-tcpip tunnel to {addr} through the previous hop"
     ));
     let channel = tokio::time::timeout(
@@ -729,7 +729,7 @@ where
     // that needs the context.
     if let Ok(mut pending) = notes.lock() {
         for line in pending.drain(..) {
-            trace.add(line);
+            trace.add_detail(line);
         }
     }
 
@@ -742,7 +742,7 @@ where
             return Err(e);
         }
     };
-    trace.add(format!(
+    trace.add_detail(format!(
         "connect: {role} {addr} connected in {}ms",
         started.elapsed().as_millis()
     ));
@@ -787,7 +787,7 @@ async fn remote_home_windows(
         .get(0..2)
         .is_some_and(|p| p.as_bytes()[0].is_ascii_alphabetic() && p.as_bytes()[1] == b':');
     if is_drive_path {
-        trace.add(format!("worker: remote home {profile} (%USERPROFILE%)"));
+        trace.add_detail(format!("worker: remote home {profile} (%USERPROFILE%)"));
         return Ok(profile.to_string());
     }
 
@@ -798,7 +798,7 @@ async fn remote_home_windows(
         .get(0..2)
         .is_some_and(|p| p.as_bytes()[0].is_ascii_alphabetic() && p.as_bytes()[1] == b':');
     if is_drive_path {
-        trace.add(format!("worker: remote home {home} ($HOME fallback)"));
+        trace.add_detail(format!("worker: remote home {home} ($HOME fallback)"));
         return Ok(home.to_string());
     }
 
@@ -834,7 +834,7 @@ pub async fn upload_binary(
         return Err(anyhow!("could not determine remote HOME for worker upload"));
     }
     let remote_target = format!("{}:{}/.rexec/rexec", host, home.trim_end_matches('/'));
-    trace.add(format!("worker: remote home {home} (~)"));
+    trace.add_detail(format!("worker: remote home {home} (~)"));
 
     let ssh_opts = "-o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new -o ServerAliveInterval=5 -o ServerAliveCountMax=3";
     let ssh_e = format!("ssh {}", ssh_opts);
@@ -881,7 +881,7 @@ pub async fn upload_binary(
     // Belt-and-suspenders: ensure the executable bit survives any umask quirk.
     exec_remote(session, "chmod +x ~/.rexec/rexec").await?;
 
-    trace.add(format!("worker: uploaded to {remote_target}"));
+    trace.add_detail(format!("worker: uploaded to {remote_target}"));
     Ok(())
 }
 
@@ -1089,12 +1089,14 @@ pub async fn ensure_remote_binary_traced(
         );
         let remote_output = exec_remote(session, &probe).await?;
         let up_to_date = remote_output.trim() == expected;
-        trace.add(format!(
+        let version_line = format!(
             "worker: local {local_version} vs remote {} → {}",
             remote_version_label(&remote_output),
             if up_to_date { "up to date" } else { "upload" }
-        ));
+        );
         if up_to_date {
+            // "nothing to do" is plumbing; an actual deploy is a decision.
+            trace.add_detail(version_line);
             return Ok(RemoteEnv {
                 is_windows: true,
                 home,
@@ -1102,17 +1104,19 @@ pub async fn ensure_remote_binary_traced(
                 deployed: false,
             });
         }
+        trace.add(version_line);
     } else {
         // Check remote version. This probe needs a POSIX shell and `~`
         // expansion — guaranteed on the Linux/macOS remotes detected above.
         let remote_output = exec_remote(session, "~/.rexec/rexec --version 2>/dev/null").await?;
         let up_to_date = remote_output.trim() == expected;
-        trace.add(format!(
+        let version_line = format!(
             "worker: local {local_version} vs remote {} → {}",
             remote_version_label(&remote_output),
             if up_to_date { "up to date" } else { "upload" }
-        ));
+        );
         if up_to_date {
+            trace.add_detail(version_line);
             return Ok(RemoteEnv {
                 is_windows: false,
                 home: String::new(),
@@ -1120,6 +1124,7 @@ pub async fn ensure_remote_binary_traced(
                 deployed: false,
             }); // Already up to date
         }
+        trace.add(version_line);
     }
 
     let src_path = if remote_asset == local_asset() {

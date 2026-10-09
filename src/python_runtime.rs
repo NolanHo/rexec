@@ -798,7 +798,7 @@ async fn fetch_payload(
     if cache_path.exists() {
         match verify_payload(&cache_path, payload) {
             Ok(()) => {
-                trace.add(format!("python: cached {}", cache_path.display()));
+                trace.add_detail(format!("python: cached {}", cache_path.display()));
                 return Ok(cache_path);
             }
             Err(e) => {
@@ -889,7 +889,7 @@ async fn fetch_payload(
             cache_path.display()
         )
     })?;
-    trace.add(format!("python: cached {}", cache_path.display()));
+    trace.add_detail(format!("python: cached {}", cache_path.display()));
     Ok(cache_path)
 }
 
