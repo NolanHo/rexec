@@ -66,8 +66,14 @@ rexec -q <host> run -- "echo hi"
 
 ### Output contract
 
+> **Never pass `-v` to get error information.** A failure already prints the error
+> plus the FULL decision trace (resolved target, route, every auth attempt, connect
+> timings, the worker launch command) in one shot — `-v`/`-vv` only change what a
+> *successful* run prints. Read the error and continue; use `-v` at most to see a
+> successful run's route, `-vv` only to debug a successful run.
+
 - **Success is silent**: stdout/stderr carry the command's own output and nothing else — except the first-connect known-hosts notice (`⚠ Accepting new host key for …`, as `ssh` prints) and the non-zero-exit warning. `-v/--verbose` adds the decision trace — decisions only (resolved target, route, platform/deploy, remote PID, reconnects); `-vv` adds plumbing (auth attempts, connect timings, worker launch). Failures always print the full trace.
-- **Errors/warnings carry full context in one shot** — no re-run with `-v` needed. An unknown host alias fails listing near-miss suggestions from the configured aliases (prefix/substring matches) plus the hint to use `user@host` for a literal host (an alias is never silently treated as a raw hostname). A worker that dies before starting reports its own stderr and the launch command.
+- **Errors/warnings carry full context in one shot** — never re-run with `-v` to get it: failures render every trace entry regardless of verbosity (including the `-vv` plumbing), and `-q` does not suppress them either. An unknown host alias fails listing near-miss suggestions from the configured aliases (prefix/substring matches) plus the hint to use `user@host` for a literal host (an alias is never silently treated as a raw hostname). A worker that dies before starting reports its own stderr and the launch command.
 - **Non-zero remote exit** prints exactly one warning line to stderr: `⚠ remote exit <code> (log: ~/.rexec/logs/<pid>.log)`; exit code 0 prints nothing. rexec's own exit status **mirrors the remote code** (ssh semantics) — a signal-killed remote process (reported as `-1`) exits `255`; piping stdout into an early-exiting reader (`| head`) ends the process on SIGPIPE (141) instead.
 - **`--json`** writes one JSON line to stderr, last (after the trace/warning): `host`, `resolved`, `pid`, `exit_code`, `duration_ms`, `deployed`, `stdout_bytes`, `stderr_bytes`, `log_path` (`null` for now — the warning line carries the remote log path), `error` (failure only), always in that order. stdout is never polluted. `deployed` means any payload was deployed to the remote during this invocation — the worker or the managed Python runtime — and the history record stores the same meaning.
 - **`ProxyJump` is honoured**: jump chains from the ssh config (chained jumps included) are tunnelled hop by hop, each hop authenticating with its own `User`/`IdentityFile`. `plan` prints `route: via …`; `-v` traces every hop. `--sync` passes the alias (or `-J` for a literal target) to rsync's ssh so it takes the same route.
@@ -87,7 +93,7 @@ rexec -q <host> run -- "echo hi"
 | Option | Description |
 |--------|-------------|
 | `-p PORT` / `--port PORT` | SSH port (overrides `host:port` and ssh-config `Port`) |
-| `-v` / `--verbose` | Decision trace on success (resolution, route, deploy, reconnect); `-vv` adds plumbing (auth attempts, timings, worker launch). Errors always carry the full trace |
+| `-v` / `--verbose` | Decision trace on SUCCESS runs only (resolution, route, deploy, reconnect); `-vv` adds plumbing (auth attempts, timings, worker launch). Never needed for errors — failures always print the full trace |
 | `--json` | Emit one machine-readable result summary line on stderr (`run`/`script`/`plan`/`init`/`list`; `history` ignores it) |
 | `--no-history` | Do not record this run in the local execution history (same as `REXEC_HISTORY=0`) |
 | `--reveal-secrets` | Print secret values (env vars) instead of `***`; they are recorded locally either way |
