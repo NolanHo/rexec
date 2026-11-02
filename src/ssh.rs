@@ -81,8 +81,11 @@ async fn authenticate(
         return Ok(());
     }
 
-    // 2. Try identity file from ssh config
-    if let Some(id_file) = &remote.identity_file {
+    // 2. Try every identity file ssh config names, in order. A host may name
+    // several — `IdentitiesOnly yes` with two keys is common — and the endpoint
+    // often accepts only a later entry, so stopping at the first would report a
+    // host as unreachable that OpenSSH reaches.
+    for id_file in &remote.identity_files {
         match load_private_key(id_file) {
             Ok(key) => {
                 // RSA: None would map to legacy ssh-rsa (SHA-1), which modern OpenSSH
@@ -96,7 +99,7 @@ async fn authenticate(
                             "auth: identity file {} → failed: {e:#}",
                             id_file.display()
                         ));
-                        return Err(e.into());
+                        continue;
                     }
                 };
                 if matches!(result, AuthResult::Success) {

@@ -451,7 +451,9 @@ pub struct RemoteHost {
     pub hostname: String,
     pub port: Option<u16>,
     pub user: Option<String>,
-    pub identity_file: Option<PathBuf>,
+    /// Every `IdentityFile` the config names, in order. A host may name more
+    /// than one, and the endpoint often accepts only a later entry.
+    pub identity_files: Vec<PathBuf>,
     /// Resolved `ProxyJump` chain: the hosts to tunnel through, outermost hop
     /// first, so `jump.last()` is the hop that opens the connection to us.
     ///
@@ -947,6 +949,98 @@ fn load_user_ssh_config() -> Result<(PathBuf, SshConfig)> {
     Ok((path, config))
 }
 
+/// Collect every `IdentityFile` that applies to `host`, in file order.
+///
+/// OpenSSH accumulates this directive across every matching block — a `Host *`
+/// default plus the host's own block both apply — while `ssh2_config` keeps only
+/// the first. A host whose second key is the accepted one would otherwise look
+/// unreachable.
+///
+/// @param host - the alias being resolved.
+/// @param config_text - the Include-expanded configuration.
+/// @returns the paths in the order ssh would offer them, duplicates removed.
+fn identity_files_for(host: &str, config_text: &str) -> Vec<PathBuf> {
+    /// One `Host` pattern against a host name: `*` and `?` only.
+    fn matches(pattern: &str, host: &str) -> bool {
+        let pattern = pattern.to_ascii_lowercase();
+        let host = host.to_ascii_lowercase();
+        if pattern == "*" {
+            return true;
+        }
+        // Linear wildcard match over chars: the patterns here are single tokens.
+        let (mut p, mut h) = (0usize, 0usize);
+        let (pat, name) = (pattern.as_bytes(), host.as_bytes());
+        let mut star: Option<usize> = None;
+        let mut resume = 0usize;
+        while h < name.len() {
+            if p < pat.len() && (pat[p] == b'?' || pat[p] == name[h]) {
+                p += 1;
+                h += 1;
+            } else if p < pat.len() && pat[p] == b'*' {
+                star = Some(p);
+                resume = h;
+                p += 1;
+            } else if let Some(at) = star {
+                p = at + 1;
+                resume += 1;
+                h = resume;
+            } else {
+                return false;
+            }
+        }
+        while p < pat.len() && pat[p] == b'*' {
+            p += 1;
+        }
+        p == pat.len()
+    }
+
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let mut patterns: Vec<String> = Vec::new();
+    let mut in_match_block = false;
+    let mut found: Vec<PathBuf> = Vec::new();
+    for line in config_text.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        let mut parts = trimmed.split_whitespace();
+        let Some(keyword) = parts.next() else {
+            continue;
+        };
+        match keyword.to_ascii_lowercase().as_str() {
+            "host" => {
+                patterns = parts.map(|token| token.to_string()).collect();
+                in_match_block = false;
+                continue;
+            }
+            // A `Match` block ends the current host list; its own lines do not
+            // apply to a plain alias lookup.
+            "match" => {
+                patterns.clear();
+                in_match_block = true;
+                continue;
+            }
+            "identityfile" | "identityfile2" => {}
+            _ => continue,
+        }
+        if in_match_block || !patterns.iter().any(|pattern| matches(pattern, host)) {
+            continue;
+        }
+        let Some(value) = parts.next() else { continue };
+        let path = match value.strip_prefix("~/") {
+            Some(rest) => match &home {
+                Some(home) => home.join(rest),
+                None => PathBuf::from(value),
+            },
+            None => PathBuf::from(value),
+        };
+        if !found.iter().any(|existing| existing == &path) {
+            found.push(path);
+        }
+    }
+    found
+}
+
 /// ssh-config directives that would change *which socket* ssh opens, but that
 /// this client does not implement.
 ///
@@ -1275,10 +1369,7 @@ fn resolve_jump_chain(
                 .unwrap_or_else(|| spec_host.clone()),
             port: spec_port.or(hop_params.port),
             user: spec_user.clone().or_else(|| hop_params.user.clone()),
-            identity_file: hop_params
-                .identity_file
-                .as_ref()
-                .and_then(|v| v.first().cloned()),
+            identity_files: hop_params.identity_file.clone().unwrap_or_default(),
             jump: Vec::new(),
             jump_specs: Vec::new(),
             alias: is_defined_alias(config, &spec_host).then(|| spec_host.clone()),
@@ -1526,7 +1617,7 @@ fn resolve_host(
                 hostname: v6.to_string(),
                 port: None,
                 user: None,
-                identity_file: None,
+                identity_files: Vec::new(),
                 jump: Vec::new(),
                 jump_specs: Vec::new(),
                 alias: None,
@@ -1558,10 +1649,9 @@ fn resolve_host(
             if parsed.port.is_none() {
                 parsed.port = params.port;
             }
-            parsed.identity_file = params
-                .identity_file
-                .as_ref()
-                .and_then(|v| v.first().cloned());
+            if parsed.identity_files.is_empty() {
+                parsed.identity_files = params.identity_file.clone().unwrap_or_default();
+            }
             // A literal target inherits `ProxyJump` from a matching block the
             // same way `ssh 10.0.0.5` does (e.g. `Host *.example.com` with a
             // jump host). A config problem must not break the literal path.
@@ -1636,20 +1726,34 @@ fn resolve_host(
                 .unwrap_or_else(|| host.to_string()),
             port: host_config.port,
             user: host_config.user.clone(),
-            identity_file: host_config
-                .identity_file
-                .as_ref()
-                .and_then(|v| v.first().cloned()),
+            // The crate keeps only the first IdentityFile; the account's ssh
+            // offers every match, and the accepted key is often a later one.
+            identity_files: {
+                let from_text = identity_files_for(host, &load_ssh_config_text(&path)?);
+                if from_text.is_empty() {
+                    host_config.identity_file.clone().unwrap_or_default()
+                } else {
+                    from_text
+                }
+            },
             jump,
             jump_specs,
             alias: Some(host.to_string()),
             socks5: target_socks5,
         };
-        let key = resolved
-            .identity_file
-            .as_ref()
-            .map(|p| format!(" (key {})", p.display()))
-            .unwrap_or_default();
+        let key = if resolved.identity_files.is_empty() {
+            String::new()
+        } else {
+            format!(
+                " (key {})",
+                resolved
+                    .identity_files
+                    .iter()
+                    .map(|path| path.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        };
         warn_unimplemented_routing(
             &host_config,
             host,
@@ -1732,7 +1836,7 @@ fn parse_user_host_port(s: &str) -> Result<RemoteHost> {
         hostname,
         port,
         user,
-        identity_file: None,
+        identity_files: Vec::new(),
         jump: Vec::new(),
         jump_specs: Vec::new(),
         alias: None,
@@ -1965,6 +2069,35 @@ mod tests {
             "shell_quote roundtrip failed for {:?}",
             input
         );
+    }
+
+    /// The account's ssh offers every matching `IdentityFile`; the block's own
+    /// key often comes second and is the accepted one, so keeping only the first
+    /// makes a reachable host look unreachable.
+    #[test]
+    fn test_identity_files_accumulate_in_file_order() {
+        let config = "\
+Host *
+  IdentityFile ~/.ssh/default_key
+
+Host target
+  HostName 10.0.0.5
+  IdentityFile /root/.ssh/target_key
+  IdentityFile /root/.ssh/second_key
+
+Host other
+  IdentityFile /root/.ssh/other_key
+";
+        let files = identity_files_for("target", config);
+        assert_eq!(files.len(), 3, "default, target, second: {files:?}");
+        assert!(files[0].ends_with(".ssh/default_key"), "{files:?}");
+        assert!(files[1].ends_with(".ssh/target_key"), "{files:?}");
+        assert!(files[2].ends_with(".ssh/second_key"), "{files:?}");
+
+        // A `Host *` default names only its own key for an unrelated host.
+        let other = identity_files_for("unrelated", config);
+        assert_eq!(other.len(), 1, "{other:?}");
+        assert!(other[0].ends_with(".ssh/default_key"), "{other:?}");
     }
 
     /// A sync that was not asked to delete must not carry `--delete`: a wrong
@@ -2298,11 +2431,11 @@ Host dotted\n  ProxyJump jump.example.com:2222\n";
         );
         assert!(
             chain[0]
-                .identity_file
-                .as_deref()
-                .is_some_and(|p| p.ends_with("js4_key")),
+                .identity_files
+                .iter()
+                .any(|path| path.ends_with("js4_key")),
             "hop inherited the block's IdentityFile: {:?}",
-            chain[0].identity_file
+            chain[0].identity_files
         );
         assert_eq!(chain[0].alias.as_deref(), Some("js4"));
 
@@ -2336,7 +2469,7 @@ Host dotted\n  ProxyJump jump.example.com:2222\n";
             hostname: "10.0.0.1".to_string(),
             port: Some(22),
             user: None,
-            identity_file: None,
+            identity_files: Vec::new(),
             jump: Vec::new(),
             jump_specs: Vec::new(),
             alias: None,
@@ -2347,7 +2480,7 @@ Host dotted\n  ProxyJump jump.example.com:2222\n";
             hostname: "192.168.4.70".to_string(),
             port: Some(42200),
             user: None,
-            identity_file: None,
+            identity_files: Vec::new(),
             jump: Vec::new(),
             jump_specs: Vec::new(),
             alias: Some("js4".to_string()),
@@ -2531,7 +2664,7 @@ Host dotted\n  ProxyJump jump.example.com:2222\n";
             hostname: "10.173.91.2".to_string(),
             port: Some(22),
             user: None,
-            identity_file: None,
+            identity_files: Vec::new(),
             jump: Vec::new(),
             jump_specs: Vec::new(),
             alias: None,
@@ -2547,7 +2680,7 @@ Host dotted\n  ProxyJump jump.example.com:2222\n";
             hostname: "192.168.4.70".to_string(),
             port: Some(42200),
             user: None,
-            identity_file: None,
+            identity_files: Vec::new(),
             jump: Vec::new(),
             jump_specs: Vec::new(),
             alias: Some("js4".to_string()),
@@ -2567,12 +2700,12 @@ Host dotted\n  ProxyJump jump.example.com:2222\n";
             hostname: "10.30.40.4".to_string(),
             port: Some(22),
             user: Some("zengqixin".to_string()),
-            identity_file: None,
+            identity_files: Vec::new(),
             jump: vec![RemoteHost {
                 hostname: "192.168.4.70".to_string(),
                 port: Some(42200),
                 user: Some("zengqixin".to_string()),
-                identity_file: None,
+                identity_files: Vec::new(),
                 jump: Vec::new(),
                 jump_specs: Vec::new(),
                 alias: Some("js4".to_string()),
@@ -2732,7 +2865,7 @@ Host js4\n  HostName 192.168.4.70\n  Port 42200\n  User zengqixin\n";
             hostname: "154.57.56.2".to_string(),
             port: Some(8122),
             user: None,
-            identity_file: None,
+            identity_files: Vec::new(),
             jump: chain.clone(),
             jump_specs: specs,
             alias: None,
@@ -2767,7 +2900,7 @@ Host js4\n  HostName 192.168.4.70\n  Port 42200\n  User zengqixin\n";
             hostname: "192.168.4.70".to_string(),
             port: Some(42200),
             user: Some("zengqixin".to_string()),
-            identity_file: None,
+            identity_files: Vec::new(),
             jump: Vec::new(),
             jump_specs: Vec::new(),
             alias: Some("js4".to_string()),
@@ -2777,7 +2910,7 @@ Host js4\n  HostName 192.168.4.70\n  Port 42200\n  User zengqixin\n";
             hostname: "10.30.40.4".to_string(),
             port: Some(22),
             user: Some("zengqixin".to_string()),
-            identity_file: None,
+            identity_files: Vec::new(),
             jump: vec![js4],
             jump_specs: vec!["js4".to_string()],
             alias: Some("lyg2004".to_string()),
@@ -2834,7 +2967,7 @@ Host js4\n  HostName 192.168.4.70\n  Port 42200\n  User zengqixin\n";
             hostname: "154.57.56.2".to_string(),
             port: Some(8122),
             user: None,
-            identity_file: None,
+            identity_files: Vec::new(),
             jump: Vec::new(),
             jump_specs: Vec::new(),
             alias: None,
@@ -2846,7 +2979,7 @@ Host js4\n  HostName 192.168.4.70\n  Port 42200\n  User zengqixin\n";
                 hostname: "192.168.4.70".to_string(),
                 port: Some(42200),
                 user: None,
-                identity_file: None,
+                identity_files: Vec::new(),
                 jump: Vec::new(),
                 jump_specs: Vec::new(),
                 alias: None,
@@ -2856,7 +2989,7 @@ Host js4\n  HostName 192.168.4.70\n  Port 42200\n  User zengqixin\n";
                 hostname: "10.30.40.4".to_string(),
                 port: None,
                 user: None,
-                identity_file: None,
+                identity_files: Vec::new(),
                 jump: Vec::new(),
                 jump_specs: Vec::new(),
                 alias: None,
