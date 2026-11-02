@@ -21,6 +21,9 @@ Run `rexec <host> init` once per new host to check/install remote deps (rsync, s
 # Sync a folder + run a command
 rexec <host> run --sync ./project:/home/user/project -- "python main.py"
 
+# Mirror instead of copy: also remove host files the folder no longer has
+rexec <host> run --sync ./project:/home/user/project --delete -- "python main.py"
+
 # Run only (no sync)
 rexec <host> run -- "bash deploy.sh"
 
@@ -83,7 +86,8 @@ rexec -q <host> run -- "echo hi"
 
 | Option | Description |
 |--------|-------------|
-| `--sync LOCAL:REMOTE` | rsync a local **file or folder** to the remote before running. Folders sync *contents* with `--delete`; a single file is sent as-is. |
+| `--sync LOCAL:REMOTE` | rsync a local **file or folder** to the remote before running. Folders sync *contents*; a single file is sent as-is. |
+| `--delete` | With `--sync` on a folder: remove host files the local tree does not have. Off by default, because deleting on the host is not recoverable and a mistyped path would do it. |
 | `-e KEY=VALUE` / `--env KEY=VALUE` | Set an env var on the remote command. Repeatable. Secrets never appear in the remote `ps`. |
 | `--env-file PATH` | Read `KEY=VALUE` lines from a local file (supports `#` comments and `export ` prefix). Repeatable. |
 | `-- <command...>` | Command to run on the remote (joined; executed by the worker from a private script file). |

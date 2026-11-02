@@ -235,6 +235,11 @@ enum Action {
         #[arg(long, value_name = "LOCAL:REMOTE")]
         sync: Option<String>,
 
+        /// With --sync on a directory: remove host files the local tree does not
+        /// have. Off by default; a wrong path must not delete anything remotely
+        #[arg(long = "delete", requires = "sync")]
+        delete: bool,
+
         /// Command to execute on the remote host
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         command: Vec<String>,
@@ -1807,7 +1812,7 @@ fn sync_ssh_e_with(remote: &RemoteHost, explicit_socks5: Option<&str>) -> String
     }
 }
 
-async fn do_sync(local: &Path, remote_path: &str, remote: &RemoteHost) -> Result<()> {
+async fn do_sync(local: &Path, remote_path: &str, remote: &RemoteHost, delete: bool) -> Result<()> {
     let (rsync_host, _) = rsync_endpoint(remote);
     let ssh_e = sync_ssh_e(remote);
 
@@ -1839,7 +1844,8 @@ async fn do_sync(local: &Path, remote_path: &str, remote: &RemoteHost) -> Result
         ));
     }
 
-    // Directory: sync contents (trailing slash on both sides) with --delete.
+    // Directory: sync contents (trailing slash on both sides). Deletion is the
+    // caller's decision: a mirror that prunes the host is unrecoverable there.
     let local_str = local.to_string_lossy();
     let local_arg = if local_str.ends_with('/') {
         local_str.into_owned()
@@ -1852,15 +1858,14 @@ async fn do_sync(local: &Path, remote_path: &str, remote: &RemoteHost) -> Result
         format!("{}/", remote_path)
     };
 
+    let args = directory_sync_args(
+        &local_arg,
+        &format!("{rsync_host}:{remote_arg}"),
+        &ssh_e,
+        delete,
+    );
     let mut child = tokio::process::Command::new("rsync")
-        .args([
-            "-az",
-            "--delete",
-            "-e",
-            ssh_e.as_str(),
-            &local_arg,
-            &format!("{}:{}", rsync_host, remote_arg),
-        ])
+        .args(&args)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::inherit())
@@ -1868,6 +1873,31 @@ async fn do_sync(local: &Path, remote_path: &str, remote: &RemoteHost) -> Result
         .map_err(rsync_spawn_error)?;
 
     wait_rsync(&mut child, local, &rsync_host, remote, &remote_arg).await
+}
+
+/// The rsync arguments for one directory sync.
+///
+/// Deletion is the caller's decision, so it appears only when asked for: a mirror
+/// that prunes the host is unrecoverable there, and a mistyped path must not
+/// remove anything.
+///
+/// @param local - local argument, with the trailing slash rsync needs.
+/// @param remote - `host:path` argument, with the trailing slash rsync needs.
+/// @param ssh_e - the `-e` command carrying the port and jump route.
+/// @param delete - whether host files absent locally are removed.
+/// @returns the argv for `rsync`.
+fn directory_sync_args(local: &str, remote: &str, ssh_e: &str, delete: bool) -> Vec<String> {
+    let mut args = vec!["-az".to_string()];
+    if delete {
+        args.push("--delete".to_string());
+    }
+    args.extend([
+        "-e".to_string(),
+        ssh_e.to_string(),
+        local.to_string(),
+        remote.to_string(),
+    ]);
+    args
 }
 
 /// Wait for an rsync child process with a timeout, surfacing a manual-recovery
@@ -1934,6 +1964,31 @@ mod tests {
             result, input,
             "shell_quote roundtrip failed for {:?}",
             input
+        );
+    }
+
+    /// A sync that was not asked to delete must not carry `--delete`: a wrong
+    /// local path would otherwise prune the host's directory.
+    #[test]
+    fn test_directory_sync_args_never_delete_unless_asked() {
+        let plain = directory_sync_args("/src/", "host:/dst/", "ssh -p 2222", false);
+        assert_eq!(
+            plain,
+            vec!["-az", "-e", "ssh -p 2222", "/src/", "host:/dst/"]
+        );
+        assert!(!plain.iter().any(|arg| arg == "--delete"));
+
+        let mirror = directory_sync_args("/src/", "host:/dst/", "ssh -p 2222", true);
+        assert_eq!(
+            mirror,
+            vec![
+                "-az",
+                "--delete",
+                "-e",
+                "ssh -p 2222",
+                "/src/",
+                "host:/dst/"
+            ]
         );
     }
 
@@ -4984,7 +5039,8 @@ async fn run_script(
         (remote_script, managed_runner)
     };
 
-    do_sync(script, &remote_script, remote).await?;
+    // One file is uploaded, never mirrored: nothing to delete.
+    do_sync(script, &remote_script, remote, false).await?;
 
     let runner: Option<String> = match interpreter {
         Some(i) => Some(i.to_string()),
@@ -6624,6 +6680,7 @@ async fn main() -> Result<()> {
                 Some(host),
                 Action::Run {
                     sync,
+                    delete,
                     env,
                     env_file,
                     command,
@@ -6648,7 +6705,7 @@ async fn main() -> Result<()> {
                 if let Some(sync_arg) = &sync {
                     let (local, remote_path) = parse_sync_arg(sync_arg)?;
                     trace.add_detail(format!("sync: {} → {}", local.display(), remote_path));
-                    do_sync(&local, &remote_path, &remote).await?;
+                    do_sync(&local, &remote_path, &remote, delete).await?;
                 }
                 let env_vars = collect_env(&env, &env_file)?;
                 let command = command.join(" ");
