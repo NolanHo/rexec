@@ -217,6 +217,10 @@ rexec dev run --sync ./deploy.sh:/opt/app/deploy.sh -- "bash /opt/app/deploy.sh"
 
 ## Disconnect behavior
 
+On Unix, worker mode ignores both SIGHUP and SIGPIPE. A closed SSH output pipe
+therefore disables streaming while the worker continues logging and waiting for
+its child. Ordinary CLI pipelines retain the default SIGPIPE behavior.
+
 - **SSH drops:** the remote worker keeps running and writing to a log; the CLI reconnects (backoff 1s→30s, up to 10 tries) and resumes output from the last byte — no data lost. (Linux/macOS remotes; Windows remotes are experimental and do not guarantee survival.) Reconnect progress lines are verbose-only (`-v`); a recovered run stays silent, and a failed reconnect reports the remote PID plus the decision trace.
 - **CLI killed (Ctrl+C / SIGTERM):** prints the remote PID; the remote process continues. Re-attach later with `ssh <host> "~/.rexec/rexec attach --pid <PID> --offset 0"` (Linux/macOS remotes; on a Windows remote use the full `%USERPROFILE%\.rexec\rexec.exe` path under cmd).
 

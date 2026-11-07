@@ -44,15 +44,20 @@ fn script_file_name(pid: u32, suffix: &str) -> String {
     format!("{}{}", pid, suffix)
 }
 
-/// Ignore SIGHUP so the worker survives SSH disconnection.
+/// Keep the worker alive when its SSH session or output pipe disappears.
 ///
 /// Unix: sshd delivers SIGHUP to the session's process group when the
 /// connection drops; ignoring it keeps the worker (and the child it spawned)
 /// alive so `attach` can reconnect to the log afterwards.
+/// The CLI restores default SIGPIPE handling for ordinary pipelines, but the
+/// worker must receive EPIPE so write_frame can disable streaming and keep its
+/// durable log and child process alive.
 #[cfg(unix)]
-fn ignore_sighup() {
+fn ignore_worker_disconnects() {
+    // SAFETY: Valid Unix signal dispositions; no Rust callback runs in a handler.
     unsafe {
         libc::signal(libc::SIGHUP, libc::SIG_IGN);
+        libc::signal(libc::SIGPIPE, libc::SIG_IGN);
     }
 }
 
@@ -62,7 +67,7 @@ fn ignore_sighup() {
 /// remotes is NOT guaranteed — a documented experimental limitation of the
 /// Windows path, not a bug this layer can work around.
 #[cfg(windows)]
-fn ignore_sighup() {}
+fn ignore_worker_disconnects() {}
 
 /// Is a process with this PID alive?
 ///
@@ -215,14 +220,14 @@ fn extract_command_and_env(buf: &[u8]) -> Result<(String, Vec<(String, String)>)
 ///
 /// Runs on the remote host. stdin/stdout are connected to the SSH channel.
 /// Output is written to both the log file (always) and stdout (when connected).
-/// SIGHUP is ignored so the worker survives SSH disconnection (unix; see
-/// `ignore_sighup` for the Windows limitation).
+/// SIGHUP and SIGPIPE are ignored so the worker survives SSH disconnection
+/// (unix; see `ignore_worker_disconnects` for the Windows limitation).
 ///
 /// The child process is always waited on, even if the worker encounters errors.
 /// The log file is cleaned up on successful exit (exit code 0).
 pub async fn worker() -> Result<()> {
-    // Ignore SIGHUP — survive SSH disconnect (no-op on Windows)
-    ignore_sighup();
+    // Restore the worker's disconnect policy after the CLI's SIGPIPE default.
+    ignore_worker_disconnects();
 
     let pid = std::process::id();
 

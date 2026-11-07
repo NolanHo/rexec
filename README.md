@@ -10,7 +10,7 @@ A CLI to sync local files/folders and run commands on remote hosts over SSH, des
 - **Script run**: one-command sync + run a local script (`script` subcommand)
 - **Bundled Python runtime**: a pinned CPython for Linux remotes, so `rexec <host> script --python foo.py` runs without any Python on the host, with `python install`/`python status` to pre-warm or inspect it
 - **Host listing**: list SSH hosts from `~/.ssh/config` (`list` subcommand)
-- **Disconnect resilience**: remote worker ignores SIGHUP and writes to a log; CLI reconnects with backoff and resumes from the last byte (Linux/macOS remotes; Windows remotes are experimental and do not guarantee disconnect survival)
+- **Disconnect resilience**: remote worker ignores SIGHUP and SIGPIPE and writes to a log; CLI reconnects with backoff and resumes from the last byte (Linux/macOS remotes; Windows remotes are experimental and do not guarantee disconnect survival)
 - **Auto binary deploy**: deploys a version-matched worker to the remote on first use — uploads itself when platforms match, otherwise downloads the prebuilt worker from GitHub Releases (e.g. macOS local → Linux remote)
 - **Secrets/command out of argv**: env vars and the command are sent over stdin and the command runs from a private script file — neither appears on any cmdline, so `pkill -f`/`pgrep -f` can't match them by command content (env vars are still visible in `/proc/<pid>/environ` to the same user)
 - **SSH config**: resolves host aliases from `~/.ssh/config` (Include-expanded); `user@host:port` literals work everywhere (run **and** sync). An unknown alias is an error with near-miss suggestions — it is never silently treated as a raw hostname (use `user@host` for literal hosts)
@@ -236,7 +236,7 @@ rexec history prune --keep-days 7 --max-mb 500
 
 ## SSH Disconnection Behavior
 
-- Remote process **continues running** (worker ignores SIGHUP — not killed when SSH drops)
+- Remote process **continues running** (worker ignores SIGHUP and SIGPIPE, so a closed SSH output pipe becomes a recoverable write error)
 - Local CLI **auto-reconnects** with exponential backoff (1s→30s, max 10)
 - Output **resumes from the last byte offset** — no data lost
 - If reconnection fails after 10 retries, prints the remote PID and exits
@@ -256,6 +256,15 @@ rexec my-server init
 ```bash
 cargo build --release
 # Binary at target/release/remote-exec
+```
+
+The Unix worker disconnect regression closes the observer's pipe while a child
+is running, then verifies child completion and exact log replay with its exit
+code. It needs Python 3 and a new output directory:
+
+```bash
+python3 scripts/test_worker_disconnect.py --binary target/release/remote-exec \
+  --output-dir /tmp/rexec-disconnect-check
 ```
 
 ### Releasing
